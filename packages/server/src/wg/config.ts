@@ -1,6 +1,6 @@
 import { db } from '@server/db';
-import { peerGroupRulesTable, peerGroupsTable, peersTable, serverPeersTable, type Peer, type ServerPeer } from '@server/db/schema';
-import { eq } from 'drizzle-orm';
+import { peerTagAssignmentsTable, peersTable, policyGrantsTable, serverPeersTable, type Peer, type ServerPeer } from '@server/db/schema';
+import { and, eq } from 'drizzle-orm';
 
 export const generateServerConfig = async (server: ServerPeer) => {
 	const peers = await db.query.peersTable.findMany({
@@ -32,20 +32,26 @@ AllowedIPs = ${peer.wgAddress}
  * server's nft ruleset (see wg/firewall.ts) is what actually decides reachability.
  * A client can't reach an allowed subnet or the internet unless its own config
  * routes that traffic into the tunnel in the first place, so this still has to
- * reflect the peer's group grant. Peers reachable via a dstGroupId rule need no
- * extra entry here - they're other peers on the same server.cidrRange, already
- * covered by the base entry.
+ * reflect the peer's applicable grants. Only `allow` grants matter here (a `deny`
+ * needs no route, and ordering/precedence between them doesn't either - the worst
+ * a stale route can do is send traffic the firewall then drops). Peers reachable
+ * via a dstKind 'tag'/'peer'/'server' grant need no extra entry here - they're
+ * other peers (or the gateway) on the same server.cidrRange, already covered by
+ * the base entry.
  */
 const computeClientAllowedIps = async (peer: Peer, server: ServerPeer) => {
-	if (!peer.groupId) return server.cidrRange;
+	const assignments = await db.query.peerTagAssignmentsTable.findMany({ where: eq(peerTagAssignmentsTable.peerId, peer.id) });
+	const tagIds = new Set(assignments.map((a) => a.tagId));
 
-	const group = await db.query.peerGroupsTable.findFirst({ where: eq(peerGroupsTable.id, peer.groupId) });
-	if (!group) return server.cidrRange; // stale reference (shouldn't happen - fk sets peer.groupId null on group delete)
+	const grants = await db.query.policyGrantsTable.findMany({
+		where: and(eq(policyGrantsTable.serverPeerId, server.id), eq(policyGrantsTable.enabled, true), eq(policyGrantsTable.action, 'allow')),
+	});
 
-	if (group.allowInternet) return '0.0.0.0/0';
+	const applicable = grants.filter((g) => (g.srcKind === 'peer' && g.srcPeerId === peer.id) || (g.srcKind === 'tag' && g.srcTagId !== null && tagIds.has(g.srcTagId)));
 
-	const rules = await db.query.peerGroupRulesTable.findMany({ where: eq(peerGroupRulesTable.srcGroupId, group.id) });
-	const extraCidrs = rules.filter((r) => r.dstCidr).map((r) => r.dstCidr!);
+	if (applicable.some((g) => g.dstKind === 'internet' || g.dstKind === 'any')) return '0.0.0.0/0';
+
+	const extraCidrs = applicable.filter((g) => g.dstKind === 'cidr' && g.dstCidr).map((g) => g.dstCidr!);
 
 	return [server.cidrRange, ...extraCidrs].join(', ');
 };

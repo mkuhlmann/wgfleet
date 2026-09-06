@@ -15,7 +15,7 @@ bun run dev                       # root: runs `dev` in both packages in paralle
 ```bash
 bun run --cwd packages/server dev              # bun --watch src/index.ts
 bun run --cwd packages/server test             # NODE_ENV=test bun test --preload ./src/tests/setup.ts
-bun test --preload ./src/tests/setup.ts src/api/groups.test.ts   # single file, run from packages/server
+bun test --preload ./src/tests/setup.ts src/api/policy.test.ts   # single file, run from packages/server
 bun run --cwd packages/server build            # bun build src/index.ts --outdir dist --target bun
 ```
 No real network/root privileges are needed for `dev` or `test` — see "Dev shim" below. There is no server-side
@@ -61,7 +61,7 @@ The frontend never calls a generated client or a hand-maintained schema package.
 ### Server: Elysia plugin composition
 
 `packages/server/src/index.ts` composes route plugins from `src/api/*.ts` (each an `Elysia` instance, e.g.
-`serversRoutes`, `serversPeersRoute`, `peersRoutes`, `groupsRoutes`) under `.group('/api/v1', ...)`, in front of a
+`serversRoutes`, `serversPeersRoute`, `peersRoutes`, `policyRoutes`) under `.group('/api/v1', ...)`, in front of a
 static-file plugin serving `packages/app/dist` with an SPA fallback. Because `App` is `typeof _app`, TypeScript
 must fully resolve every plugin's types to type-check anything that imports `App` - in practice this means the
 app's typecheck (`type-check` above) transitively validates most of the server too.
@@ -70,16 +70,16 @@ app's typecheck (`type-check` above) transitively validates most of the server t
 no user table: a bearer token either equals `process.env.ADMIN_TOKEN` (god-mode) or matches the `authToken`
 column on the row named by `params.id` for that scope (`serverPeers.authToken` or `peers.authToken` - each row
 carries its own credential, generated with `nanoid(32)`). A `server`-scoped token therefore authorizes every
-route parameterized by that server's id, including all of its peers and groups.
+route parameterized by that server's id, including all of its peers, tags and grants.
 
 ### Persistence: Drizzle + SQLite, no shared-schema layer
 
-`src/db/schema.ts` defines four tables: `serverPeersTable` (one per WireGuard interface/server), `peersTable`
-(clients, FK'd to a server), `peerGroupsTable` and `peerGroupRulesTable` (see "Restricted clients" below).
-**SQLite foreign-key enforcement is never turned on** (no `PRAGMA foreign_keys = ON` anywhere) - `onDelete`
-clauses in the schema are declarative intent only; cascade/cleanup on delete is done by hand in the API handler
-(see `DELETE /wg/servers/:id/groups/:groupId` in `src/api/groups.ts` for the pattern: an explicit
-`db.transaction(...)` that unassigns members and deletes referencing rules before deleting the row itself).
+`src/db/schema.ts` defines six tables: `serverPeersTable` (one per WireGuard interface/server), `peersTable`
+(clients, FK'd to a server), `peerTagsTable`, `peerTagAssignmentsTable` and `policyGrantsTable` (see "Restricted
+clients" below). **SQLite foreign-key enforcement is never turned on** (no `PRAGMA foreign_keys = ON` anywhere) -
+`onDelete` clauses in the schema are declarative intent only; cascade/cleanup on delete is done by hand in the
+API handler (see `DELETE /wg/servers/:id/tags/:tagId` in `src/api/policy.ts` for the pattern: an explicit
+`db.transaction(...)` that unassigns members and deletes referencing grants before deleting the row itself).
 `bun:sqlite` is a synchronous driver, so `db.transaction()` callbacks are synchronous too (`.run()`, not
 `await`).
 
@@ -105,31 +105,39 @@ block in `src/tests/setup.ts`**, which replaces the whole module for every test 
 Local dev/tests never need root or real WireGuard tooling: `WG_DEV_SHIM=true bun run dev` (or just running
 outside a privileged container) exercises the full app against the shim.
 
-### Restricted clients: groups, rules, and the firewall as the actual boundary
+### Restricted clients: tags, ordered grants, and the firewall as the actual boundary
 
-Peers can optionally belong to a `peerGroup` (`peers.groupId`, nullable - **null means fully unrestricted**,
-identical to pre-feature behavior, so ungrouped peers are unaffected by any of this). A group's outbound
-reachability is a set of `peerGroupRules` rows, each `(srcGroupId, dstGroupId | dstCidr)` - i.e. a directional
-group -> group or group -> CIDR allow list, replaced wholesale per group via `PUT
-/wg/servers/:id/groups/:groupId/rules` (delete-then-insert in one transaction).
+Peers carry a many-to-many set of **tags** (`peerTagAssignmentsTable`; no tags is **fully unrestricted**, same
+escape hatch the old single-`groupId` model had). Reachability is `policyGrantsTable`: an explicit, per-server
+**ordered list** (`position`, ascending) of `(action: allow|deny, src: tag|peer, dst: tag|peer|cidr|server|
+internet|any, protocol, ports)` rows, evaluated first-match-wins - see the type comment atop `wg/firewall.ts` for
+the full evaluation semantics. A peer becomes "governed" (denied by default absent a matching grant) the moment
+it carries a tag *or* is named directly as a grant's `src` - this is what lets a peer-scoped grant placed above a
+tag-scoped one express "override this tag's policy for one specific client", the feature this model replaced
+`peerGroupsTable`/`peerGroupRulesTable`/`peers.groupId` to get (see migration `drizzle/0002_policy_grants.sql`
+for how old groups/rules/booleans were carried forward as tags/grants). Grants are replaced wholesale per server
+via `PUT /wg/servers/:id/grants` (delete-then-insert in one transaction, array index becomes `position`); the
+whole policy (tags + grants + peer↔tag assignments) can also be read/written as one JSON document via
+`GET`/`PUT /wg/servers/:id/policy`, addressing tags by name rather than id so a hand-edited document doesn't need
+real ids for new tags.
 
 **The client's own WireGuard config (`AllowedIPs`, in `src/wg/config.ts`) is a routing hint only, never the
 enforcement boundary** - a client owns that file and can edit it. The actual boundary is a single nftables
 `table inet wgmgr` generated by `src/wg/firewall.ts` and applied atomically (`table {}; delete table; table {...}`)
-across *all* servers at once on every relevant mutation (`syncFirewall()`, called from peer/server/group CRUD
+across *all* servers at once on every relevant mutation (`syncFirewall()`, called from peer/server/tag/grant CRUD
 handlers and from `wgManager` start/stop). Read the top-of-file comments in `firewall.ts` before touching it -
-notable non-obvious invariants: nft object names are ordinal (`s{serverIdx}g{groupIdx}`), never derived from
-nanoid ids or `interfaceName`, because those don't satisfy nft's identifier charset; the diagonal
-(group -> itself) is a real, separate toggle - two peers in the same group cannot reach each other unless it's
-set; and enabling a server's `enableNat` must not silently grant ungrouped peers internet access (there's an
-explicit forward-chain guard for this - see the comment above `egressGuard` in `firewall.ts`).
+notable non-obvious invariants: nft object names are ordinal (`s{serverIdx}t{tagIdx}`), never derived from
+nanoid ids or `interfaceName`, because those don't satisfy nft's identifier charset; a tag can't reach its own
+members unless a grant explicitly names that tag as both `src` and `dst`; and enabling a server's `enableNat`
+must not silently grant ungoverned peers internet access (there's an explicit forward-chain guard for this - see
+the comment above `egressGuard` in `firewall.ts`).
 
 `src/wg/firewall.ts` splits into a pure `buildRuleset(servers: FirewallServer[])` (no db, no io - this is what
 `firewall.test.ts` drives directly with fixtures) and a thin `generateFirewallRuleset()`/`syncFirewall()` that
 load state from the db and apply it. Keep new test scenarios on the pure function - `bun:sqlite` under
 `NODE_ENV=test` is a single in-memory database shared across *all* test files in the same run, so anything
 reading "all servers" from the db in a test would pick up fixtures inserted by unrelated test files (this is why
-existing fixtures prefix ids per-file, e.g. `serversRouter-server`, `peersRouters-server`, `groupsRouter-server`).
+existing fixtures prefix ids per-file, e.g. `serversRouter-server`, `peersRouters-server`, `policyRouter-server`).
 
 ### Frontend: no component library, one design system
 

@@ -46,7 +46,7 @@
 								<span v-if="!peer.peerInfo" class="text-unknown border border-unknown/40 rounded-sm px-1.5 py-0.5">unknown</span>
 								<span v-else-if="peer.peerInfo.connected" class="text-up border border-up/40 rounded-sm px-1.5 py-0.5">up</span>
 								<span v-else class="text-down border border-down/40 rounded-sm px-1.5 py-0.5">down</span>
-								<span v-if="groupName(peer.groupId)" class="text-accent-dim border border-accent-dim/40 rounded-sm px-1.5 py-0.5">[{{ groupName(peer.groupId) }}]</span>
+								<span v-for="name in tagNames(peer.tagIds)" :key="name" class="text-accent-dim border border-accent-dim/40 rounded-sm px-1.5 py-0.5">[{{ name }}]</span>
 							</div>
 
 							<div class="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 text-sm text-muted">
@@ -84,16 +84,16 @@
 					<th class="px-4 py-2.5">status</th>
 					<th class="px-4 py-2.5">name/id</th>
 					<th class="px-4 py-2.5">address</th>
-					<th class="px-4 py-2.5">group</th>
+					<th class="px-4 py-2.5">tags</th>
 					<th class="px-4 py-2.5">transfer</th>
 					<th class="px-4 py-2.5 text-right">actions</th>
 				</template>
 
 				<template #table-row="{ item: peer }">
 					<td class="px-4 py-3">
-						<span v-if="!peer.peerInfo" class="text-unknown" title="Unknown">&#9679;</span>
-						<span v-else-if="peer.peerInfo.connected" class="text-up" title="Connected">&#9679;</span>
-						<span v-else class="text-down" title="Disconnected">&#9679;</span>
+						<span v-if="!peer.peerInfo" class="text-unknown border border-unknown/40 rounded-sm px-1.5 py-0.5">unknown</span>
+						<span v-else-if="peer.peerInfo.connected" class="text-up border border-up/40 rounded-sm px-1.5 py-0.5">up</span>
+						<span v-else class="text-down border border-down/40 rounded-sm px-1.5 py-0.5">down</span>
 					</td>
 					<td class="px-4 py-3 font-medium text-text">
 						{{ peer.friendlyName ?? peer.id }}
@@ -102,7 +102,7 @@
 						{{ peer.wgAddress }}
 					</td>
 					<td class="px-4 py-3 text-muted text-xs">
-						<span v-if="groupName(peer.groupId)" class="text-accent-dim">[{{ groupName(peer.groupId) }}]</span>
+						<span v-if="tagNames(peer.tagIds).length" class="text-accent-dim">[{{ tagNames(peer.tagIds).join('] [') }}]</span>
 						<span v-else>-</span>
 					</td>
 					<td class="px-4 py-3 text-muted text-xs">
@@ -146,7 +146,7 @@
 
 <script setup lang="ts">
 import { queryServer, queryServerPeers } from '@app/queries/queryServers';
-import { queryServerGroups } from '@app/queries/queryGroups';
+import { queryServerTags } from '@app/queries/queryPolicy';
 import { useQuery, useQueryClient } from '@tanstack/vue-query';
 import { useRoute } from 'vue-router';
 import { ref, computed } from 'vue';
@@ -163,10 +163,10 @@ const route = useRoute();
 
 const { data: server, isLoading } = useQuery(queryServer(route.params.id as string));
 const { data: peers } = useQuery(queryServerPeers(route.params.id as string));
-const { data: groups } = useQuery(queryServerGroups(route.params.id as string));
+const { data: tags } = useQuery(queryServerTags(route.params.id as string));
 
-const groupNameById = computed(() => new Map((groups.value ?? []).map((g) => [g.id, g.friendlyName ?? g.name])));
-const groupName = (groupId: string | null | undefined) => (groupId ? groupNameById.value.get(groupId) : undefined);
+const tagNameById = computed(() => new Map((tags.value ?? []).map((t) => [t.id, t.friendlyName ?? t.name])));
+const tagNames = (tagIds: string[] | undefined) => (tagIds ?? []).map((id) => tagNameById.value.get(id)).filter((name): name is string => Boolean(name));
 
 const queryClient = useQueryClient();
 

@@ -1,8 +1,8 @@
 import { Elysia, status, t } from 'elysia';
 import { db } from '../db';
-import { peerGroupsTable, peersTable, serverPeersTable, type Peer } from '../db/schema';
+import { peerTagAssignmentsTable, peerTagsTable, peersTable, policyGrantsTable, serverPeersTable, type Peer } from '../db/schema';
 import IPCIDR from 'ip-cidr';
-import { eq, and, or } from 'drizzle-orm';
+import { eq, and, or, inArray } from 'drizzle-orm';
 import { reloadServer, wgDerivePublicKey, wgGenKey, wgGenPsk } from '../wg/shell';
 import { syncFirewall } from '../wg/firewall';
 import { wgManager } from '../wg/manager';
@@ -12,15 +12,24 @@ import { generatePeerConfig } from '@server/wg/config';
 
 const log = createLog('http');
 
-async function assertGroupBelongsToServer(groupId: string | null | undefined, serverPeerId: string) {
-	if (!groupId) return null;
-	const group = await db.query.peerGroupsTable.findFirst({
-		where: and(eq(peerGroupsTable.id, groupId), eq(peerGroupsTable.serverPeerId, serverPeerId)),
+async function assertTagsBelongToServer(tagIds: string[] | undefined, serverPeerId: string) {
+	if (!tagIds || tagIds.length === 0) return null;
+	const tags = await db.query.peerTagsTable.findMany({
+		where: and(inArray(peerTagsTable.id, tagIds), eq(peerTagsTable.serverPeerId, serverPeerId)),
 	});
-	if (!group) {
-		return status(400, 'Group not found on this server');
+	if (tags.length !== new Set(tagIds).size) {
+		return status(400, 'One or more tags not found on this server');
 	}
 	return null;
+}
+
+async function setPeerTags(peerId: string, tagIds: string[]) {
+	db.transaction((tx) => {
+		tx.delete(peerTagAssignmentsTable).where(eq(peerTagAssignmentsTable.peerId, peerId)).run();
+		for (const tagId of tagIds) {
+			tx.insert(peerTagAssignmentsTable).values({ peerId, tagId }).run();
+		}
+	});
 }
 
 export const serversPeersRoute = new Elysia()
@@ -40,10 +49,19 @@ export const serversPeersRoute = new Elysia()
 				where: eq(peersTable.serverPeerId, server.id),
 			});
 
-			const peersWithInfo: (Peer & { peerInfo: null | { connected: boolean; wgTransferRx: number; wgTransferTx: number; wgLatestHandshake: number; wgEndpoint: string } })[] = [];
+			const assignments = peers.length ? await db.query.peerTagAssignmentsTable.findMany({ where: inArray(peerTagAssignmentsTable.peerId, peers.map((p) => p.id)) }) : [];
+			const tagIdsByPeer = new Map<string, string[]>();
+			for (const a of assignments) {
+				const list = tagIdsByPeer.get(a.peerId) ?? [];
+				list.push(a.tagId);
+				tagIdsByPeer.set(a.peerId, list);
+			}
+
+			const peersWithInfo: (Peer & { tagIds: string[]; peerInfo: null | { connected: boolean; wgTransferRx: number; wgTransferTx: number; wgLatestHandshake: number; wgEndpoint: string } })[] =
+				[];
 
 			for (const peer of peers) {
-				peersWithInfo.push({ ...peer, peerInfo: wgManager.peerInfo[peer.wgPublicKey] ?? null });
+				peersWithInfo.push({ ...peer, tagIds: tagIdsByPeer.get(peer.id) ?? [], peerInfo: wgManager.peerInfo[peer.wgPublicKey] ?? null });
 			}
 
 			return peersWithInfo;
@@ -119,8 +137,8 @@ export const serversPeersRoute = new Elysia()
 				throw new Error('No IP supplied');
 			}
 
-			const groupError = await assertGroupBelongsToServer(body.groupId, server.id);
-			if (groupError) return groupError;
+			const tagError = await assertTagsBelongToServer(body.tagIds, server.id);
+			if (tagError) return tagError;
 
 			const peer = await db
 				.insert(peersTable)
@@ -133,21 +151,24 @@ export const serversPeersRoute = new Elysia()
 					wgPresharedKey: await wgGenPsk(),
 
 					wgAddress: ip,
-					groupId: body.groupId,
 				})
 				.returning();
+
+			if (body.tagIds?.length) {
+				await setPeerTags(peer[0].id, body.tagIds);
+			}
 
 			log.info(`Created peer ${peer[0].id} on server ${server.id}`);
 			reloadServer(server);
 			syncFirewall();
 
-			return peer[0];
+			return { ...peer[0], tagIds: body.tagIds ?? [] };
 		},
 		{
 			body: t.Object({
 				friendlyName: t.Optional(t.String()),
 				wgAddress: t.Optional(t.String()),
-				groupId: t.Optional(t.Nullable(t.String())),
+				tagIds: t.Optional(t.Array(t.String())),
 			}),
 			params: t.Object({
 				id: t.String(),
@@ -224,10 +245,10 @@ export const serversPeersRoute = new Elysia()
 				throw new Error('No IP supplied');
 			}
 
-			// undefined = leave the group unchanged, null = explicitly unassign (unrestrict)
-			if (body.groupId !== undefined) {
-				const groupError = await assertGroupBelongsToServer(body.groupId, server.id);
-				if (groupError) return groupError;
+			// undefined = leave tags unchanged, [] = explicitly clear all tags (unrestrict)
+			if (body.tagIds !== undefined) {
+				const tagError = await assertTagsBelongToServer(body.tagIds, server.id);
+				if (tagError) return tagError;
 			}
 
 			const updatedPeer = await db
@@ -235,10 +256,13 @@ export const serversPeersRoute = new Elysia()
 				.set({
 					friendlyName: body.friendlyName ?? peer.friendlyName,
 					wgAddress: body.wgAddress ?? peer.wgAddress,
-					groupId: body.groupId !== undefined ? body.groupId : peer.groupId,
 				})
 				.where(and(eq(peersTable.id, params.peerId), eq(peersTable.serverPeerId, params.id)))
 				.returning();
+
+			if (body.tagIds !== undefined) {
+				await setPeerTags(peer.id, body.tagIds);
+			}
 
 			log.info(`Updated peer ${peer.id} on server ${server.id}`);
 			reloadServer(server);
@@ -250,7 +274,7 @@ export const serversPeersRoute = new Elysia()
 			body: t.Object({
 				friendlyName: t.Optional(t.String()),
 				wgAddress: t.Optional(t.String()),
-				groupId: t.Optional(t.Nullable(t.String())),
+				tagIds: t.Optional(t.Array(t.String())),
 			}),
 			params: t.Object({
 				id: t.String(),
@@ -299,7 +323,15 @@ export const serversPeersRoute = new Elysia()
 				throw new Error('Peer not found');
 			}
 
-			await db.delete(peersTable).where(eq(peersTable.id, params.peerId));
+			// no db-level FK enforcement (sqlite foreign_keys pragma isn't turned on anywhere in
+			// this codebase), so cascade cleanup happens explicitly here - a peer-scoped grant
+			// naming this peer directly would otherwise dangle.
+			db.transaction((tx) => {
+				tx.delete(peerTagAssignmentsTable).where(eq(peerTagAssignmentsTable.peerId, peer.id)).run();
+				tx.delete(policyGrantsTable).where(eq(policyGrantsTable.srcPeerId, peer.id)).run();
+				tx.delete(policyGrantsTable).where(eq(policyGrantsTable.dstPeerId, peer.id)).run();
+				tx.delete(peersTable).where(eq(peersTable.id, params.peerId)).run();
+			});
 			log.info(`Deleted peer ${peer.id} from server ${server.id}`);
 			reloadServer(server);
 			syncFirewall();

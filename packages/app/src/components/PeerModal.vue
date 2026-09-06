@@ -13,16 +13,21 @@
 				<span v-if="errors.wgAddress" class="text-down text-xs block mt-1">{{ errors.wgAddress }}</span>
 			</div>
 			<div class="field">
-				<label for="groupId" class="mb-1.5 text-sm text-muted block"><span class="text-accent-dim">&gt;</span> group</label>
-				<select
-					id="groupId"
-					v-model="form.groupId"
-					class="block w-full rounded-sm border border-border bg-bg text-text px-3 py-2 text-sm transition-colors duration-150 focus:outline-none focus:border-accent"
-				>
-					<option :value="null">none - unrestricted</option>
-					<option v-for="group in groups" :key="group.id" :value="group.id">{{ group.friendlyName ?? group.name }}</option>
-				</select>
-				<small class="text-muted text-xs">restricts reachability to what the group's policy allows. leave unset for unrestricted access</small>
+				<label class="mb-1.5 text-sm text-muted block"><span class="text-accent-dim">&gt;</span> tags</label>
+				<div v-if="!tags || tags.length === 0" class="text-xs text-muted">no tags defined yet - add one from the server's policy page first</div>
+				<div v-else class="flex flex-wrap gap-x-4 gap-y-2">
+					<button
+						v-for="tag in tags"
+						:key="tag.id"
+						type="button"
+						class="flex items-center gap-2 text-sm text-text"
+						@click="toggleTag(tag.id)"
+					>
+						<span class="text-accent-dim">{{ form.tagIds.includes(tag.id) ? '[x]' : '[ ]' }}</span>
+						<span>{{ tag.friendlyName ?? tag.name }}</span>
+					</button>
+				</div>
+				<small class="text-muted text-xs">restricts reachability to what the policy's grants allow. leave all unset for unrestricted access</small>
 			</div>
 			<div class="flex justify-end gap-2 mt-2">
 				<BaseButton @click="visible = false" variant="ghost" type="button">cancel</BaseButton>
@@ -40,7 +45,7 @@ import { useToast } from '@app/composables/useToast';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query';
 import type { Peer, ServerPeer } from '@server/db/schema';
 import { eden } from '@app/queries/edenClient';
-import { queryServerGroups } from '@app/queries/queryGroups';
+import { queryServerTags } from '@app/queries/queryPolicy';
 import BaseButton from './BaseButton.vue';
 import BaseInput from './BaseInput.vue';
 import BaseModal from './BaseModal.vue';
@@ -48,7 +53,7 @@ import BaseModal from './BaseModal.vue';
 const toast = useToast();
 
 const props = defineProps<{
-	peer?: Peer;
+	peer?: Peer & { tagIds?: string[] };
 	server: ServerPeer;
 }>();
 
@@ -57,17 +62,21 @@ const isEditMode = ref(props.peer ? true : false);
 const visible = defineModel<boolean>('visible', { required: true });
 const queryClient = useQueryClient();
 
-const { data: groups } = useQuery(queryServerGroups(props.server.id));
+const { data: tags } = useQuery(queryServerTags(props.server.id));
 
 const form = reactive<{
 	friendlyName?: string;
 	wgAddress?: string;
-	groupId?: string | null;
+	tagIds: string[];
 }>({
 	friendlyName: '',
 	wgAddress: '',
-	groupId: null,
+	tagIds: [],
 });
+
+const toggleTag = (tagId: string) => {
+	form.tagIds = form.tagIds.includes(tagId) ? form.tagIds.filter((id) => id !== tagId) : [...form.tagIds, tagId];
+};
 
 const errors = reactive({
 	wgAddress: '',
@@ -98,13 +107,13 @@ watch(
 		if (peer) {
 			form.friendlyName = peer.friendlyName ?? '';
 			form.wgAddress = peer.wgAddress ?? '';
-			form.groupId = peer.groupId ?? null;
+			form.tagIds = peer.tagIds ?? [];
 			isEditMode.value = true;
 		} else {
 			isEditMode.value = false;
 			form.friendlyName = '';
 			form.wgAddress = '';
-			form.groupId = null;
+			form.tagIds = [];
 		}
 		errors.wgAddress = '';
 	},

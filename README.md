@@ -13,8 +13,9 @@ I created this project to manage an automated large scale wireguard vpn for thin
 - Primarily designed to use api
 - Optionally provides simple ui for managing configurations
 - Automatically generate client configurations (including QR codes)
-- Restricted clients: put peers in groups and control what each group can reach, enforced server-side with nftables (see [Restricted Clients](#restricted-clients) below)
-- Redirect traffic through the VPN, including full internet egress, per group
+- Restricted clients: tag peers and write an ordered allow/deny policy (grants) controlling what each tag - or an
+  individual peer - can reach, enforced server-side with nftables (see [Restricted Clients](#restricted-clients) below)
+- Redirect traffic through the VPN, including full internet egress, per tag
 - Traffic stats
 - Authenticated with administration, server and peer token
 
@@ -79,23 +80,29 @@ docker-compose up -d
 
 ## Restricted Clients
 
-By default every peer on a server can reach every other peer - this is unchanged, and any peer you never assign
-to a group keeps behaving exactly this way.
+By default every peer on a server can reach every other peer - this is unchanged, and any peer you never tag
+keeps behaving exactly this way.
 
-To restrict a peer, put it in a **group**, then define what that group is allowed to reach:
+Access control is a Tailscale-grants-style model, scoped per server:
 
-- another **group** (directional - "office can reach db" doesn't imply "db can reach office"; a group needs an
-  explicit rule to itself before its own members can reach each other)
-- an arbitrary **subnet/CIDR** - useful for a site-to-site LAN behind the gateway
-- the **server** itself (its own tunnel address - dns, the management api)
-- the **internet** - also requires `enableNat` to be turned on for that server, since this masquerades the
-  group's traffic on the way out. Off by default; turning it on for a server does not by itself grant internet
-  access to anyone - each group's "internet" grant is still required.
+- A peer can carry any number of **tags** (a many-to-many label, not a single group).
+- Reachability is an explicit, **ordered list of grants** - `allow`/`deny` rules matched top to bottom, first
+  match wins. A grant's source is a **tag** or an individual **peer**; a peer-scoped grant placed above a
+  tag-scoped one lets you override policy for one specific client without inventing a whole new tag for it.
+- A grant's destination is another **tag**, another **peer**, an arbitrary **subnet/CIDR** (useful for a
+  site-to-site LAN behind the gateway), the **server** itself (its own tunnel address - dns, the management api),
+  the **internet**, or **any**. Grants can optionally match a protocol (`tcp`/`udp`/`icmp`) and port list/ranges.
+- The moment a peer carries a tag, or is named directly as a grant's source, it becomes **governed**: traffic
+  from it is denied by default unless some grant allows it. Reaching itself (tag -> same tag) needs its own
+  explicit grant, same as any other destination.
+- The **internet** destination also requires `enableNat` to be turned on for that server, since this masquerades
+  traffic on the way out. Off by default; turning it on for a server does not by itself grant internet access to
+  anyone - an explicit "internet" grant is still required.
 
 This is enforced with a generated nftables ruleset on the server, not by what a client's own config says it's
-allowed to do - a client can't bypass it by editing its config. Manage groups and their reachability matrix from
-the "policy" button on a server's page, or via the `/wg/servers/:id/groups` and
-`/wg/servers/:id/groups/:groupId/rules` api endpoints.
+allowed to do - a client can't bypass it by editing its config. Manage tags and grants from the "policy" button
+on a server's page (including a JSON view of the whole policy document for review/import), or via the
+`/wg/servers/:id/tags`, `/wg/servers/:id/grants` and `/wg/servers/:id/policy` api endpoints.
 
 ## Testing
 

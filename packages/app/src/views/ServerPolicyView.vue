@@ -10,39 +10,33 @@
 				<BaseButton :as="'router-link'" :to="{ name: 'servers-detail', params: { id: server.id } }" variant="ghost">&laquo; back to server</BaseButton>
 			</div>
 
-			<GroupModal v-model:visible="showAddGroupModal" :server="server" />
-			<GroupModal v-model:visible="showEditGroupModal" :group="selectedGroup" :server="server" />
+			<TagModal v-model:visible="showAddTagModal" :server="server" />
+			<TagModal v-model:visible="showEditTagModal" :tag="selectedTag" :server="server" />
 
 			<div class="flex flex-col gap-4">
 				<div class="flex justify-between items-center flex-wrap gap-3">
-					<h2 class="text-base font-bold text-text"><span class="text-accent-dim">///</span> groups</h2>
-					<BaseButton @click="showAddGroupModal = true">add group</BaseButton>
+					<h2 class="text-base font-bold text-text"><span class="text-accent-dim">///</span> tags</h2>
+					<BaseButton @click="showAddTagModal = true">add tag</BaseButton>
 				</div>
 
-				<div v-if="!groups || groups.length === 0" class="text-center py-8 text-muted text-sm">no groups yet - ungrouped peers stay fully unrestricted</div>
+				<div v-if="!tags || tags.length === 0" class="text-center py-8 text-muted text-sm">no tags yet - untagged peers stay fully unrestricted</div>
 
-				<div v-else class="grid gap-4 grid-cols-[repeat(auto-fill,minmax(260px,1fr))]">
-					<BaseCard v-for="group in groups" :key="group.id" :title="group.friendlyName ?? group.name" class="h-full flex flex-col">
+				<div v-else class="grid gap-4 grid-cols-[repeat(auto-fill,minmax(220px,1fr))]">
+					<BaseCard v-for="tag in tags" :key="tag.id" :title="tag.friendlyName ?? tag.name" class="h-full flex flex-col">
 						<div class="flex-1 flex flex-col gap-3">
 							<div class="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 text-sm text-muted">
 								<span class="whitespace-nowrap">name</span>
-								<span class="text-text text-right break-all">{{ group.name }}</span>
+								<span class="text-text text-right break-all">{{ tag.name }}</span>
 
 								<span class="whitespace-nowrap">peers</span>
-								<span class="text-text text-right">{{ group.memberCount }}</span>
-
-								<span class="whitespace-nowrap">server</span>
-								<span class="text-right" :class="group.allowServer ? 'text-up' : 'text-muted'">{{ group.allowServer ? 'allowed' : 'blocked' }}</span>
-
-								<span class="whitespace-nowrap">internet</span>
-								<span class="text-right" :class="group.allowInternet ? 'text-up' : 'text-muted'">{{ group.allowInternet ? 'allowed' : 'blocked' }}</span>
+								<span class="text-text text-right">{{ tag.memberCount }}</span>
 							</div>
 						</div>
 
 						<template #footer>
 							<div class="grid grid-cols-2 gap-2">
-								<BaseButton @click="editGroup(group)" variant="secondary" size="sm">edit</BaseButton>
-								<BaseButton @click="deleteGroup(group.id)" variant="danger" size="sm">del</BaseButton>
+								<BaseButton @click="editTag(tag)" variant="secondary" size="sm">edit</BaseButton>
+								<BaseButton @click="deleteTag(tag.id)" variant="danger" size="sm">del</BaseButton>
 							</div>
 						</template>
 					</BaseCard>
@@ -52,48 +46,62 @@
 			<div class="rule-line"></div>
 
 			<div class="flex flex-col gap-4">
-				<h2 class="text-base font-bold text-text"><span class="text-accent-dim">///</span> reachability matrix</h2>
-				<PolicyMatrix :server-id="server.id" :groups="groups ?? []" />
+				<h2 class="text-base font-bold text-text"><span class="text-accent-dim">///</span> grants</h2>
+				<p class="text-xs text-muted">
+					evaluated top to bottom, first match wins. a tagged peer with no matching grant is denied by default - untagged peers stay unrestricted. place a
+					<span class="text-text">peer</span>-scoped grant above a tag-scoped one to override it for that client.
+				</p>
+				<GrantsTable :server-id="server.id" :tags="tags ?? []" :peers="peers ?? []" />
+			</div>
+
+			<div class="rule-line"></div>
+
+			<div class="flex flex-col gap-4">
+				<h2 class="text-base font-bold text-text"><span class="text-accent-dim">///</span> policy json</h2>
+				<PolicyJsonPanel :server-id="server.id" />
 			</div>
 		</div>
 	</div>
 </template>
 
 <script setup lang="ts">
-import { queryServer } from '@app/queries/queryServers';
-import { queryServerGroups } from '@app/queries/queryGroups';
+import { queryServer, queryServerPeers } from '@app/queries/queryServers';
+import { queryServerTags } from '@app/queries/queryPolicy';
 import { useQuery, useQueryClient } from '@tanstack/vue-query';
 import { useRoute } from 'vue-router';
 import { ref } from 'vue';
 import { eden } from '@app/queries/edenClient';
-import type { PeerGroup } from '@server/db/schema';
+import type { PeerTag } from '@server/db/schema';
 import BaseButton from '@app/components/BaseButton.vue';
 import BaseCard from '@app/components/BaseCard.vue';
-import GroupModal from '@app/components/GroupModal.vue';
-import PolicyMatrix from '@app/components/PolicyMatrix.vue';
+import TagModal from '@app/components/TagModal.vue';
+import GrantsTable from '@app/components/GrantsTable.vue';
+import PolicyJsonPanel from '@app/components/PolicyJsonPanel.vue';
 
 const route = useRoute();
 const queryClient = useQueryClient();
 
 const { data: server, isLoading } = useQuery(queryServer(route.params.id as string));
-const { data: groups } = useQuery(queryServerGroups(route.params.id as string));
+const { data: tags } = useQuery(queryServerTags(route.params.id as string));
+const { data: peers } = useQuery(queryServerPeers(route.params.id as string));
 
-const showAddGroupModal = ref(false);
-const showEditGroupModal = ref(false);
-const selectedGroup = ref<PeerGroup>();
+const showAddTagModal = ref(false);
+const showEditTagModal = ref(false);
+const selectedTag = ref<PeerTag>();
 
-const editGroup = (group: PeerGroup) => {
-	selectedGroup.value = group;
-	showEditGroupModal.value = true;
+const editTag = (tag: PeerTag) => {
+	selectedTag.value = tag;
+	showEditTagModal.value = true;
 };
 
-const deleteGroup = async (groupId: string) => {
-	if (!confirm('Delete this group? Member peers become unrestricted, they are not deleted.')) return;
+const deleteTag = async (tagId: string) => {
+	if (!confirm('Delete this tag? Member peers keep their other tags, they are not deleted.')) return;
 
 	await eden.api.v1.wg
 		.servers({ id: route.params.id as string })
-		.groups({ groupId })
+		.tags({ tagId })
 		.delete();
-	await queryClient.invalidateQueries({ queryKey: ['serverGroups', route.params.id as string] });
+	await queryClient.invalidateQueries({ queryKey: ['serverTags', route.params.id as string] });
+	await queryClient.invalidateQueries({ queryKey: ['serverGrants', route.params.id as string] });
 };
 </script>

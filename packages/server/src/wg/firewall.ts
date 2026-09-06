@@ -1,19 +1,32 @@
 import { db } from '@server/db';
-import { peerGroupRulesTable, peerGroupsTable, peersTable, serverPeersTable } from '@server/db/schema';
+import { peerTagAssignmentsTable, peerTagsTable, peersTable, policyGrantsTable, serverPeersTable } from '@server/db/schema';
 import { createLog } from '@server/lib/log';
-import { eq } from 'drizzle-orm';
+import { and, asc, eq } from 'drizzle-orm';
 import { applyFirewall } from './shell';
 
 const log = createLog('wg:firewall');
 
-export type FirewallGroup = {
+// A peer can carry many tags (peerTagAssignmentsTable) and policy is an explicit, ordered list
+// of grants (policyGrantsTable) - each `action` (allow/deny) fires on the first grant whose
+// src/dst/protocol/ports match. A peer is "governed" the moment it carries >=1 tag or is named
+// directly as a grant's src peer; a governed peer with no matching grant is denied by default
+// (tagging alone is enough to lock a peer down). A peer that is neither is ungoverned and falls
+// through untouched - unrestricted, exactly like the old `groupId = null` behaviour. This is what
+// makes "policy on the individual client" take precedence over tag-level policy: a peer-scoped
+// grant placed above the tag-scoped ones in the ordered list wins.
+export type FirewallTag = {
 	id: string;
 	name: string;
-	allowServer: boolean;
-	allowInternet: boolean;
 	memberIps: string[];
-	dstGroupIds: string[];
-	dstCidrs: string[];
+};
+
+export type FirewallGrant = {
+	action: 'allow' | 'deny';
+	src: { kind: 'tag'; tagId: string } | { kind: 'peer'; ip: string };
+	dst: { kind: 'tag'; tagId: string } | { kind: 'peer'; ip: string } | { kind: 'cidr'; cidr: string } | { kind: 'server' } | { kind: 'internet' } | { kind: 'any' };
+	protocol: 'any' | 'tcp' | 'udp' | 'icmp';
+	ports: string | null;
+	comment: string | null;
 };
 
 export type FirewallServer = {
@@ -21,7 +34,12 @@ export type FirewallServer = {
 	cidrRange: string;
 	wgAddress: string;
 	enableNat: boolean;
-	groups: FirewallGroup[];
+	tags: FirewallTag[];
+	// already in evaluation order (ascending `position`, enabled only) - see loadFirewallState
+	grants: FirewallGrant[];
+	// ips of peers that must be default-denied once nothing in `grants` matches - see the
+	// "governed" note above. Anyone not in this set falls through to `return`, unrestricted.
+	governedIps: string[];
 };
 
 // nft identifiers must start with a letter and only accept a limited charset. nanoid
@@ -30,10 +48,10 @@ export type FirewallServer = {
 // instead - the human name still appears as an nft `comment` for readability.
 const sanitizeComment = (value: string) => value.replace(/[\\"\r\n]/g, '').slice(0, 64);
 
-// This feature is ipv4-only throughout (see the `meta nfproto ipv6 drop` above).
+// This feature is ipv4-only throughout (see the `meta nfproto ipv6 drop` in buildRuleset).
 // `ip daddr <cidr>` is the ipv4-specific match - handing it an ipv6 literal is an
 // nft type error (`nft -f` exits 1: "Address family for hostname not supported"),
-// not something nft just ignores. Used both to gate the api (`groups.ts`) and,
+// not something nft just ignores. Used both to gate the api (`policy.ts`) and,
 // defensively, here - a dstCidr already in the db (e.g. from before this check
 // existed) must not be able to permanently break every future sync.
 export const isIpv4Cidr = (value: string) => /^(?:\d{1,3}\.){3}\d{1,3}\/(?:[0-9]|[1-2][0-9]|3[0-2])$/.test(value);
@@ -49,13 +67,69 @@ export const buildRuleset = (servers: FirewallServer[]): string => {
 	const allInterfaces = [...new Set(servers.map((s) => s.interfaceName))];
 	const managedIfaceSet = allInterfaces.length ? `{ ${allInterfaces.map(quote).join(', ')} }` : '{}';
 
-	// resolve a group's db id -> its ordinal `s{i}g{j}` name, across all servers
-	const groupSetName = new Map<string, string>();
+	// resolve a tag's db id -> its ordinal `s{i}t{j}` name, across all servers (grants are
+	// api-validated to never cross servers, but this stays robust to a stale cross-server id)
+	const tagSetName = new Map<string, string>();
 	servers.forEach((server, i) => {
-		server.groups.forEach((group, j) => {
-			groupSetName.set(group.id, `s${i}g${j}`);
+		server.tags.forEach((tag, j) => {
+			tagSetName.set(tag.id, `s${i}t${j}`);
 		});
 	});
+
+	const renderSrc = (src: FirewallGrant['src']): string | undefined => {
+		if (src.kind === 'tag') {
+			const set = tagSetName.get(src.tagId);
+			return set ? `ip saddr @${set}` : undefined;
+		}
+		return src.ip ? `ip saddr ${src.ip}` : undefined;
+	};
+
+	// `null` = valid, no dst clause needed (the destination is implicit in the chain the rule
+	// ends up in - see below). `undefined` = unresolvable, the whole grant must be skipped
+	// (stale tag/peer reference, or a non-ipv4 cidr - see isIpv4Cidr comment above).
+	const renderDst = (dst: FirewallGrant['dst']): string | null | undefined => {
+		switch (dst.kind) {
+			case 'tag': {
+				const set = tagSetName.get(dst.tagId);
+				return set ? `ip daddr @${set}` : undefined;
+			}
+			case 'peer':
+				return dst.ip ? `ip daddr ${dst.ip}` : undefined;
+			case 'cidr':
+				return isIpv4Cidr(dst.cidr) ? `ip daddr ${dst.cidr}` : undefined;
+			case 'internet':
+				return `oifname != ${managedIfaceSet}`;
+			case 'server':
+			case 'any':
+				return null;
+		}
+	};
+
+	const renderL4 = (protocol: FirewallGrant['protocol'], ports: string | null): string | undefined => {
+		if (protocol === 'any') return undefined;
+		if (protocol === 'icmp') return 'meta l4proto icmp';
+		if (ports && ports.trim()) {
+			const normalized = ports
+				.split(',')
+				.map((p) => p.trim())
+				.filter(Boolean)
+				.join(', ');
+			return `${protocol} dport { ${normalized} }`;
+		}
+		return `meta l4proto ${protocol}`;
+	};
+
+	const renderGrantRule = (grant: FirewallGrant): string | undefined => {
+		const src = renderSrc(grant.src);
+		if (!src) return undefined;
+		const dst = renderDst(grant.dst);
+		if (dst === undefined) return undefined;
+		const l4 = renderL4(grant.protocol, grant.ports);
+		const verdict = grant.action === 'allow' ? 'accept' : 'drop';
+		const clause = [src, dst, l4, verdict].filter((p): p is string => Boolean(p)).join(' ');
+		const comment = grant.comment ? ` comment ${quote(sanitizeComment(grant.comment))}` : '';
+		return `\t${clause}${comment}`;
+	};
 
 	const sets: string[] = [];
 	const forwardLines: string[] = [];
@@ -66,60 +140,43 @@ export const buildRuleset = (servers: FirewallServer[]): string => {
 	const natLines: string[] = [];
 
 	servers.forEach((server, i) => {
-		if (server.groups.length === 0) return;
+		if (server.tags.length === 0 && server.grants.length === 0) return;
 
-		const restrictedName = `s${i}_restricted`;
+		const governedName = `s${i}_governed`;
 		const fwdName = `fwd_s${i}`;
 		const inName = `in_s${i}`;
 
-		const restrictedIps = server.groups.flatMap((g) => g.memberIps);
-		sets.push(renderSet(restrictedName, restrictedIps));
-
-		forwardLines.push(`\tiifname ${quote(server.interfaceName)} jump ${fwdName}`);
-		inputLines.push(`\tiifname ${quote(server.interfaceName)} ip saddr @${restrictedName} jump ${inName}`);
-
-		const fwdBody: string[] = [];
-		const inBody: string[] = [];
-
-		server.groups.forEach((group, j) => {
-			const setName = `s${i}g${j}`;
-			sets.push(renderSet(setName, group.memberIps, group.name));
-
-			fwdBody.push(`\tip saddr @${setName} jump src_${setName}`);
-
-			if (group.allowServer) {
-				inBody.push(`\tip saddr @${setName} accept`);
-			}
-
-			const srcBody: string[] = [];
-			// ipv4-only feature (matches the rest of the codebase - the cidrRange
-			// regex is ipv4-only and peers have no v6 address) - drop v6 explicitly
-			// rather than silently falling through unfiltered.
-			srcBody.push(`\tmeta nfproto ipv6 drop`);
-
-			for (const dstGroupId of group.dstGroupIds) {
-				const dstSet = groupSetName.get(dstGroupId);
-				if (!dstSet) continue; // dst group not found on this or any server - ignore stale rule
-				srcBody.push(`\tip daddr @${dstSet} accept`);
-			}
-
-			for (const cidr of group.dstCidrs) {
-				if (!isIpv4Cidr(cidr)) continue; // defensive - see isIpv4Cidr comment above
-				srcBody.push(`\tip daddr ${cidr} accept`);
-			}
-
-			if (group.allowInternet) {
-				srcBody.push(`\toifname != ${managedIfaceSet} accept`);
-			}
-
-			srcBody.push(`\tdrop`);
-
-			srcChains.push(`chain src_${setName} {\n${srcBody.join('\n')}\n}`);
+		sets.push(renderSet(governedName, server.governedIps));
+		server.tags.forEach((tag, j) => {
+			sets.push(renderSet(`s${i}t${j}`, tag.memberIps, tag.name));
 		});
 
-		fwdBody.push(`\treturn`);
+		forwardLines.push(`\tiifname ${quote(server.interfaceName)} jump ${fwdName}`);
+		inputLines.push(`\tiifname ${quote(server.interfaceName)} ip saddr @${governedName} jump ${inName}`);
+
+		// ipv4-only feature (matches the rest of the codebase - the cidrRange
+		// regex is ipv4-only and peers have no v6 address) - drop v6 explicitly
+		// rather than silently falling through unfiltered.
+		const fwdBody: string[] = [`\tmeta nfproto ipv6 drop`];
+		for (const grant of server.grants) {
+			// 'server'-dst grants only ever apply to traffic hitting the gateway itself,
+			// handled below in the input chain, not here.
+			if (grant.dst.kind === 'server') continue;
+			const line = renderGrantRule(grant);
+			if (line) fwdBody.push(line);
+		}
+		fwdBody.push(`\tip saddr @${governedName} drop`); // governed, nothing matched -> default deny
+		fwdBody.push(`\treturn`); // ungoverned -> unrestricted, as before
 		fwdChains.push(`chain ${fwdName} {\n${fwdBody.join('\n')}\n}`);
 
+		// only entered for governed peers (see the jump condition above) - a 'server' or 'any'
+		// dst grant applies here; everything else is meaningless against the gateway itself.
+		const inBody: string[] = [`\tmeta nfproto ipv6 drop`];
+		for (const grant of server.grants) {
+			if (grant.dst.kind !== 'server' && grant.dst.kind !== 'any') continue;
+			const line = renderGrantRule(grant);
+			if (line) inBody.push(line);
+		}
 		inBody.push(`\tdrop`);
 		inChains.push(`chain ${inName} {\n${inBody.join('\n')}\n}`);
 
@@ -132,13 +189,13 @@ export const buildRuleset = (servers: FirewallServer[]): string => {
 
 	parts.push(...sets);
 
-	// Safety net: an ungrouped peer falls through `fwd_s{i}`'s `return` (it's
+	// Safety net: an ungoverned peer falls through `fwd_s{i}`'s `return` (it's
 	// unrestricted, matching today's behaviour) and would otherwise hit this base
 	// chain's `policy accept` even for traffic leaving via a non-wg interface - i.e.
 	// internet/LAN egress, only reachable at all once postrouting can masquerade it
-	// (`enableNat`). That capability is new and must stay opt-in per group, so
+	// (`enableNat`). That capability is new and must stay opt-in per peer/tag, so
 	// explicitly deny it for any wg-sourced traffic not already accepted by a
-	// group's own rules. Only added when some server has NAT on - with NAT off
+	// grant. Only added when some server has NAT on - with NAT off
 	// everywhere (the default) such traffic already can't work (no route back), so
 	// this stays a true no-op for every deployment that hasn't touched the feature.
 	// Peer-to-peer reachability (iif == oif, both managed wg interfaces) is untouched.
@@ -193,36 +250,88 @@ const loadFirewallState = async (): Promise<FirewallServer[]> => {
 	const result: FirewallServer[] = [];
 
 	for (const server of servers) {
-		const groups = await db.query.peerGroupsTable.findMany({ where: eq(peerGroupsTable.serverPeerId, server.id) });
-		if (groups.length === 0) {
-			result.push({ interfaceName: server.interfaceName, cidrRange: server.cidrRange, wgAddress: server.wgAddress, enableNat: server.enableNat, groups: [] });
+		const tags = await db.query.peerTagsTable.findMany({ where: eq(peerTagsTable.serverPeerId, server.id) });
+		const grantRows = await db.query.policyGrantsTable.findMany({
+			where: and(eq(policyGrantsTable.serverPeerId, server.id), eq(policyGrantsTable.enabled, true)),
+			orderBy: asc(policyGrantsTable.position),
+		});
+
+		if (tags.length === 0 && grantRows.length === 0) {
+			result.push({ interfaceName: server.interfaceName, cidrRange: server.cidrRange, wgAddress: server.wgAddress, enableNat: server.enableNat, tags: [], grants: [], governedIps: [] });
 			continue;
 		}
 
-		const firewallGroups: FirewallGroup[] = [];
-		for (const group of groups) {
-			const members = await db.query.peersTable.findMany({ where: eq(peersTable.groupId, group.id) });
-			const rules = await db.query.peerGroupRulesTable.findMany({ where: eq(peerGroupRulesTable.srcGroupId, group.id) });
+		const peers = await db.query.peersTable.findMany({ where: eq(peersTable.serverPeerId, server.id) });
+		const peerIp = new Map(peers.map((p) => [p.id, p.wgAddress]));
 
-			const dstCidrs = rules.filter((r) => r.dstCidr).map((r) => r.dstCidr!);
-			for (const cidr of dstCidrs) {
-				if (!isIpv4Cidr(cidr)) {
-					log.warn(`Group ${group.id} (${group.name}) has a non-ipv4 dstCidr rule "${cidr}" - ignoring it. Remove and re-add the rule via the api/ui to clean it up.`);
-				}
+		const firewallTags: FirewallTag[] = [];
+		const governedPeerIds = new Set<string>();
+
+		for (const tag of tags) {
+			const assignments = await db.query.peerTagAssignmentsTable.findMany({ where: eq(peerTagAssignmentsTable.tagId, tag.id) });
+			const memberIps: string[] = [];
+			for (const a of assignments) {
+				const ip = peerIp.get(a.peerId);
+				if (!ip) continue; // stale assignment (peer deleted) - be defensive, ignore it
+				memberIps.push(ip);
+				governedPeerIds.add(a.peerId);
 			}
-
-			firewallGroups.push({
-				id: group.id,
-				name: group.friendlyName ?? group.name,
-				allowServer: group.allowServer,
-				allowInternet: group.allowInternet,
-				memberIps: members.map((m) => m.wgAddress),
-				dstGroupIds: rules.filter((r) => r.dstGroupId).map((r) => r.dstGroupId!),
-				dstCidrs,
-			});
+			firewallTags.push({ id: tag.id, name: tag.friendlyName ?? tag.name, memberIps });
 		}
 
-		result.push({ interfaceName: server.interfaceName, cidrRange: server.cidrRange, wgAddress: server.wgAddress, enableNat: server.enableNat, groups: firewallGroups });
+		const firewallGrants: FirewallGrant[] = [];
+		for (const grant of grantRows) {
+			let src: FirewallGrant['src'] | undefined;
+			if (grant.srcKind === 'tag' && grant.srcTagId) {
+				src = { kind: 'tag', tagId: grant.srcTagId };
+			} else if (grant.srcKind === 'peer' && grant.srcPeerId) {
+				const ip = peerIp.get(grant.srcPeerId);
+				if (ip) {
+					src = { kind: 'peer', ip };
+					governedPeerIds.add(grant.srcPeerId);
+				}
+			}
+			if (!src) {
+				log.warn(`Grant ${grant.id} on server ${server.id} has an unresolvable source - ignoring it. Remove and re-add the grant via the api/ui to clean it up.`);
+				continue;
+			}
+
+			let dst: FirewallGrant['dst'] | undefined;
+			if (grant.dstKind === 'tag' && grant.dstTagId) {
+				dst = { kind: 'tag', tagId: grant.dstTagId };
+			} else if (grant.dstKind === 'peer' && grant.dstPeerId) {
+				const ip = peerIp.get(grant.dstPeerId);
+				if (ip) dst = { kind: 'peer', ip };
+			} else if (grant.dstKind === 'cidr' && grant.dstCidr) {
+				dst = { kind: 'cidr', cidr: grant.dstCidr };
+			} else if (grant.dstKind === 'server') {
+				dst = { kind: 'server' };
+			} else if (grant.dstKind === 'internet') {
+				dst = { kind: 'internet' };
+			} else if (grant.dstKind === 'any') {
+				dst = { kind: 'any' };
+			}
+			if (!dst) {
+				log.warn(`Grant ${grant.id} on server ${server.id} has an unresolvable destination - ignoring it. Remove and re-add the grant via the api/ui to clean it up.`);
+				continue;
+			}
+			if (dst.kind === 'cidr' && !isIpv4Cidr(dst.cidr)) {
+				log.warn(`Grant ${grant.id} on server ${server.id} has a non-ipv4 dstCidr "${dst.cidr}" - ignoring it. Remove and re-add the grant via the api/ui to clean it up.`);
+				continue;
+			}
+
+			firewallGrants.push({ action: grant.action, src, dst, protocol: grant.protocol, ports: grant.ports, comment: grant.comment });
+		}
+
+		result.push({
+			interfaceName: server.interfaceName,
+			cidrRange: server.cidrRange,
+			wgAddress: server.wgAddress,
+			enableNat: server.enableNat,
+			tags: firewallTags,
+			grants: firewallGrants,
+			governedIps: [...governedPeerIds].map((id) => peerIp.get(id)).filter((ip): ip is string => Boolean(ip)),
+		});
 	}
 
 	return result;

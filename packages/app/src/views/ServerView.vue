@@ -6,7 +6,10 @@
 		<div class="flex flex-col gap-4" v-if="server">
 			<div class="flex items-center justify-between flex-wrap gap-3">
 				<h1 class="text-lg font-bold text-text"><span class="text-accent-dim">///</span> {{ server.friendlyName ?? server.id }}</h1>
-				<BaseButton :as="'router-link'" :to="{ name: 'servers-policy', params: { id: server.id } }" variant="secondary">policy</BaseButton>
+				<div class="flex gap-2">
+					<BaseButton :as="'router-link'" :to="{ name: 'servers-traffic', params: { id: server.id } }" variant="secondary">traffic</BaseButton>
+					<BaseButton :as="'router-link'" :to="{ name: 'servers-policy', params: { id: server.id } }" variant="secondary">policy</BaseButton>
+				</div>
 			</div>
 
 			<PeerModal v-model:visible="showAddPeerModal" :server="server" />
@@ -61,10 +64,10 @@
 									<span class="text-text text-right break-words">{{ peer.peerInfo.wgLatestHandshake == 0 ? '-' : new Date(peer.peerInfo.wgLatestHandshake * 1000).toLocaleString() }}</span>
 
 									<span class="whitespace-nowrap">received</span>
-									<span class="text-text text-right">{{ Math.round((peer.peerInfo.wgTransferRx * 100) / 1024) / 100 }} KiB</span>
+									<span class="text-text text-right">{{ formatBytes(peer.peerInfo.wgTransferRx) }}</span>
 
 									<span class="whitespace-nowrap">transmitted</span>
-									<span class="text-text text-right">{{ Math.round((peer.peerInfo.wgTransferTx * 100) / 1024) / 100 }} KiB</span>
+									<span class="text-text text-right">{{ formatBytes(peer.peerInfo.wgTransferTx) }}</span>
 								</template>
 							</div>
 						</div>
@@ -107,8 +110,8 @@
 					</td>
 					<td class="px-4 py-3 text-muted text-xs">
 						<div v-if="peer.peerInfo">
-							<div>&darr; {{ Math.round((peer.peerInfo.wgTransferRx * 100) / 1024) / 100 }} KiB</div>
-							<div>&uarr; {{ Math.round((peer.peerInfo.wgTransferTx * 100) / 1024) / 100 }} KiB</div>
+							<div>&darr; {{ formatBytes(peer.peerInfo.wgTransferRx) }}</div>
+							<div>&uarr; {{ formatBytes(peer.peerInfo.wgTransferTx) }}</div>
 						</div>
 						<div v-else>-</div>
 					</td>
@@ -153,7 +156,12 @@ import { ref, computed } from 'vue';
 import { api } from '@app/queries/edenClient';
 import QrcodeVue from 'qrcode.vue';
 import PeerModal from '@app/components/PeerModal.vue';
+import { formatBytes } from '@app/lib/format';
 import type { Peer } from '@server/db/schema';
+
+// wgLast* are internal delta-tracking bookkeeping the api never returns (see serversPeers.ts) -
+// every peer object handled in this view/PeerModal omits them.
+type PublicPeer = Omit<Peer, 'wgLastRxBytes' | 'wgLastTxBytes' | 'wgLastSampledAt'>;
 import BaseButton from '@app/components/BaseButton.vue';
 import BaseCard from '@app/components/BaseCard.vue';
 import DataView from '@app/components/DataView.vue';
@@ -200,9 +208,9 @@ const copyConfig = async () => {
 
 const showAddPeerModal = ref(false);
 const showEditPeerModal = ref(false);
-const selectedPeer = ref<Peer>();
+const selectedPeer = ref<PublicPeer>();
 
-const editPeer = (peer: Peer) => {
+const editPeer = (peer: PublicPeer) => {
 	selectedPeer.value = peer;
 	showEditPeerModal.value = true;
 };

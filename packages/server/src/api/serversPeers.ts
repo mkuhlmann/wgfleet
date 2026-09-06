@@ -57,11 +57,15 @@ export const serversPeersRoute = new Elysia()
 				tagIdsByPeer.set(a.peerId, list);
 			}
 
-			const peersWithInfo: (Peer & { tagIds: string[]; peerInfo: null | { connected: boolean; wgTransferRx: number; wgTransferTx: number; wgLatestHandshake: number; wgEndpoint: string } })[] =
-				[];
+			const peersWithInfo: (Omit<Peer, 'wgLastRxBytes' | 'wgLastTxBytes' | 'wgLastSampledAt'> & {
+				tagIds: string[];
+				peerInfo: null | { connected: boolean; wgTransferRx: number; wgTransferTx: number; wgLatestHandshake: number; wgEndpoint: string };
+			})[] = [];
 
 			for (const peer of peers) {
-				peersWithInfo.push({ ...peer, tagIds: tagIdsByPeer.get(peer.id) ?? [], peerInfo: wgManager.peerInfo[peer.wgPublicKey] ?? null });
+				// wgLast* are internal bookkeeping for wg/traffic.ts's delta computation - not for public consumption
+				const { wgLastRxBytes, wgLastTxBytes, wgLastSampledAt, ...peerPublic } = peer;
+				peersWithInfo.push({ ...peerPublic, tagIds: tagIdsByPeer.get(peer.id) ?? [], peerInfo: wgManager.peerInfo[peer.wgPublicKey] ?? null });
 			}
 
 			return peersWithInfo;

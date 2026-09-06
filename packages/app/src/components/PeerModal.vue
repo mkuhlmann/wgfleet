@@ -53,7 +53,8 @@ import BaseModal from './BaseModal.vue';
 const toast = useToast();
 
 const props = defineProps<{
-	peer?: Peer & { tagIds?: string[] };
+	// wgLast* are internal delta-tracking bookkeeping the api never returns (see serversPeers.ts)
+	peer?: Omit<Peer, 'wgLastRxBytes' | 'wgLastTxBytes' | 'wgLastSampledAt'> & { tagIds?: string[] };
 	server: ServerPeer;
 }>();
 

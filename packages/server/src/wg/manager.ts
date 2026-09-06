@@ -2,6 +2,7 @@ import { db } from '@server/db';
 import { peersTable, type ServerPeer } from '@server/db/schema';
 import { isInterfaceUp, resetFirewall, startServer, stopServer, wgShow } from './shell';
 import { syncFirewall } from './firewall';
+import { recordServerTraffic, rollupAndPrune, trafficStatsEnabled } from './traffic';
 import { createLog } from '@server/lib/log';
 import { eq } from 'drizzle-orm';
 
@@ -49,13 +50,36 @@ const constructWgManager = () => {
 					wgLatestHandshake: peer.latestHandshake,
 				};
 			}
+
+			if (trafficStatsEnabled) {
+				try {
+					await recordServerTraffic(
+						server,
+						wgShowResult.peers.map((p) => ({ publicKey: p.publicKey, transferRx: p.transferRx, transferTx: p.transferTx }))
+					);
+				} catch (error) {
+					log.error(`Failed to record traffic for ${server.interfaceName}: ${error}`);
+				}
+			}
 		}
 	};
 
 	let loopTimeout: Timer | null = null;
+	let tickCount = 0;
+	const ROLLUP_EVERY_N_TICKS = 120; // ~1h at the 30s tick cadence below
 
 	const loop = async () => {
-		refreshInfo();
+		await refreshInfo();
+
+		tickCount++;
+		if (trafficStatsEnabled && tickCount % ROLLUP_EVERY_N_TICKS === 0) {
+			try {
+				await rollupAndPrune();
+			} catch (error) {
+				log.error(`Traffic rollup/prune failed: ${error}`);
+			}
+		}
+
 		loopTimeout = setTimeout(loop, 30000);
 	};
 

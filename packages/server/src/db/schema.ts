@@ -1,5 +1,5 @@
-import { relations } from 'drizzle-orm';
-import { integer, text, sqliteTable, unique } from 'drizzle-orm/sqlite-core';
+import { relations, sql } from 'drizzle-orm';
+import { integer, text, sqliteTable, unique, index } from 'drizzle-orm/sqlite-core';
 import { nanoid } from 'nanoid';
 
 export const serverPeersTable = sqliteTable('serverPeers', {
@@ -36,6 +36,16 @@ export const serverPeersTable = sqliteTable('serverPeers', {
 	// inert without this - keeps upgrading an existing deployment from silently
 	// turning it into an internet gateway.
 	enableNat: integer('enableNat', { mode: 'boolean' }).notNull().default(false),
+
+	// Lifetime traffic totals since statsSince, manually resettable (see api/traffic.ts). Kept
+	// as running counters rather than derived from trafficBucketsTable because that table is
+	// pruned (see wg/traffic.ts) and because a server's total must keep counting traffic from
+	// peers that have since been deleted.
+	lifetimeRxBytes: integer('lifetimeRxBytes').notNull().default(0),
+	lifetimeTxBytes: integer('lifetimeTxBytes').notNull().default(0),
+	statsSince: integer('statsSince', { mode: 'timestamp' })
+		.notNull()
+		.default(sql`(unixepoch())`),
 });
 
 export type ServerPeer = typeof serverPeersTable.$inferSelect;
@@ -220,6 +230,20 @@ export const peersTable = sqliteTable('peers', {
 
 	// no groupId column any more - a peer's tags are the many-to-many peerTagAssignmentsTable.
 	// no tags and no grant naming this peer directly = unrestricted (today's behaviour preserved).
+
+	// Last raw cumulative rx/tx reported by `wg show` (see wg/shell.ts's wgShow), used by
+	// wg/traffic.ts to compute a per-tick delta. wgLastSampledAt is null until the first sample -
+	// that (not a zero byte count) is how "never sampled" is distinguished from "sampled, 0 bytes".
+	wgLastRxBytes: integer('wgLastRxBytes').notNull().default(0),
+	wgLastTxBytes: integer('wgLastTxBytes').notNull().default(0),
+	wgLastSampledAt: integer('wgLastSampledAt', { mode: 'timestamp' }),
+
+	// Lifetime traffic totals since statsSince, manually resettable (see api/traffic.ts).
+	lifetimeRxBytes: integer('lifetimeRxBytes').notNull().default(0),
+	lifetimeTxBytes: integer('lifetimeTxBytes').notNull().default(0),
+	statsSince: integer('statsSince', { mode: 'timestamp' })
+		.notNull()
+		.default(sql`(unixepoch())`),
 });
 
 export const peersRelation = relations(peersTable, ({ one, many }) => ({
@@ -231,3 +255,40 @@ export const peersRelation = relations(peersTable, ({ one, many }) => ({
 }));
 
 export type Peer = typeof peersTable.$inferSelect;
+
+// RRD-style rollup storage for the traffic-graph feature (see wg/traffic.ts). One row = one
+// (peer, resolution, aligned bucket) accumulator. There is deliberately no separate server-level
+// bucket table - server-aggregate time series are a SUM(...) GROUP BY bucketStart query over
+// these rows at read time (see api/traffic.ts), avoiding a second write/consolidation path that
+// could drift from the peer-level one.
+export const trafficBucketsTable = sqliteTable(
+	'trafficBuckets',
+	{
+		id: text('id')
+			.primaryKey()
+			.$defaultFn(() => nanoid()),
+
+		peerId: text('peerId')
+			.notNull()
+			.references(() => peersTable.id, { onDelete: 'cascade' }),
+
+		// denormalized from peersTable.serverPeerId - a peer never moves between servers in this
+		// codebase, so this is stable and lets server-aggregate queries group by serverPeerId
+		// directly without joining peersTable on every read.
+		serverPeerId: text('serverPeerId')
+			.notNull()
+			.references(() => serverPeersTable.id, { onDelete: 'cascade' }),
+
+		resolution: text('resolution', { enum: ['1m', '1h', '1d'] }).notNull(),
+
+		// start of the aligned bucket (unix seconds, UTC-aligned to the resolution boundary - see
+		// wg/traffic.ts's bucketStartFor)
+		bucketStart: integer('bucketStart', { mode: 'timestamp' }).notNull(),
+
+		rxBytes: integer('rxBytes').notNull().default(0),
+		txBytes: integer('txBytes').notNull().default(0),
+	},
+	(t) => [unique().on(t.peerId, t.resolution, t.bucketStart), index('trafficBuckets_server_res_bucket_idx').on(t.serverPeerId, t.resolution, t.bucketStart)]
+);
+
+export type TrafficBucket = typeof trafficBucketsTable.$inferSelect;

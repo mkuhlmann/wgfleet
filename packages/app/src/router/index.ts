@@ -25,6 +25,11 @@ const router = createRouter({
 			name: 'servers-policy',
 			component: () => import('../views/ServerPolicyView.vue'),
 		},
+		{
+			path: '/servers/:id/traffic',
+			name: 'servers-traffic',
+			component: () => import('../views/TrafficView.vue'),
+		},
 	],
 });
 

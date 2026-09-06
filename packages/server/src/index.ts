@@ -8,6 +8,7 @@ import { peersRoutes } from './api/peers';
 import { wgManager } from './wg/manager';
 import { serversPeersRoute } from './api/serversPeers';
 import { policyRoutes } from './api/policy';
+import { trafficRoutes } from './api/traffic';
 import { migrateDb } from './db';
 import { nanoid } from 'nanoid';
 
@@ -37,7 +38,7 @@ const _app = new Elysia()
 		httpLog.info(`${request.method} ${request.url} ${server?.requestIP(request)?.address}`);
 	})
 	.use(auth)
-	.group('/api/v1', (app) => app.use(serversRoutes).use(serversPeersRoute).use(peersRoutes).use(policyRoutes))
+	.group('/api/v1', (app) => app.use(serversRoutes).use(serversPeersRoute).use(peersRoutes).use(policyRoutes).use(trafficRoutes))
 	.use(
 		staticPlugin({
 			indexHTML: true,

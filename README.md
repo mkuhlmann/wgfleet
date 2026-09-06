@@ -1,34 +1,36 @@
 # wg-api-manager
 
-> ℹ️ **This project is still in development but useable.**
+wg-api-manager manages WireGuard VPN deployments across multiple servers from a single API, built to
+automate a large-scale VPN for thin clients across multiple locations. Multi-server support is the point:
+as far as I know no other project handles more than one WireGuard server per install. It's api-first,
+with a web ui on top for managing configurations manually. I run it in production. It's opinionated and
+documentation is thin in places - feedback and pull requests welcome.
 
-I created this project to manage an automated large scale wireguard vpn for thin clients in multiple locations. I also needed support for multiple wireguard servers, which as far as I know no other project supports. The project is primarily designed to be used with an api, but also provides a simple ui for managing configurations. I already use wg-api-manager in production use, but keep in mind it is still in development, opinionated, lacks testing and documention. I am happy about any feedback or pull-requests.
+![wg-api-manager server view](docs/screenshot.png)
 
 ## Features
 
-- Create and manage **multiple** WireGuard VPN configurations
-- **No complex environment variables or configuration files**
-- Automated ip allocation based on CIDR-subnet
-- Supports multiple servers and endpoints
-- Primarily designed to use api
-- Optionally provides simple ui for managing configurations
-- Automatically generate client configurations (including QR codes)
+- Multiple WireGuard servers and endpoints in one install, each with its own subnet
+- No config files - everything is managed through the api or the ui
+- Automatic IP allocation from each server's CIDR range
+- Api-first, with a web ui on top for day-to-day management
+- Client config generation, including QR codes for mobile clients
 - Restricted clients: tag peers and write an ordered allow/deny policy (grants) controlling what each tag - or an
   individual peer - can reach, enforced server-side with nftables (see [Restricted Clients](#restricted-clients) below)
-- Redirect traffic through the VPN, including full internet egress, per tag
-- Traffic stats
-- Authenticated with administration, server and peer token
+- Per-tag internet egress (NAT) through the VPN
+- Bandwidth graphs and lifetime traffic totals, per server and per peer
+- Separate administration, server and peer tokens
 
 ## Planned Features
 
 - Desktop client
-- Perspectively sso (openid connect)
+- Possibly SSO (OpenID Connect)
 
 ## Installation
 
-### 1. Generate Adminstration Token
+### 1. Generate Administration Token
 
-Generate an unique and cryptographically secure administration token.
+Generate a unique and cryptographically secure administration token.
 
 ```bash
 openssl rand -base64 32

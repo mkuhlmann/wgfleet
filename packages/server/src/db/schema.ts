@@ -47,9 +47,12 @@ export const serverPeersTable = sqliteTable('serverPeers', {
 	// table that already has rows ("Cannot add a column with non-constant default") - the literal
 	// `0` default lets the migration add the column, then an UPDATE in the same migration backfills
 	// existing rows to the real current time (see drizzle/0003_futuristic_black_knight.sql).
-	statsSince: integer('statsSince', { mode: 'timestamp' })
-		.notNull()
-		.default(sql`0`),
+	// drizzle-orm's sqlite dialect always prefers a static `.default()` over `$defaultFn()` when
+	// both are set (it never even calls defaultFn), so this `0` would otherwise leak into every
+	// new row's insert too - every create-server/create-peer handler must pass statsSince: new
+	// Date() explicitly (see api/servers.ts, api/serversPeers.ts) rather than relying on this
+	// column default for "now".
+	statsSince: integer('statsSince', { mode: 'timestamp' }).notNull().default(sql`0`),
 });
 
 export type ServerPeer = typeof serverPeersTable.$inferSelect;
@@ -249,9 +252,12 @@ export const peersTable = sqliteTable('peers', {
 	// table that already has rows ("Cannot add a column with non-constant default") - the literal
 	// `0` default lets the migration add the column, then an UPDATE in the same migration backfills
 	// existing rows to the real current time (see drizzle/0003_futuristic_black_knight.sql).
-	statsSince: integer('statsSince', { mode: 'timestamp' })
-		.notNull()
-		.default(sql`0`),
+	// drizzle-orm's sqlite dialect always prefers a static `.default()` over `$defaultFn()` when
+	// both are set (it never even calls defaultFn), so this `0` would otherwise leak into every
+	// new row's insert too - every create-server/create-peer handler must pass statsSince: new
+	// Date() explicitly (see api/servers.ts, api/serversPeers.ts) rather than relying on this
+	// column default for "now".
+	statsSince: integer('statsSince', { mode: 'timestamp' }).notNull().default(sql`0`),
 });
 
 export const peersRelation = relations(peersTable, ({ one, many }) => ({

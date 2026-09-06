@@ -12,6 +12,7 @@
 	},
 	"dependencies": {
 		"@elysiajs/eden": "^1.4.5",
+		"@tanstack/charts": "0.16.0",
 		"@tanstack/vue-query": "^5.102.8",
 		"@types/bun": "^1.4.0",
 		"@wg-manager/server": "workspace:*",

@@ -155,6 +155,9 @@ export const serversPeersRoute = new Elysia()
 					wgPresharedKey: await wgGenPsk(),
 
 					wgAddress: ip,
+
+					// the column default is a literal 0 (epoch) - see schema.ts's statsSince comment
+					statsSince: new Date(),
 				})
 				.returning();
 

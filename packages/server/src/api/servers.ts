@@ -64,6 +64,9 @@ export const serversRoutes = new Elysia()
 					wgPublicKey: publicKey,
 
 					enableNat: body.enableNat,
+
+					// the column default is a literal 0 (epoch) - see schema.ts's statsSince comment
+					statsSince: new Date(),
 				})
 				.returning();
 

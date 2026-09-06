@@ -177,6 +177,7 @@ const createServer = useMutation({
 	},
 	onSuccess: () => {
 		queryClient.invalidateQueries({ queryKey: ['servers'] });
+		queryClient.invalidateQueries({ queryKey: ['server'] });
 		visible.value = false;
 	},
 	onError: (error) => {
@@ -197,6 +198,7 @@ const updateServer = useMutation({
 	},
 	onSuccess: () => {
 		queryClient.invalidateQueries({ queryKey: ['servers'] });
+		queryClient.invalidateQueries({ queryKey: ['server'] });
 		visible.value = false;
 	},
 	onError: (error) => {

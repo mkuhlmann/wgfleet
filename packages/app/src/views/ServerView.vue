@@ -12,12 +12,19 @@
 			<PeerModal v-model:visible="showAddPeerModal" :server="server" />
 			<PeerModal v-model:visible="showEditPeerModal" :peer="selectedPeer" :server="server" />
 			<PeerTrafficModal v-model:visible="showPeerTrafficModal" :server-id="server.id" :peer="selectedTrafficPeer" />
+			<ServerModal v-model:visible="showEditServerModal" :server="server" />
 
 			<div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
 				<BaseCard :title="server.friendlyName ?? server.id">
+					<template #actions>
+						<BaseButton @click="showEditServerModal = true" variant="ghost" size="sm">edit</BaseButton>
+					</template>
 					<div class="grid grid-cols-[auto_1fr] gap-x-6 gap-y-2 text-sm text-muted">
 						<span class="whitespace-nowrap">id</span>
 						<span class="text-text text-right break-all">{{ server.id }}</span>
+
+						<span class="whitespace-nowrap">interface</span>
+						<span class="text-text text-right break-all">{{ server.interfaceName }}</span>
 
 						<span class="whitespace-nowrap">endpoint</span>
 						<span class="text-text text-right break-all">{{ server.wgEndpoint }}</span>
@@ -25,8 +32,17 @@
 						<span class="whitespace-nowrap">listen port</span>
 						<span class="text-text text-right">{{ server.wgListenPort }}</span>
 
+						<span class="whitespace-nowrap">wireguard address</span>
+						<span class="text-text text-right break-all">{{ server.wgAddress }}</span>
+
 						<span class="whitespace-nowrap">cidr range</span>
 						<span class="text-text text-right break-all">{{ server.cidrRange }}</span>
+
+						<span class="whitespace-nowrap">reserved ips</span>
+						<span class="text-text text-right">{{ server.reservedIps }}</span>
+
+						<span class="whitespace-nowrap">nat</span>
+						<span class="text-text text-right">{{ server.enableNat ? 'enabled' : 'disabled' }}</span>
 					</div>
 				</BaseCard>
 
@@ -164,6 +180,7 @@ import { api } from '@app/queries/edenClient';
 import QrcodeVue from 'qrcode.vue';
 import PeerModal from '@app/components/PeerModal.vue';
 import PeerTrafficModal from '@app/components/PeerTrafficModal.vue';
+import ServerModal from '@app/components/ServerModal.vue';
 import TrafficCard from '@app/components/TrafficCard.vue';
 import { formatBytes } from '@app/lib/format';
 import type { Peer } from '@server/db/schema';
@@ -221,6 +238,7 @@ const copyConfig = async () => {
 
 const showAddPeerModal = ref(false);
 const showEditPeerModal = ref(false);
+const showEditServerModal = ref(false);
 const selectedPeer = ref<PublicPeer>();
 
 const editPeer = (peer: PublicPeer) => {

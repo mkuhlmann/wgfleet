@@ -16,20 +16,14 @@
 
 		<div v-if="enabled === false" class="text-sm text-muted text-center py-6">traffic statistics disabled</div>
 
-		<div v-else class="flex items-stretch gap-4">
-			<div class="flex-1 min-w-0">
-				<TrafficChart :buckets="buckets" />
-			</div>
-			<div class="flex flex-col justify-between shrink-0 text-right text-sm">
-				<div class="text-accent">&darr; {{ formatBytes(totals.rx) }}</div>
-				<div class="text-muted">&uarr; {{ formatBytes(totals.tx) }}</div>
-			</div>
-		</div>
+		<template v-else>
+			<TrafficChart :buckets="buckets" />
 
-		<div v-if="enabled !== false" class="flex gap-4 text-xs mt-2">
-			<span class="text-accent">[ rx ]</span>
-			<span class="text-muted">[ tx ]</span>
-		</div>
+			<div class="flex gap-4 text-xs mt-2">
+				<span class="text-accent">[ rx ] &darr; {{ formatBytes(totals.rx) }}</span>
+				<span class="text-muted">[ tx ] &uarr; {{ formatBytes(totals.tx) }}</span>
+			</div>
+		</template>
 	</BaseCard>
 </template>
 

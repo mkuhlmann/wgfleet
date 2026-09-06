@@ -17,7 +17,9 @@ ALTER TABLE `peers` ADD `wgLastTxBytes` integer DEFAULT 0 NOT NULL;--> statement
 ALTER TABLE `peers` ADD `wgLastSampledAt` integer;--> statement-breakpoint
 ALTER TABLE `peers` ADD `lifetimeRxBytes` integer DEFAULT 0 NOT NULL;--> statement-breakpoint
 ALTER TABLE `peers` ADD `lifetimeTxBytes` integer DEFAULT 0 NOT NULL;--> statement-breakpoint
-ALTER TABLE `peers` ADD `statsSince` integer DEFAULT (unixepoch()) NOT NULL;--> statement-breakpoint
+ALTER TABLE `peers` ADD `statsSince` integer DEFAULT 0 NOT NULL;--> statement-breakpoint
 ALTER TABLE `serverPeers` ADD `lifetimeRxBytes` integer DEFAULT 0 NOT NULL;--> statement-breakpoint
 ALTER TABLE `serverPeers` ADD `lifetimeTxBytes` integer DEFAULT 0 NOT NULL;--> statement-breakpoint
-ALTER TABLE `serverPeers` ADD `statsSince` integer DEFAULT (unixepoch()) NOT NULL;
+ALTER TABLE `serverPeers` ADD `statsSince` integer DEFAULT 0 NOT NULL;--> statement-breakpoint
+UPDATE `peers` SET `statsSince` = unixepoch() WHERE `statsSince` = 0;--> statement-breakpoint
+UPDATE `serverPeers` SET `statsSince` = unixepoch() WHERE `statsSince` = 0;

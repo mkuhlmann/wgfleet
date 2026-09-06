@@ -271,7 +271,7 @@
           "primaryKey": false,
           "notNull": true,
           "autoincrement": false,
-          "default": "(unixepoch())"
+          "default": "0"
         }
       },
       "indexes": {},
@@ -615,7 +615,7 @@
           "primaryKey": false,
           "notNull": true,
           "autoincrement": false,
-          "default": "(unixepoch())"
+          "default": "0"
         }
       },
       "indexes": {},

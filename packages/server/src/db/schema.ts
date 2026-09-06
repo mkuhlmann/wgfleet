@@ -43,9 +43,13 @@ export const serverPeersTable = sqliteTable('serverPeers', {
 	// peers that have since been deleted.
 	lifetimeRxBytes: integer('lifetimeRxBytes').notNull().default(0),
 	lifetimeTxBytes: integer('lifetimeTxBytes').notNull().default(0),
+	// SQLite's ALTER TABLE ADD COLUMN refuses a non-constant default (e.g. `unixepoch()`) on a
+	// table that already has rows ("Cannot add a column with non-constant default") - the literal
+	// `0` default lets the migration add the column, then an UPDATE in the same migration backfills
+	// existing rows to the real current time (see drizzle/0003_futuristic_black_knight.sql).
 	statsSince: integer('statsSince', { mode: 'timestamp' })
 		.notNull()
-		.default(sql`(unixepoch())`),
+		.default(sql`0`),
 });
 
 export type ServerPeer = typeof serverPeersTable.$inferSelect;
@@ -241,9 +245,13 @@ export const peersTable = sqliteTable('peers', {
 	// Lifetime traffic totals since statsSince, manually resettable (see api/traffic.ts).
 	lifetimeRxBytes: integer('lifetimeRxBytes').notNull().default(0),
 	lifetimeTxBytes: integer('lifetimeTxBytes').notNull().default(0),
+	// SQLite's ALTER TABLE ADD COLUMN refuses a non-constant default (e.g. `unixepoch()`) on a
+	// table that already has rows ("Cannot add a column with non-constant default") - the literal
+	// `0` default lets the migration add the column, then an UPDATE in the same migration backfills
+	// existing rows to the real current time (see drizzle/0003_futuristic_black_knight.sql).
 	statsSince: integer('statsSince', { mode: 'timestamp' })
 		.notNull()
-		.default(sql`(unixepoch())`),
+		.default(sql`0`),
 });
 
 export const peersRelation = relations(peersTable, ({ one, many }) => ({

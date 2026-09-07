@@ -67,8 +67,9 @@ const main = async () => {
 	log.info('Starting wireguard manager');
 	wgManager.start();
 
-	log.info('Starting http server');
-	_app.listen(3000);
+	const port = Number(process.env.PORT) || 3000;
+	log.info(`Starting http server on port ${port}`);
+	_app.listen(port);
 
 	httpLog.info(`api ist running at ${_app.server?.hostname}:${_app.server?.port}`);
 };

@@ -8,7 +8,7 @@ This is a Bun workspace monorepo (`packages/server`, `packages/app`). Root scrip
 
 ```bash
 bun install                       # from repo root
-bun run dev                       # root: runs `dev` in both packages in parallel (server on :3000, vite on :5173 w/ proxy)
+bun run dev                       # root: runs `dev` in both packages in parallel (server on PORT / :3000, vite on :5173 w/ proxy)
 ```
 
 **Server** (`packages/server`, Elysia + Bun + Drizzle/SQLite):
@@ -26,7 +26,7 @@ typecheck, since it transitively resolves the whole Elysia plugin chain through 
 
 **App** (`packages/app`, Vue 3 + Vite + Tailwind v4):
 ```bash
-bun run --cwd packages/app dev            # vite dev server, proxies /api -> localhost:3000
+bun run --cwd packages/app dev            # vite dev server, proxies /api -> server port (PORT env, default :3000)
 bun run --cwd packages/app build          # type-check + vite build
 bun run --cwd packages/app type-check     # bun scripts/type-check.mjs --build - see the file's header comment for why
                                             # this isn't just `vue-tsc --build` (TS7 + Bun interop workarounds)

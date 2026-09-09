@@ -1,0 +1,86 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 'Version bump'
+        required: true
+        type: choice
+        default: patch
+        options:
+          - patch
+          - minor
+          - major
+          - exact
+      version:
+        description: 'Exact version (only used when bump is "exact", e.g. 1.2.3)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute new version
+        id: version
+        run: |
+          current=$(node -p "require('./package.json').version")
+
+          if [ "${{ inputs.bump }}" = "exact" ]; then
+            new="${{ inputs.version }}"
+            if [ -z "$new" ]; then
+              echo "version input is required when bump is 'exact'" >&2
+              exit 1
+            fi
+          else
+            IFS='.' read -r major minor patch <<< "$current"
+            case "${{ inputs.bump }}" in
+              major) new="$((major + 1)).0.0" ;;
+              minor) new="${major}.$((minor + 1)).0" ;;
+              patch) new="${major}.${minor}.$((patch + 1))" ;;
+            esac
+          fi
+
+          if ! [[ "$new" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "computed version '$new' is not valid semver" >&2
+            exit 1
+          fi
+
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          echo "new=$new" >> "$GITHUB_OUTPUT"
+
+      - name: Update package.json
+        run: |
+          node -e "
+            const fs = require('fs');
+            const pkg = require('./package.json');
+            pkg.version = '${{ steps.version.outputs.new }}';
+            fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+          "
+
+      - name: Commit and tag
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add package.json
+          git commit -m "release: v${{ steps.version.outputs.new }}"
+          git tag "v${{ steps.version.outputs.new }}"
+          git push origin HEAD:main
+          git push origin "v${{ steps.version.outputs.new }}"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "v${{ steps.version.outputs.new }}" \
+            --title "v${{ steps.version.outputs.new }}" \
+            --generate-notes

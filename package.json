@@ -1,5 +1,6 @@
 {
   "name": "wgfleet",
+  "version": "0.1.0",
   "scripts": {
     "dev": "bun --filter '*' dev",
     "start": "bun --cwd packages/server start"

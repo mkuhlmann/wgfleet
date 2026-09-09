@@ -1,8 +1,9 @@
 import { db } from '@server/db';
-import { peerTagAssignmentsTable, peerTagsTable, peersTable, policyGrantsTable, serverPeersTable } from '@server/db/schema';
+import { serverPeersTable } from '@server/db/schema';
 import { createLog } from '@server/lib/log';
-import { and, asc, eq } from 'drizzle-orm';
+import { asc } from 'drizzle-orm';
 import { applyFirewall } from './shell';
+import { loadPolicyGraph, type PolicyGraph } from '@server/db/policyGraph';
 
 const log = createLog('wg:firewall');
 
@@ -244,97 +245,99 @@ const indent = (block: string) =>
 		.map((line) => (line ? '\t' + line : line))
 		.join('\n');
 
-const loadFirewallState = async (): Promise<FirewallServer[]> => {
-	const servers = await db.query.serverPeersTable.findMany();
+// Builds this server's FirewallServer from its policy graph (see db/policyGraph.ts) -
+// resolves tag/peer references to ips, drops anything unresolvable (stale assignment, a
+// grant naming a deleted tag/peer, a non-ipv4 dstCidr) rather than letting it break the
+// whole ruleset, and derives `governedIps` per the "governed" rule documented on
+// FirewallServer above.
+const toFirewallServer = (graph: PolicyGraph): FirewallServer => {
+	const peerIp = new Map(graph.peers.map((p) => [p.id, p.wgAddress]));
 
-	const result: FirewallServer[] = [];
+	const peerIdsByTag = new Map<string, string[]>();
+	for (const a of graph.assignments) {
+		const list = peerIdsByTag.get(a.tagId) ?? [];
+		list.push(a.peerId);
+		peerIdsByTag.set(a.tagId, list);
+	}
 
-	for (const server of servers) {
-		const tags = await db.query.peerTagsTable.findMany({ where: eq(peerTagsTable.serverPeerId, server.id) });
-		const grantRows = await db.query.policyGrantsTable.findMany({
-			where: and(eq(policyGrantsTable.serverPeerId, server.id), eq(policyGrantsTable.enabled, true)),
-			orderBy: asc(policyGrantsTable.position),
-		});
+	const governedPeerIds = new Set<string>();
+	const firewallTags: FirewallTag[] = graph.tags.map((tag) => {
+		const memberIps: string[] = [];
+		for (const peerId of peerIdsByTag.get(tag.id) ?? []) {
+			const ip = peerIp.get(peerId);
+			if (!ip) continue; // stale assignment (peer deleted) - be defensive, ignore it
+			memberIps.push(ip);
+			governedPeerIds.add(peerId);
+		}
+		return { id: tag.id, name: tag.friendlyName ?? tag.name, memberIps };
+	});
 
-		if (tags.length === 0 && grantRows.length === 0) {
-			result.push({ interfaceName: server.interfaceName, cidrRange: server.cidrRange, wgAddress: server.wgAddress, enableNat: server.enableNat, tags: [], grants: [], governedIps: [] });
+	const firewallGrants: FirewallGrant[] = [];
+	for (const grant of graph.grants) {
+		if (!grant.enabled) continue;
+
+		let src: FirewallGrant['src'] | undefined;
+		if (grant.srcKind === 'tag' && grant.srcTagId) {
+			src = { kind: 'tag', tagId: grant.srcTagId };
+		} else if (grant.srcKind === 'peer' && grant.srcPeerId) {
+			const ip = peerIp.get(grant.srcPeerId);
+			if (ip) {
+				src = { kind: 'peer', ip };
+				governedPeerIds.add(grant.srcPeerId);
+			}
+		}
+		if (!src) {
+			log.warn(`Grant ${grant.id} on server ${graph.server.id} has an unresolvable source - ignoring it. Remove and re-add the grant via the api/ui to clean it up.`);
 			continue;
 		}
 
-		const peers = await db.query.peersTable.findMany({ where: eq(peersTable.serverPeerId, server.id) });
-		const peerIp = new Map(peers.map((p) => [p.id, p.wgAddress]));
-
-		const firewallTags: FirewallTag[] = [];
-		const governedPeerIds = new Set<string>();
-
-		for (const tag of tags) {
-			const assignments = await db.query.peerTagAssignmentsTable.findMany({ where: eq(peerTagAssignmentsTable.tagId, tag.id) });
-			const memberIps: string[] = [];
-			for (const a of assignments) {
-				const ip = peerIp.get(a.peerId);
-				if (!ip) continue; // stale assignment (peer deleted) - be defensive, ignore it
-				memberIps.push(ip);
-				governedPeerIds.add(a.peerId);
-			}
-			firewallTags.push({ id: tag.id, name: tag.friendlyName ?? tag.name, memberIps });
+		let dst: FirewallGrant['dst'] | undefined;
+		if (grant.dstKind === 'tag' && grant.dstTagId) {
+			dst = { kind: 'tag', tagId: grant.dstTagId };
+		} else if (grant.dstKind === 'peer' && grant.dstPeerId) {
+			const ip = peerIp.get(grant.dstPeerId);
+			if (ip) dst = { kind: 'peer', ip };
+		} else if (grant.dstKind === 'cidr' && grant.dstCidr) {
+			dst = { kind: 'cidr', cidr: grant.dstCidr };
+		} else if (grant.dstKind === 'server') {
+			dst = { kind: 'server' };
+		} else if (grant.dstKind === 'internet') {
+			dst = { kind: 'internet' };
+		} else if (grant.dstKind === 'any') {
+			dst = { kind: 'any' };
+		}
+		if (!dst) {
+			log.warn(`Grant ${grant.id} on server ${graph.server.id} has an unresolvable destination - ignoring it. Remove and re-add the grant via the api/ui to clean it up.`);
+			continue;
+		}
+		if (dst.kind === 'cidr' && !isIpv4Cidr(dst.cidr)) {
+			log.warn(`Grant ${grant.id} on server ${graph.server.id} has a non-ipv4 dstCidr "${dst.cidr}" - ignoring it. Remove and re-add the grant via the api/ui to clean it up.`);
+			continue;
 		}
 
-		const firewallGrants: FirewallGrant[] = [];
-		for (const grant of grantRows) {
-			let src: FirewallGrant['src'] | undefined;
-			if (grant.srcKind === 'tag' && grant.srcTagId) {
-				src = { kind: 'tag', tagId: grant.srcTagId };
-			} else if (grant.srcKind === 'peer' && grant.srcPeerId) {
-				const ip = peerIp.get(grant.srcPeerId);
-				if (ip) {
-					src = { kind: 'peer', ip };
-					governedPeerIds.add(grant.srcPeerId);
-				}
-			}
-			if (!src) {
-				log.warn(`Grant ${grant.id} on server ${server.id} has an unresolvable source - ignoring it. Remove and re-add the grant via the api/ui to clean it up.`);
-				continue;
-			}
-
-			let dst: FirewallGrant['dst'] | undefined;
-			if (grant.dstKind === 'tag' && grant.dstTagId) {
-				dst = { kind: 'tag', tagId: grant.dstTagId };
-			} else if (grant.dstKind === 'peer' && grant.dstPeerId) {
-				const ip = peerIp.get(grant.dstPeerId);
-				if (ip) dst = { kind: 'peer', ip };
-			} else if (grant.dstKind === 'cidr' && grant.dstCidr) {
-				dst = { kind: 'cidr', cidr: grant.dstCidr };
-			} else if (grant.dstKind === 'server') {
-				dst = { kind: 'server' };
-			} else if (grant.dstKind === 'internet') {
-				dst = { kind: 'internet' };
-			} else if (grant.dstKind === 'any') {
-				dst = { kind: 'any' };
-			}
-			if (!dst) {
-				log.warn(`Grant ${grant.id} on server ${server.id} has an unresolvable destination - ignoring it. Remove and re-add the grant via the api/ui to clean it up.`);
-				continue;
-			}
-			if (dst.kind === 'cidr' && !isIpv4Cidr(dst.cidr)) {
-				log.warn(`Grant ${grant.id} on server ${server.id} has a non-ipv4 dstCidr "${dst.cidr}" - ignoring it. Remove and re-add the grant via the api/ui to clean it up.`);
-				continue;
-			}
-
-			firewallGrants.push({ action: grant.action, src, dst, protocol: grant.protocol, ports: grant.ports, comment: grant.comment });
-		}
-
-		result.push({
-			interfaceName: server.interfaceName,
-			cidrRange: server.cidrRange,
-			wgAddress: server.wgAddress,
-			enableNat: server.enableNat,
-			tags: firewallTags,
-			grants: firewallGrants,
-			governedIps: [...governedPeerIds].map((id) => peerIp.get(id)).filter((ip): ip is string => Boolean(ip)),
-		});
+		firewallGrants.push({ action: grant.action, src, dst, protocol: grant.protocol, ports: grant.ports, comment: grant.comment });
 	}
 
-	return result;
+	return {
+		interfaceName: graph.server.interfaceName,
+		cidrRange: graph.server.cidrRange,
+		wgAddress: graph.server.wgAddress,
+		enableNat: graph.server.enableNat,
+		tags: firewallTags,
+		grants: firewallGrants,
+		governedIps: [...governedPeerIds].map((id) => peerIp.get(id)).filter((ip): ip is string => Boolean(ip)),
+	};
+};
+
+const loadFirewallState = async (): Promise<FirewallServer[]> => {
+	// buildRuleset's ordinal `s{i}`/`s{i}t{j}` naming (see its doc comment) depends on a
+	// stable server order - createdAt is a timestamp with second-ish resolution, so break
+	// ties by id to keep the order deterministic even for servers created in the same tick.
+	const servers = await db.query.serverPeersTable.findMany({ orderBy: [asc(serverPeersTable.createdAt), asc(serverPeersTable.id)] });
+
+	const graphs = await Promise.all(servers.map((s) => loadPolicyGraph(s.id)));
+
+	return graphs.filter((g): g is PolicyGraph => !!g).map(toFirewallServer);
 };
 
 export const generateFirewallRuleset = async () => buildRuleset(await loadFirewallState());

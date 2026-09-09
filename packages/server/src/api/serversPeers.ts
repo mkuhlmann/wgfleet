@@ -1,11 +1,13 @@
 import { Elysia, status, t } from 'elysia';
 import { db } from '../db';
-import { peerTagAssignmentsTable, peerTagsTable, peersTable, policyGrantsTable, serverPeersTable, type Peer } from '../db/schema';
-import { eq, and, or, inArray } from 'drizzle-orm';
-import { reloadServer, wgDerivePublicKey, wgGenKey, wgGenPsk } from '../wg/shell';
-import { syncFirewall } from '../wg/firewall';
+import { peerTagAssignmentsTable, peerTagsTable, peersTable, policyGrantsTable, type Peer } from '../db/schema';
+import { eq, and, inArray } from 'drizzle-orm';
+import { wgDerivePublicKey, wgGenKey, wgGenPsk } from '../wg/shell';
+import { converge } from '../wg/converge';
 import { wgManager } from '../wg/manager';
 import { resolvePeerAddress } from '../wg/addressing';
+import { resolveServer } from '@server/db/servers';
+import { loadPolicyGraph, tagIdsByPeer } from '@server/db/policyGraph';
 import { auth } from './auth';
 import { createLog } from '@server/lib/log';
 import { generatePeerConfig } from '@server/wg/config';
@@ -37,35 +39,23 @@ export const serversPeersRoute = new Elysia()
 	.get(
 		'/wg/servers/:id/peers',
 		async ({ params }) => {
-			const server = await db.query.serverPeersTable.findFirst({
-				where: or(eq(serverPeersTable.id, params.id), eq(serverPeersTable.interfaceName, params.id)),
-			});
+			const graph = await loadPolicyGraph(params.id);
 
-			if (!server) {
-				throw new Error('Server not found');
+			if (!graph) {
+				return status(404, 'Server not found');
 			}
 
-			let peers = await db.query.peersTable.findMany({
-				where: eq(peersTable.serverPeerId, server.id),
-			});
-
-			const assignments = peers.length ? await db.query.peerTagAssignmentsTable.findMany({ where: inArray(peerTagAssignmentsTable.peerId, peers.map((p) => p.id)) }) : [];
-			const tagIdsByPeer = new Map<string, string[]>();
-			for (const a of assignments) {
-				const list = tagIdsByPeer.get(a.peerId) ?? [];
-				list.push(a.tagId);
-				tagIdsByPeer.set(a.peerId, list);
-			}
+			const tagIds = tagIdsByPeer(graph);
 
 			const peersWithInfo: (Omit<Peer, 'wgLastRxBytes' | 'wgLastTxBytes' | 'wgLastSampledAt'> & {
 				tagIds: string[];
 				peerInfo: null | { connected: boolean; wgTransferRx: number; wgTransferTx: number; wgLatestHandshake: number; wgEndpoint: string };
 			})[] = [];
 
-			for (const peer of peers) {
+			for (const peer of graph.peers) {
 				// wgLast* are internal bookkeeping for wg/traffic.ts's delta computation - not for public consumption
 				const { wgLastRxBytes, wgLastTxBytes, wgLastSampledAt, ...peerPublic } = peer;
-				peersWithInfo.push({ ...peerPublic, tagIds: tagIdsByPeer.get(peer.id) ?? [], peerInfo: wgManager.peerInfo[peer.wgPublicKey] ?? null });
+				peersWithInfo.push({ ...peerPublic, tagIds: tagIds.get(peer.id) ?? [], peerInfo: wgManager.peerInfo[peer.wgPublicKey] ?? null });
 			}
 
 			return peersWithInfo;
@@ -80,12 +70,10 @@ export const serversPeersRoute = new Elysia()
 	.post(
 		'/wg/servers/:id/peers',
 		async ({ params, body }) => {
-			const server = await db.query.serverPeersTable.findFirst({
-				where: or(eq(serverPeersTable.id, params.id), eq(serverPeersTable.interfaceName, params.id)),
-			});
+			const server = await resolveServer(params.id);
 
-			if (!server || !server.cidrRange) {
-				throw new Error('Server not found');
+			if (!server) {
+				return status(404, 'Server not found');
 			}
 
 			const privateKey = await wgGenKey();
@@ -128,8 +116,10 @@ export const serversPeersRoute = new Elysia()
 			}
 
 			log.info(`Created peer ${peer[0].id} on server ${server.id}`);
-			reloadServer(server);
-			syncFirewall();
+			const convergeResult = await converge(server.id);
+			if (!convergeResult.ok) {
+				log.warn(`Peer ${peer[0].id} created but server ${server.id} failed to converge: ${convergeResult.reason}`);
+			}
 
 			return { ...peer[0], tagIds: body.tagIds ?? [] };
 		},
@@ -148,20 +138,18 @@ export const serversPeersRoute = new Elysia()
 	.patch(
 		'/wg/servers/:id/peers/:peerId',
 		async ({ params, body }) => {
-			const server = await db.query.serverPeersTable.findFirst({
-				where: or(eq(serverPeersTable.id, params.id), eq(serverPeersTable.interfaceName, params.id)),
-			});
+			const server = await resolveServer(params.id);
 
-			if (!server || !server.cidrRange) {
-				throw new Error('Server not found');
+			if (!server) {
+				return status(404, 'Server not found');
 			}
 
 			const peer = await db.query.peersTable.findFirst({
-				where: and(eq(peersTable.id, params.peerId), eq(peersTable.serverPeerId, params.id)),
+				where: and(eq(peersTable.id, params.peerId), eq(peersTable.serverPeerId, server.id)),
 			});
 
 			if (!peer) {
-				throw new Error('Peer not found');
+				return status(404, 'Peer not found');
 			}
 
 			// only re-resolve an address when the request actually asks to change it - a PATCH
@@ -194,7 +182,7 @@ export const serversPeersRoute = new Elysia()
 					friendlyName: body.friendlyName ?? peer.friendlyName,
 					wgAddress: body.wgAddress ?? peer.wgAddress,
 				})
-				.where(and(eq(peersTable.id, params.peerId), eq(peersTable.serverPeerId, params.id)))
+				.where(and(eq(peersTable.id, params.peerId), eq(peersTable.serverPeerId, server.id)))
 				.returning();
 
 			if (body.tagIds !== undefined) {
@@ -202,8 +190,10 @@ export const serversPeersRoute = new Elysia()
 			}
 
 			log.info(`Updated peer ${peer.id} on server ${server.id}`);
-			reloadServer(server);
-			syncFirewall();
+			const convergeResult = await converge(server.id);
+			if (!convergeResult.ok) {
+				log.warn(`Peer ${peer.id} updated but server ${server.id} failed to converge: ${convergeResult.reason}`);
+			}
 
 			return updatedPeer;
 		},
@@ -223,12 +213,17 @@ export const serversPeersRoute = new Elysia()
 	.get(
 		'/wg/servers/:id/peers/:peerId/config',
 		async ({ params }) => {
+			const server = await resolveServer(params.id);
+			if (!server) {
+				return status(404, 'Server not found');
+			}
+
 			const peer = await db.query.peersTable.findFirst({
-				where: and(eq(peersTable.id, params.peerId), eq(peersTable.serverPeerId, params.id)),
+				where: and(eq(peersTable.id, params.peerId), eq(peersTable.serverPeerId, server.id)),
 			});
 
-			if (!peer || peer.serverPeerId != params.id) {
-				throw new Error('Peer not found');
+			if (!peer) {
+				return status(404, 'Peer not found');
 			}
 
 			return generatePeerConfig(peer);
@@ -244,20 +239,18 @@ export const serversPeersRoute = new Elysia()
 	.delete(
 		'/wg/servers/:id/peers/:peerId',
 		async ({ params }) => {
-			const server = await db.query.serverPeersTable.findFirst({
-				where: or(eq(serverPeersTable.id, params.id), eq(serverPeersTable.interfaceName, params.id)),
-			});
+			const server = await resolveServer(params.id);
 
 			if (!server) {
-				throw new Error('Server not found');
+				return status(404, 'Server not found');
 			}
 
 			const peer = await db.query.peersTable.findFirst({
-				where: and(eq(peersTable.id, params.peerId), eq(peersTable.serverPeerId, params.id)),
+				where: and(eq(peersTable.id, params.peerId), eq(peersTable.serverPeerId, server.id)),
 			});
 
 			if (!peer) {
-				throw new Error('Peer not found');
+				return status(404, 'Peer not found');
 			}
 
 			// no db-level FK enforcement (sqlite foreign_keys pragma isn't turned on anywhere in
@@ -270,8 +263,10 @@ export const serversPeersRoute = new Elysia()
 				tx.delete(peersTable).where(eq(peersTable.id, params.peerId)).run();
 			});
 			log.info(`Deleted peer ${peer.id} from server ${server.id}`);
-			reloadServer(server);
-			syncFirewall();
+			const convergeResult = await converge(server.id);
+			if (!convergeResult.ok) {
+				log.warn(`Peer ${peer.id} deleted but server ${server.id} failed to converge: ${convergeResult.reason}`);
+			}
 
 			return { success: true };
 		},

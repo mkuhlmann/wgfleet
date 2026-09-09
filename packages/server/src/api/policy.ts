@@ -1,9 +1,11 @@
 import { Elysia, status, t } from 'elysia';
 import { db } from '../db';
-import { peerTagAssignmentsTable, peerTagsTable, peersTable, policyGrantsTable, serverPeersTable } from '../db/schema';
-import { eq, and, or, ne, inArray, asc } from 'drizzle-orm';
+import { peerTagAssignmentsTable, peerTagsTable, peersTable, policyGrantsTable } from '../db/schema';
+import { eq, and, ne, inArray, asc } from 'drizzle-orm';
 import { nanoid } from 'nanoid';
 import { isIpv4Cidr, syncFirewall } from '../wg/firewall';
+import { resolveServer as findServer } from '@server/db/servers';
+import { loadPolicyGraph, memberCountByTag, toPolicyDocument } from '@server/db/policyGraph';
 import { auth } from './auth';
 import { createLog } from '@server/lib/log';
 
@@ -14,12 +16,6 @@ const nameRegex = /^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$/;
 // comma-separated ports/ranges, e.g. "22,80,8000-8100" - each endpoint 1-65535, lo <= hi
 const portsRegex = /^\d{1,5}(-\d{1,5})?(,\d{1,5}(-\d{1,5})?)*$/;
 const maxPortEntries = 32;
-
-async function findServer(idOrInterfaceName: string) {
-	return db.query.serverPeersTable.findFirst({
-		where: or(eq(serverPeersTable.id, idOrInterfaceName), eq(serverPeersTable.interfaceName, idOrInterfaceName)),
-	});
-}
 
 async function isTagNameInUse(serverPeerId: string, name: string, excludeTagId?: string) {
 	const existing = await db.query.peerTagsTable.findFirst({
@@ -131,43 +127,13 @@ const policyDocBody = t.Object({
 	peerTags: t.Array(t.Object({ peerId: t.String(), friendlyName: t.Optional(t.String()), tags: t.Array(t.String()) })),
 });
 
+// Thin wrapper kept for a stable name at the three call sites below - the actual read and
+// projection live in db/policyGraph.ts, shared with GET /tags, serversPeers.ts's GET /peers,
+// and the firewall/config modules.
 async function buildPolicyDocument(serverPeerId: string) {
-	const tags = await db.query.peerTagsTable.findMany({ where: eq(peerTagsTable.serverPeerId, serverPeerId) });
-	const peers = await db.query.peersTable.findMany({ where: eq(peersTable.serverPeerId, serverPeerId) });
-	const assignments = peers.length ? await db.query.peerTagAssignmentsTable.findMany({ where: inArray(peerTagAssignmentsTable.peerId, peers.map((p) => p.id)) }) : [];
-	const grants = await db.query.policyGrantsTable.findMany({ where: eq(policyGrantsTable.serverPeerId, serverPeerId), orderBy: asc(policyGrantsTable.position) });
-
-	const tagNameById = new Map(tags.map((t) => [t.id, t.name]));
-
-	const tagNamesByPeer = new Map<string, string[]>();
-	for (const a of assignments) {
-		const name = tagNameById.get(a.tagId);
-		if (!name) continue; // stale assignment - be defensive, ignore it
-		const list = tagNamesByPeer.get(a.peerId) ?? [];
-		list.push(name);
-		tagNamesByPeer.set(a.peerId, list);
-	}
-
-	return {
-		tags: tags.map((tag) => ({ name: tag.name, friendlyName: tag.friendlyName ?? undefined })),
-		grants: grants.map((g) => ({
-			enabled: g.enabled,
-			action: g.action,
-			srcKind: g.srcKind,
-			srcTag: g.srcTagId ? tagNameById.get(g.srcTagId) : undefined,
-			srcPeerId: g.srcPeerId ?? undefined,
-			dstKind: g.dstKind,
-			dstTag: g.dstTagId ? tagNameById.get(g.dstTagId) : undefined,
-			dstPeerId: g.dstPeerId ?? undefined,
-			dstCidr: g.dstCidr ?? undefined,
-			protocol: g.protocol,
-			ports: g.ports,
-			comment: g.comment,
-		})),
-		peerTags: peers
-			.filter((p) => (tagNamesByPeer.get(p.id)?.length ?? 0) > 0)
-			.map((p) => ({ peerId: p.id, friendlyName: p.friendlyName ?? undefined, tags: tagNamesByPeer.get(p.id)! })),
-	};
+	const graph = await loadPolicyGraph(serverPeerId);
+	// callers already checked the server exists before calling this
+	return toPolicyDocument(graph!);
 }
 
 export const policyRoutes = new Elysia()
@@ -176,19 +142,11 @@ export const policyRoutes = new Elysia()
 	.get(
 		'/wg/servers/:id/tags',
 		async ({ params }) => {
-			const server = await findServer(params.id);
-			if (!server) return status(404, 'Server not found');
+			const graph = await loadPolicyGraph(params.id);
+			if (!graph) return status(404, 'Server not found');
 
-			const tags = await db.query.peerTagsTable.findMany({ where: eq(peerTagsTable.serverPeerId, server.id) });
-			const peers = await db.query.peersTable.findMany({ where: eq(peersTable.serverPeerId, server.id) });
-			const assignments = peers.length ? await db.query.peerTagAssignmentsTable.findMany({ where: inArray(peerTagAssignmentsTable.peerId, peers.map((p) => p.id)) }) : [];
-
-			const memberCountByTag = new Map<string, number>();
-			for (const a of assignments) {
-				memberCountByTag.set(a.tagId, (memberCountByTag.get(a.tagId) ?? 0) + 1);
-			}
-
-			return tags.map((tag) => ({ ...tag, memberCount: memberCountByTag.get(tag.id) ?? 0 }));
+			const counts = memberCountByTag(graph);
+			return graph.tags.map((tag) => ({ ...tag, memberCount: counts.get(tag.id) ?? 0 }));
 		},
 		{ params: t.Object({ id: t.String() }), verifyAuth: { scope: 'server' } }
 	)
@@ -208,7 +166,7 @@ export const policyRoutes = new Elysia()
 				.returning();
 
 			log.info(`Created tag ${tag[0].id} on server ${server.id}`);
-			syncFirewall();
+			await syncFirewall();
 
 			return tag[0];
 		},
@@ -240,7 +198,7 @@ export const policyRoutes = new Elysia()
 				.returning();
 
 			log.info(`Updated tag ${tag.id} on server ${server.id}`);
-			syncFirewall();
+			await syncFirewall();
 
 			return updated[0];
 		},
@@ -271,7 +229,7 @@ export const policyRoutes = new Elysia()
 			});
 
 			log.info(`Deleted tag ${tag.id} from server ${server.id}`);
-			syncFirewall();
+			await syncFirewall();
 
 			return { success: true };
 		},
@@ -325,7 +283,7 @@ export const policyRoutes = new Elysia()
 			});
 
 			log.info(`Replaced grants for server ${server.id}`);
-			syncFirewall();
+			await syncFirewall();
 
 			return db.query.policyGrantsTable.findMany({ where: eq(policyGrantsTable.serverPeerId, server.id), orderBy: asc(policyGrantsTable.position) });
 		},
@@ -444,7 +402,7 @@ export const policyRoutes = new Elysia()
 			});
 
 			log.info(`Replaced policy document on server ${server.id}`);
-			syncFirewall();
+			await syncFirewall();
 
 			return buildPolicyDocument(server.id);
 		},

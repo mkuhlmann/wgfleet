@@ -64,6 +64,7 @@ import { useMutation, useQueryClient } from '@tanstack/vue-query';
 import type { ServerPeer } from '@server/db/schema';
 import { CIDR_REGEX, INTERFACE_NAME_REGEX, IPV4_ADDRESS_REGEX, WG_LISTEN_PORT_MAX, WG_LISTEN_PORT_MIN } from '@server/lib/validation';
 import { eden } from '@app/queries/edenClient';
+import { invalidate } from '@app/queries/keys';
 import BaseButton from './BaseButton.vue';
 import BaseInput from './BaseInput.vue';
 import BaseModal from './BaseModal.vue';
@@ -170,9 +171,8 @@ const createServer = useMutation({
 		const res = await eden.api.v1.wg.servers.post(data);
 		return res.data;
 	},
-	onSuccess: () => {
-		queryClient.invalidateQueries({ queryKey: ['servers'] });
-		queryClient.invalidateQueries({ queryKey: ['server'] });
+	onSuccess: async () => {
+		await invalidate.afterServerChange(queryClient);
 		visible.value = false;
 	},
 	onError: (error) => {
@@ -191,9 +191,8 @@ const updateServer = useMutation({
 		const res = await eden.api.v1.wg.servers({ id: props.server?.id }).patch(data);
 		return res.data;
 	},
-	onSuccess: () => {
-		queryClient.invalidateQueries({ queryKey: ['servers'] });
-		queryClient.invalidateQueries({ queryKey: ['server'] });
+	onSuccess: async () => {
+		await invalidate.afterServerChange(queryClient);
 		visible.value = false;
 	},
 	onError: (error) => {

@@ -1,11 +1,12 @@
 import { queryOptions } from '@tanstack/vue-query';
 import { api } from './edenClient';
+import { queryKeys } from './keys';
 
 export type TrafficResolution = '1m' | '1h' | '1d';
 
 export const queryServerTraffic = (id: string, resolution: TrafficResolution) =>
 	queryOptions({
-		queryKey: ['serverTraffic', id, resolution],
+		queryKey: queryKeys.serverTraffic(id, resolution),
 		queryFn: async () => {
 			const resp = await api.wg.servers({ id: id }).traffic.get({ query: { resolution } });
 			return resp.data;
@@ -16,7 +17,7 @@ export const queryServerTraffic = (id: string, resolution: TrafficResolution) =>
 
 export const queryPeerTraffic = (id: string, peerId: string, resolution: TrafficResolution) =>
 	queryOptions({
-		queryKey: ['peerTraffic', id, peerId, resolution],
+		queryKey: queryKeys.peerTraffic(id, peerId, resolution),
 		queryFn: async () => {
 			const resp = await api.wg.servers({ id: id }).peers({ peerId: peerId }).traffic.get({ query: { resolution } });
 			return resp.data;

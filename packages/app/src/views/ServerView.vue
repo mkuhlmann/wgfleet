@@ -177,6 +177,7 @@ import { useQuery, useQueryClient } from '@tanstack/vue-query';
 import { useRoute } from 'vue-router';
 import { ref, computed } from 'vue';
 import { api } from '@app/queries/edenClient';
+import { invalidate } from '@app/queries/keys';
 import QrcodeVue from 'qrcode.vue';
 import PeerModal from '@app/components/PeerModal.vue';
 import PeerTrafficModal from '@app/components/PeerTrafficModal.vue';
@@ -261,6 +262,8 @@ const deletePeer = async (peerId: string) => {
 		.servers({ id: serverId })
 		.peers({ peerId: peerId })
 		.delete();
-	await queryClient.invalidateQueries(queryServerPeers(serverId));
+	// a peer delete also cascades referencing grants server-side (serversPeers.ts) - see
+	// invalidate.afterPeerDelete
+	await invalidate.afterPeerDelete(queryClient, serverId);
 };
 </script>

@@ -1,46 +1,19 @@
 process.env.DATABASE_PATH = ':memory:';
 
 import { migrateDb } from '@server/db';
-import { mock } from 'bun:test';
+import { mock, afterEach } from 'bun:test';
+import * as shellRecording from '@server/wg/shell.recording';
 
 await migrateDb();
 
 process.env.ADMIN_TOKEN = 'adminToken';
 
-mock.module('@server/wg/shell', () => {
-	return {
-		cmd: async (command: string) => {
-			return { stdout: 'mocked stdout', stderr: '' };
-		},
-		wgGenKey: async () => 'mockedPrivateKey',
-		wgGenPsk: async () => 'mockedPsk',
-		wgDerivePublicKey: async (privateKey: string) => 'mockedPublicKey',
-		wgShow: async (interfaceName: string) => {
-			return {
-				interface: {
-					privateKey: 'mockedPrivateKey',
-					publicKey: 'mockedPublicKey',
-					listenPort: 'mockedPort',
-					fwmark: 'mockedFwmark',
-				},
-				peers: [],
-			};
-		},
-		isInterfaceUp: async (interfaceName: string) => true,
-		startServer: async (server: any) => {
-			/* mocked startServer */
-		},
-		reloadServer: async (server: any) => {
-			/* mocked reloadServer */
-		},
-		stopServer: async (server: any) => {
-			/* mocked stopServer */
-		},
-		applyFirewall: async (ruleset: string) => {
-			/* mocked applyFirewall */
-		},
-		resetFirewall: async () => {
-			/* mocked resetFirewall */
-		},
-	};
+// Replaces the whole wg/shell module for every test file (bun:test runs test files
+// sequentially in this repo, so the recording adapter's module-level state is safe to
+// share) - see shell.recording.ts for what it records and CLAUDE.md's note on the
+// wg/shell layer for why every exported function needs an adapter here.
+mock.module('@server/wg/shell', () => shellRecording);
+
+afterEach(() => {
+	shellRecording.shellCallLog.reset();
 });

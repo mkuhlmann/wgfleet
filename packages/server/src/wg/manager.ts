@@ -1,10 +1,10 @@
 import { db } from '@server/db';
-import { peersTable, type ServerPeer } from '@server/db/schema';
+import { type ServerPeer } from '@server/db/schema';
 import { isInterfaceUp, resetFirewall, startServer, stopServer, wgShow } from './shell';
 import { syncFirewall } from './firewall';
+import { converge } from './converge';
 import { recordServerTraffic, rollupAndPrune, trafficStatsEnabled } from './traffic';
 import { createLog } from '@server/lib/log';
-import { eq } from 'drizzle-orm';
 
 const log = createLog('wg');
 
@@ -37,7 +37,10 @@ const constructWgManager = () => {
 
 			if (!wgShowResult) {
 				log.info(`Server is down! Starting server ${server.interfaceName}`);
-				await startServer(server);
+				const convergeResult = await converge(server.id);
+				if (!convergeResult.ok) {
+					log.error(`Failed to restart server ${server.interfaceName}: ${convergeResult.reason}`);
+				}
 				continue;
 			}
 

@@ -69,6 +69,7 @@ import { computed, ref } from 'vue';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query';
 import { queryServerGrants } from '@app/queries/queryPolicy';
 import { eden } from '@app/queries/edenClient';
+import { invalidate } from '@app/queries/keys';
 import { useToast } from '@app/composables/useToast';
 import type { PeerTag, Peer, PolicyGrant } from '@server/db/schema';
 import BaseButton from './BaseButton.vue';
@@ -116,14 +117,12 @@ const describeL4 = (protocol: string, ports: string | null) => {
 	return protocol;
 };
 
-const invalidate = () => queryClient.invalidateQueries({ queryKey: ['serverGrants', props.serverId] });
-
 const replaceAll = useMutation({
 	mutationFn: async (body: GrantDraft[]) => {
 		const res = await eden.api.v1.wg.servers({ id: props.serverId }).grants.put({ grants: body });
 		return res.data;
 	},
-	onSuccess: invalidate,
+	onSuccess: () => invalidate.afterGrantsChange(queryClient, props.serverId),
 	onError: (error: Error) => toast.add({ severity: 'error', detail: error.message, summary: 'Failed to update grants', life: 5000 }),
 });
 

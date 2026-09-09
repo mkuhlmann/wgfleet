@@ -2,9 +2,10 @@ import { Elysia, status, t } from 'elysia';
 import { db } from '../db';
 import { serverPeersTable } from '../db/schema';
 import IPCIDR from 'ip-cidr';
-import { eq, or, and, ne } from 'drizzle-orm';
-import { reloadServer, startServer, wgDerivePublicKey, wgGenKey } from '../wg/shell';
-import { syncFirewall } from '../wg/firewall';
+import { eq, and, ne } from 'drizzle-orm';
+import { wgDerivePublicKey, wgGenKey } from '../wg/shell';
+import { converge } from '../wg/converge';
+import { resolveServer } from '@server/db/servers';
 import { auth } from './auth';
 import { createLog } from '@server/lib/log';
 import { generateServerConfig } from '@server/wg/config';
@@ -72,8 +73,10 @@ export const serversRoutes = new Elysia()
 				.returning();
 
 			log.info(`Created server ${peer[0].id}`);
-			startServer(peer[0]);
-			syncFirewall();
+			const convergeResult = await converge(peer[0].id);
+			if (!convergeResult.ok) {
+				log.warn(`Server ${peer[0].id} created but failed to converge: ${convergeResult.reason}`);
+			}
 			return peer;
 		},
 		{
@@ -94,9 +97,7 @@ export const serversRoutes = new Elysia()
 	.get(
 		'/wg/servers/:id',
 		async ({ params }) => {
-			const server = await db.query.serverPeersTable.findFirst({
-				where: or(eq(serverPeersTable.id, params.id), eq(serverPeersTable.interfaceName, params.id)),
-			});
+			const server = await resolveServer(params.id);
 
 			if (!server) {
 				return status(404, 'Server not found');
@@ -112,15 +113,13 @@ export const serversRoutes = new Elysia()
 	.patch(
 		'/wg/servers/:id',
 		async ({ params, body }) => {
-			const server = await db.query.serverPeersTable.findFirst({
-				where: eq(serverPeersTable.id, params.id),
-			});
+			const server = await resolveServer(params.id);
 
 			if (!server) {
 				return status(404, 'Server not found');
 			}
 
-			if (body.wgListenPort && (await isPortInUse(body.wgListenPort, params.id))) {
+			if (body.wgListenPort && (await isPortInUse(body.wgListenPort, server.id))) {
 				return status(400, 'Port already in use by another server');
 			}
 
@@ -132,11 +131,15 @@ export const serversRoutes = new Elysia()
 				return status(400, 'wgAddress is not in CIDR range');
 			}
 
-			const updatedServer = await db.update(serverPeersTable).set(body).where(eq(serverPeersTable.id, params.id)).returning();
+			const updatedServer = await db.update(serverPeersTable).set(body).where(eq(serverPeersTable.id, server.id)).returning();
 
 			log.info(`Updated server ${updatedServer[0].id}`);
-			reloadServer(updatedServer[0]);
-			syncFirewall();
+			// converge re-resolves the row itself, so it always reloads/starts using the
+			// post-update config, whatever changed (including interfaceName).
+			const convergeResult = await converge(server.id);
+			if (!convergeResult.ok) {
+				log.warn(`Server ${server.id} updated but failed to converge: ${convergeResult.reason}`);
+			}
 
 			return updatedServer;
 		},
@@ -160,12 +163,10 @@ export const serversRoutes = new Elysia()
 	.get(
 		'/wg/servers/:id/config',
 		async ({ params }) => {
-			const server = await db.query.serverPeersTable.findFirst({
-				where: or(eq(serverPeersTable.id, params.id), eq(serverPeersTable.interfaceName, params.id)),
-			});
+			const server = await resolveServer(params.id);
 
 			if (!server) {
-				throw new Error('Server not found');
+				return status(404, 'Server not found');
 			}
 
 			return await generateServerConfig(server);

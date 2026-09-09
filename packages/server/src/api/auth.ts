@@ -1,8 +1,9 @@
 import { Elysia, t } from 'elysia';
 import { db } from '@server/db';
-import { adminSessionsTable, peersTable, serverPeersTable } from '@server/db/schema';
+import { adminSessionsTable, peersTable } from '@server/db/schema';
 import { and, eq, gt, lt } from 'drizzle-orm';
 import { nanoid } from 'nanoid';
+import { resolveServer } from '@server/db/servers';
 
 export const auth = new Elysia({ name: 'auth' }).macro({
 	verifyAuth(
@@ -38,11 +39,12 @@ export const auth = new Elysia({ name: 'auth' }).macro({
 				// @ts-expect-error - params may be empty or typed by route
 				const id = params?.id;
 				if (config.scope == 'server' && id) {
-					const server = await db.query.serverPeersTable.findFirst({
-						where: and(eq(serverPeersTable.id, id), eq(serverPeersTable.authToken, token)),
-					});
+					// resolveServer also matches by interfaceName, so a server-scoped token
+					// authorizes the same URLs the route handlers themselves resolve - see
+					// db/servers.ts.
+					const server = await resolveServer(id);
 
-					if (server) {
+					if (server && server.authToken === token) {
 						return;
 					}
 				}

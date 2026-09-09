@@ -27,6 +27,7 @@ import { useToast } from '@app/composables/useToast';
 import { useMutation, useQueryClient } from '@tanstack/vue-query';
 import type { PeerTag, ServerPeer } from '@server/db/schema';
 import { eden } from '@app/queries/edenClient';
+import { invalidate } from '@app/queries/keys';
 import BaseButton from './BaseButton.vue';
 import BaseInput from './BaseInput.vue';
 import BaseModal from './BaseModal.vue';
@@ -80,15 +81,13 @@ watch(
 	{ immediate: true }
 );
 
-const invalidate = () => queryClient.invalidateQueries({ queryKey: ['serverTags', props.server.id] });
-
 const createTag = useMutation({
 	mutationFn: async (data: typeof form) => {
 		const res = await eden.api.v1.wg.servers({ id: props.server.id }).tags.post(data);
 		return res.data;
 	},
-	onSuccess: () => {
-		invalidate();
+	onSuccess: async () => {
+		await invalidate.afterTagChange(queryClient, props.server.id);
 		visible.value = false;
 	},
 	onError: (error) => {
@@ -107,8 +106,8 @@ const updateTag = useMutation({
 		const res = await eden.api.v1.wg.servers({ id: props.server.id }).tags({ tagId: props.tag.id }).patch(data);
 		return res.data;
 	},
-	onSuccess: () => {
-		invalidate();
+	onSuccess: async () => {
+		await invalidate.afterTagChange(queryClient, props.server.id);
 		visible.value = false;
 	},
 	onError: (error) => {

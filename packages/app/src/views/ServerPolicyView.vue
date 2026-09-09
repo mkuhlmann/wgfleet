@@ -71,6 +71,7 @@ import { useQuery, useQueryClient } from '@tanstack/vue-query';
 import { useRoute } from 'vue-router';
 import { ref } from 'vue';
 import { eden } from '@app/queries/edenClient';
+import { invalidate } from '@app/queries/keys';
 import type { PeerTag } from '@server/db/schema';
 import BaseButton from '@app/components/BaseButton.vue';
 import BaseCard from '@app/components/BaseCard.vue';
@@ -101,7 +102,8 @@ const deleteTag = async (tagId: string) => {
 		.servers({ id: route.params.id as string })
 		.tags({ tagId })
 		.delete();
-	await queryClient.invalidateQueries({ queryKey: ['serverTags', route.params.id as string] });
-	await queryClient.invalidateQueries({ queryKey: ['serverGrants', route.params.id as string] });
+	// a tag delete also unassigns member peers and removes referencing grants server-side
+	// (policy.ts) - see invalidate.afterTagDelete
+	await invalidate.afterTagDelete(queryClient, route.params.id as string);
 };
 </script>

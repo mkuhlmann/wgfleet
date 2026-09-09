@@ -22,6 +22,7 @@ import { computed, ref, watch } from 'vue';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query';
 import { queryServerPolicy } from '@app/queries/queryPolicy';
 import { eden } from '@app/queries/edenClient';
+import { invalidate } from '@app/queries/keys';
 import { useToast } from '@app/composables/useToast';
 import BaseButton from './BaseButton.vue';
 
@@ -65,12 +66,7 @@ const copyToClipboard = async () => {
 	setTimeout(() => (copied.value = false), 2000);
 };
 
-const invalidateAll = () => {
-	queryClient.invalidateQueries({ queryKey: ['serverPolicy', props.serverId] });
-	queryClient.invalidateQueries({ queryKey: ['serverTags', props.serverId] });
-	queryClient.invalidateQueries({ queryKey: ['serverGrants', props.serverId] });
-	queryClient.invalidateQueries({ queryKey: ['serverPeers', props.serverId] });
-};
+const invalidateAll = () => invalidate.afterPolicyApply(queryClient, props.serverId);
 
 const applyMutation = useMutation({
 	mutationFn: async (body: unknown) => {

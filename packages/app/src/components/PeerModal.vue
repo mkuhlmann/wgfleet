@@ -47,6 +47,7 @@ import type { Peer, ServerPeer } from '@server/db/schema';
 import { IPV4_ADDRESS_REGEX } from '@server/lib/validation';
 import { eden } from '@app/queries/edenClient';
 import { queryServerTags } from '@app/queries/queryPolicy';
+import { invalidate } from '@app/queries/keys';
 import BaseButton from './BaseButton.vue';
 import BaseInput from './BaseInput.vue';
 import BaseModal from './BaseModal.vue';
@@ -122,8 +123,8 @@ const createPeer = useMutation({
 		const res = await eden.api.v1.wg.servers({ id: props.server.id }).peers.post(data);
 		return res.data;
 	},
-	onSuccess: () => {
-		queryClient.invalidateQueries({ queryKey: ['serverPeers', props.server.id] });
+	onSuccess: async () => {
+		await invalidate.afterPeerChange(queryClient, props.server.id);
 		visible.value = false;
 	},
 	onError: (error) => {
@@ -142,8 +143,8 @@ const updatePeer = useMutation({
 		const res = await eden.api.v1.wg.servers({ id: props.server.id }).peers({ peerId: props.peer.id }).patch(data);
 		return res.data;
 	},
-	onSuccess: () => {
-		queryClient.invalidateQueries({ queryKey: ['serverPeers', props.server.id] });
+	onSuccess: async () => {
+		await invalidate.afterPeerChange(queryClient, props.server.id);
 		visible.value = false;
 	},
 	onError: (error) => {

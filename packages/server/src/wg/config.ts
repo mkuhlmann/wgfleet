@@ -1,6 +1,7 @@
 import { db } from '@server/db';
-import { peerTagAssignmentsTable, peersTable, policyGrantsTable, serverPeersTable, type Peer, type ServerPeer } from '@server/db/schema';
-import { and, eq } from 'drizzle-orm';
+import { peersTable, type Peer, type ServerPeer } from '@server/db/schema';
+import { eq } from 'drizzle-orm';
+import { allowedIpsForPeer, loadPolicyGraph } from '@server/db/policyGraph';
 
 export const generateServerConfig = async (server: ServerPeer) => {
 	const peers = await db.query.peersTable.findMany({
@@ -27,45 +28,18 @@ AllowedIPs = ${peer.wgAddress}
 	return config;
 };
 
-/**
- * Client-side AllowedIPs is a routing hint, not the enforcement boundary - the
- * server's nft ruleset (see wg/firewall.ts) is what actually decides reachability.
- * A client can't reach an allowed subnet or the internet unless its own config
- * routes that traffic into the tunnel in the first place, so this still has to
- * reflect the peer's applicable grants. Only `allow` grants matter here (a `deny`
- * needs no route, and ordering/precedence between them doesn't either - the worst
- * a stale route can do is send traffic the firewall then drops). Peers reachable
- * via a dstKind 'tag'/'peer'/'server' grant need no extra entry here - they're
- * other peers (or the gateway) on the same server.cidrRange, already covered by
- * the base entry.
- */
-const computeClientAllowedIps = async (peer: Peer, server: ServerPeer) => {
-	const assignments = await db.query.peerTagAssignmentsTable.findMany({ where: eq(peerTagAssignmentsTable.peerId, peer.id) });
-	const tagIds = new Set(assignments.map((a) => a.tagId));
-
-	const grants = await db.query.policyGrantsTable.findMany({
-		where: and(eq(policyGrantsTable.serverPeerId, server.id), eq(policyGrantsTable.enabled, true), eq(policyGrantsTable.action, 'allow')),
-	});
-
-	const applicable = grants.filter((g) => (g.srcKind === 'peer' && g.srcPeerId === peer.id) || (g.srcKind === 'tag' && g.srcTagId !== null && tagIds.has(g.srcTagId)));
-
-	if (applicable.some((g) => g.dstKind === 'internet' || g.dstKind === 'any')) return '0.0.0.0/0';
-
-	const extraCidrs = applicable.filter((g) => g.dstKind === 'cidr' && g.dstCidr).map((g) => g.dstCidr!);
-
-	return [server.cidrRange, ...extraCidrs].join(', ');
-};
-
 export const generatePeerConfig = async (peer: Peer) => {
-	const server = await db.query.serverPeersTable.findFirst({
-		where: eq(serverPeersTable.id, peer.serverPeerId),
-	});
+	// Also gives us the peer's tags and this server's grants in one read - see
+	// db/policyGraph.ts's allowedIpsForPeer for why AllowedIPs (a routing hint, not the
+	// enforcement boundary - wg/firewall.ts's nft ruleset is that) still has to reflect them.
+	const graph = await loadPolicyGraph(peer.serverPeerId);
 
-	if (!server) {
+	if (!graph) {
 		throw new Error('Server not found.');
 	}
 
-	const allowedIps = await computeClientAllowedIps(peer, server);
+	const server = graph.server;
+	const allowedIps = allowedIpsForPeer(graph, peer);
 
 	let config = `[Interface]
 PrivateKey = ${peer.wgPrivateKey}

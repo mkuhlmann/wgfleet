@@ -22,7 +22,7 @@
 import { ref, computed } from 'vue';
 import { useQuery, useQueryClient } from '@tanstack/vue-query';
 import { queryPeerTraffic, type TrafficResolution } from '@app/queries/queryTraffic';
-import { queryServerPeers } from '@app/queries/queryServers';
+import { invalidate } from '@app/queries/keys';
 import { api } from '@app/queries/edenClient';
 import { formatBytes } from '@app/lib/format';
 import BaseModal from './BaseModal.vue';
@@ -53,6 +53,8 @@ const reset = async () => {
 	if (!confirm(`Reset lifetime traffic counters for ${props.peer.friendlyName ?? props.peer.id}?`)) return;
 
 	await api.wg.servers({ id: props.serverId }).peers({ peerId: props.peer.id }).traffic.reset.post();
-	await queryClient.invalidateQueries(queryServerPeers(props.serverId));
+	// also invalidates this peer's traffic buckets at every resolution, so the chart shown
+	// in this same modal refreshes immediately instead of waiting for the 30s poll
+	await invalidate.afterPeerTrafficReset(queryClient, props.serverId, props.peer.id);
 };
 </script>

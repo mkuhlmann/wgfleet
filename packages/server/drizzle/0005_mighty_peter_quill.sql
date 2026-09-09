@@ -1,0 +1,1 @@
+CREATE UNIQUE INDEX `peers_serverPeerId_wgAddress_unique` ON `peers` (`serverPeerId`,`wgAddress`);

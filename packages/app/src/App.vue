@@ -5,6 +5,11 @@
 				<span class="text-muted font-normal">#</span>wg-api-manager
 			</RouterLink>
 			<RouterLink to="/servers" class="nav-link">servers</RouterLink>
+			<div v-if="authStore.authTokenValidated" class="ml-auto">
+				<button @click="handleLogout" class="nav-link cursor-pointer">
+					[ logout ]
+				</button>
+			</div>
 		</nav>
 
 		<main class="px-6 py-8">
@@ -16,8 +21,17 @@
 </template>
 
 <script setup lang="ts">
-import { RouterLink, RouterView } from 'vue-router';
+import { RouterLink, RouterView, useRouter } from 'vue-router';
 import ToastStack from '@app/components/ToastStack.vue';
+import { useAuthStore } from '@app/stores/auth';
+
+const authStore = useAuthStore();
+const router = useRouter();
+
+async function handleLogout() {
+	await authStore.logout();
+	router.push('/login');
+}
 </script>
 
 <style scoped>

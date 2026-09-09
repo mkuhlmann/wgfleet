@@ -6,6 +6,10 @@ const router = createRouter({
 	linkActiveClass: 'active',
 	routes: [
 		{
+			path: '/',
+			redirect: '/servers',
+		},
+		{
 			path: '/login',
 			name: 'login',
 			component: () => import('../views/LoginView.vue'),

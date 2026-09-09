@@ -2,7 +2,7 @@ import { Elysia } from 'elysia';
 import swagger from '@elysiajs/swagger';
 import staticPlugin from '@elysiajs/static';
 import { createLog } from './lib/log';
-import { auth } from './api/auth';
+import { auth, authRoutes } from './api/auth';
 import { serversRoutes } from './api/servers';
 import { peersRoutes } from './api/peers';
 import { wgManager } from './wg/manager';
@@ -38,7 +38,7 @@ const _app = new Elysia()
 		httpLog.info(`${request.method} ${request.url} ${server?.requestIP(request)?.address}`);
 	})
 	.use(auth)
-	.group('/api/v1', (app) => app.use(serversRoutes).use(serversPeersRoute).use(peersRoutes).use(policyRoutes).use(trafficRoutes))
+	.group('/api/v1', (app) => app.use(authRoutes).use(serversRoutes).use(serversPeersRoute).use(peersRoutes).use(policyRoutes).use(trafficRoutes))
 	.use(
 		staticPlugin({
 			indexHTML: true,
@@ -69,7 +69,7 @@ const main = async () => {
 
 	const port = Number(process.env.PORT) || 3000;
 	log.info(`Starting http server on port ${port}`);
-	_app.listen(port);
+	_app.listen({ port, hostname: '0.0.0.0' });
 
 	httpLog.info(`api ist running at ${_app.server?.hostname}:${_app.server?.port}`);
 };

@@ -148,3 +148,17 @@ lists what not to reach for (no PrimeVue/icon packages/second accent color - bot
 State: TanStack Vue Query for all server state (`src/queries/*.ts`, `queryOptions()` pattern, mutations inline
 in the modal components that use them), a single Pinia store for the in-memory (non-persisted) auth token
 (`src/stores/auth.ts` - reloading the page logs you out by design).
+
+## Agent skills
+
+### Issue tracker
+
+Issues live in GitHub Issues (`mkuhlmann/wg-api-manager`), via the `gh` CLI. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Default label vocabulary (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`). See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Multi-context: root `CONTEXT-MAP.md` plus a `CONTEXT.md` per package (`packages/app`, `packages/server`). See `docs/agents/domain.md`.

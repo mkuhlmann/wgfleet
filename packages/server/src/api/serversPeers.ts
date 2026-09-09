@@ -1,11 +1,11 @@
 import { Elysia, status, t } from 'elysia';
 import { db } from '../db';
 import { peerTagAssignmentsTable, peerTagsTable, peersTable, policyGrantsTable, serverPeersTable, type Peer } from '../db/schema';
-import IPCIDR from 'ip-cidr';
 import { eq, and, or, inArray } from 'drizzle-orm';
 import { reloadServer, wgDerivePublicKey, wgGenKey, wgGenPsk } from '../wg/shell';
 import { syncFirewall } from '../wg/firewall';
 import { wgManager } from '../wg/manager';
+import { resolvePeerAddress } from '../wg/addressing';
 import { auth } from './auth';
 import { createLog } from '@server/lib/log';
 import { generatePeerConfig } from '@server/wg/config';
@@ -91,55 +91,17 @@ export const serversPeersRoute = new Elysia()
 			const privateKey = await wgGenKey();
 			const publicKey = await wgDerivePublicKey(privateKey);
 
-			const cidr = new IPCIDR(server.cidrRange);
+			const existingPeers = await db.query.peersTable.findMany({
+				where: eq(peersTable.serverPeerId, server.id),
+				columns: { wgAddress: true },
+			});
+			const existingAddresses = new Set(existingPeers.map((p) => p.wgAddress));
 
-			let ip: string | null = null;
-
-			if (body.wgAddress) {
-				if (!cidr.contains(body.wgAddress)) {
-					throw new Error('wgAddress is not in CIDR range');
-				}
-
-				const peer = await db.query.peersTable.findFirst({
-					where: and(eq(peersTable.wgAddress, body.wgAddress), eq(peersTable.serverPeerId, server.id)),
-				});
-
-				if (peer) {
-					throw new Error('IP already in use');
-				}
-
-				ip = body.wgAddress;
-			} else {
-				let fromIp = server.reservedIps!;
-
-				do {
-					const ips = cidr.toArray({ from: fromIp, limit: 1 });
-
-					if (ips.length == 0) {
-						throw new Error('No more IPs available');
-					}
-
-					const _ip = ips[0];
-
-					const peer = await db.query.peersTable.findFirst({
-						where: and(eq(peersTable.wgAddress, _ip), eq(peersTable.serverPeerId, server.id)),
-					});
-
-					if (!peer) {
-						ip = _ip;
-					} else {
-						fromIp++;
-					}
-
-					if (fromIp > 1000000) {
-						throw new Error('No more IPs available (loop)');
-					}
-				} while (ip == null);
+			const resolved = resolvePeerAddress(server.cidrRange, server.reservedIps, existingAddresses, { requested: body.wgAddress });
+			if (!resolved.ok) {
+				return status(400, resolved.message);
 			}
-
-			if (!ip) {
-				throw new Error('No IP supplied');
-			}
+			const ip = resolved.ip;
 
 			const tagError = await assertTagsBelongToServer(body.tagIds, server.id);
 			if (tagError) return tagError;
@@ -202,54 +164,22 @@ export const serversPeersRoute = new Elysia()
 				throw new Error('Peer not found');
 			}
 
-			const cidr = new IPCIDR(server.cidrRange);
-
-			let ip: string | null = null;
-
+			// only re-resolve an address when the request actually asks to change it - a PATCH
+			// that just renames a peer or edits its tags must not spuriously fail because the
+			// server's address range happens to be exhausted.
+			let ip = peer.wgAddress;
 			if (body.wgAddress) {
-				if (!cidr.contains(body.wgAddress)) {
-					throw new Error('wgAddress is not in CIDR range');
-				}
-
-				const _peer = await db.query.peersTable.findFirst({
-					where: and(eq(peersTable.wgAddress, body.wgAddress), eq(peersTable.serverPeerId, server.id)),
+				const existingPeers = await db.query.peersTable.findMany({
+					where: eq(peersTable.serverPeerId, server.id),
+					columns: { wgAddress: true },
 				});
+				const existingAddresses = new Set(existingPeers.map((p) => p.wgAddress).filter((address) => address !== peer.wgAddress));
 
-				if (_peer && peer.id != _peer.id) {
-					throw new Error('IP already in use');
+				const resolved = resolvePeerAddress(server.cidrRange, server.reservedIps, existingAddresses, { requested: body.wgAddress });
+				if (!resolved.ok) {
+					return status(400, resolved.message);
 				}
-
-				ip = body.wgAddress;
-			} else {
-				let fromIp = server.reservedIps!;
-
-				do {
-					const ips = cidr.toArray({ from: fromIp, limit: 1 });
-
-					if (ips.length == 0) {
-						throw new Error('No more IPs available');
-					}
-
-					const _ip = ips[0];
-
-					const peer = await db.query.peersTable.findFirst({
-						where: and(eq(peersTable.wgAddress, _ip), eq(peersTable.serverPeerId, server.id)),
-					});
-
-					if (!peer) {
-						ip = _ip;
-					} else {
-						fromIp++;
-					}
-
-					if (fromIp > 1000000) {
-						throw new Error('No more IPs available (loop)');
-					}
-				} while (ip == null);
-			}
-
-			if (!ip) {
-				throw new Error('No IP supplied');
+				ip = resolved.ip;
 			}
 
 			// undefined = leave tags unchanged, [] = explicitly clear all tags (unrestrict)

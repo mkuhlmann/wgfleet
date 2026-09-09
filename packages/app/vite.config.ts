@@ -16,9 +16,11 @@ export default defineConfig(({ mode }) => {
 		resolve: {
 			alias: {
 				'@app': fileURLToPath(new URL('./src', import.meta.url)),
+				'@server': fileURLToPath(new URL('../server/src', import.meta.url)),
 			},
 		},
 		server: {
+			host: '0.0.0.0',
 			proxy: {
 				'/api': `http://localhost:${port}`,
 			},

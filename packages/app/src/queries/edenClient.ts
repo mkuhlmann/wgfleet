@@ -2,7 +2,7 @@ import { useAuthStore } from '@app/stores/auth';
 import { treaty, type Treaty } from '@elysiajs/eden';
 import type { App } from '@server/index';
 
-export const eden = treaty<App>(`${location.host}`, {
+export const eden = treaty<App>(`${location.origin}`, {
 	headers(path, options) {
 		const authStore = useAuthStore();
 		if (authStore.authTokenValidated) {

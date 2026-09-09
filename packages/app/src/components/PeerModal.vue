@@ -44,6 +44,7 @@ import { ref, reactive, watch } from 'vue';
 import { useToast } from '@app/composables/useToast';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query';
 import type { Peer, ServerPeer } from '@server/db/schema';
+import { IPV4_ADDRESS_REGEX } from '@server/lib/validation';
 import { eden } from '@app/queries/edenClient';
 import { queryServerTags } from '@app/queries/queryPolicy';
 import BaseButton from './BaseButton.vue';
@@ -88,13 +89,8 @@ const validate = () => {
 	errors.wgAddress = '';
 
 	if (form.wgAddress) {
-		// Simple IPv4 validation
-		const ipv4Regex = /^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/;
-		// Simple IPv6 validation (basic)
-		const ipv6Regex = /^(?:[A-F0-9]{1,4}:){7}[A-F0-9]{1,4}$/i;
-		
-		if (!ipv4Regex.test(form.wgAddress) && !ipv6Regex.test(form.wgAddress)) {
-			errors.wgAddress = 'Invalid IP address format.';
+		if (!IPV4_ADDRESS_REGEX.test(form.wgAddress)) {
+			errors.wgAddress = 'Invalid IP address format. WireGuard peer addresses are IPv4 only.';
 			isValid = false;
 		}
 	}

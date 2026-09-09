@@ -8,6 +8,7 @@ import { syncFirewall } from '../wg/firewall';
 import { auth } from './auth';
 import { createLog } from '@server/lib/log';
 import { generateServerConfig } from '@server/wg/config';
+import { CIDR_REGEX, INTERFACE_NAME_REGEX, WG_LISTEN_PORT_MAX, WG_LISTEN_PORT_MIN } from '@server/lib/validation';
 
 const log = createLog('http');
 
@@ -78,12 +79,12 @@ export const serversRoutes = new Elysia()
 		{
 			body: t.Object({
 				friendlyName: t.String(),
-				interfaceName: t.RegExp(/^[a-zA-Z0-9_=+.-]{1,15}$/),
-				cidrRange: t.RegExp(/^(?:\d{1,3}\.){3}\d{1,3}\/(?:[0-9]|[1-2][0-9]|3[0-2])$/),
+				interfaceName: t.RegExp(INTERFACE_NAME_REGEX),
+				cidrRange: t.RegExp(CIDR_REGEX),
 				reservedIps: t.Integer({ default: 50 }),
 
 				wgEndpoint: t.String(),
-				wgListenPort: t.Integer(),
+				wgListenPort: t.Integer({ minimum: WG_LISTEN_PORT_MIN, maximum: WG_LISTEN_PORT_MAX }),
 				wgAddress: t.String(),
 				enableNat: t.Optional(t.Boolean({ default: false })),
 			}),
@@ -142,11 +143,11 @@ export const serversRoutes = new Elysia()
 		{
 			body: t.Object({
 				friendlyName: t.Optional(t.String()),
-				interfaceName: t.Optional(t.RegExp(/^[a-zA-Z0-9_=+.-]{1,15}$/)),
-				cidrRange: t.Optional(t.RegExp(/^(?:\d{1,3}\.){3}\d{1,3}\/(?:[0-9]|[1-2][0-9]|3[0-2])$/)),
+				interfaceName: t.Optional(t.RegExp(INTERFACE_NAME_REGEX)),
+				cidrRange: t.Optional(t.RegExp(CIDR_REGEX)),
 				reservedIps: t.Optional(t.Integer()),
 				wgEndpoint: t.Optional(t.String()),
-				wgListenPort: t.Optional(t.Integer()),
+				wgListenPort: t.Optional(t.Integer({ minimum: WG_LISTEN_PORT_MIN, maximum: WG_LISTEN_PORT_MAX })),
 				wgAddress: t.Optional(t.String()),
 				enableNat: t.Optional(t.Boolean()),
 			}),

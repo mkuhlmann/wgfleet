@@ -206,59 +206,65 @@ export const policyGrantsRelation = relations(policyGrantsTable, ({ one }) => ({
 	}),
 }));
 
-export const peersTable = sqliteTable('peers', {
-	id: text('id')
-		.primaryKey()
-		.$defaultFn(() => nanoid()),
+export const peersTable = sqliteTable(
+	'peers',
+	{
+		id: text('id')
+			.primaryKey()
+			.$defaultFn(() => nanoid()),
 
-	createdAt: integer('createdAt', { mode: 'timestamp' })
-		.notNull()
-		.$defaultFn(() => new Date()),
+		createdAt: integer('createdAt', { mode: 'timestamp' })
+			.notNull()
+			.$defaultFn(() => new Date()),
 
-	updatedAt: integer('updatedAt', { mode: 'timestamp' })
-		.notNull()
-		.$defaultFn(() => new Date()),
+		updatedAt: integer('updatedAt', { mode: 'timestamp' })
+			.notNull()
+			.$defaultFn(() => new Date()),
 
-	friendlyName: text('friendlyName'),
+		friendlyName: text('friendlyName'),
 
-	authToken: text('authToken')
-		.notNull()
-		.$defaultFn(() => nanoid(32)),
+		authToken: text('authToken')
+			.notNull()
+			.$defaultFn(() => nanoid(32)),
 
-	serverPeerId: text('serverPeerId')
-		.notNull()
-		.references(() => serverPeersTable.id),
+		serverPeerId: text('serverPeerId')
+			.notNull()
+			.references(() => serverPeersTable.id),
 
-	wgAddress: text('wgAddress').notNull(),
+		wgAddress: text('wgAddress').notNull(),
 
-	wgPrivateKey: text('wgPrivateKey').notNull(),
-	wgPublicKey: text('wgPublicKey').notNull(),
-	wgPresharedKey: text('wgPresharedKey'),
+		wgPrivateKey: text('wgPrivateKey').notNull(),
+		wgPublicKey: text('wgPublicKey').notNull(),
+		wgPresharedKey: text('wgPresharedKey'),
 
-	// no groupId column any more - a peer's tags are the many-to-many peerTagAssignmentsTable.
-	// no tags and no grant naming this peer directly = unrestricted (today's behaviour preserved).
+		// no groupId column any more - a peer's tags are the many-to-many peerTagAssignmentsTable.
+		// no tags and no grant naming this peer directly = unrestricted (today's behaviour preserved).
 
-	// Last raw cumulative rx/tx reported by `wg show` (see wg/shell.ts's wgShow), used by
-	// wg/traffic.ts to compute a per-tick delta. wgLastSampledAt is null until the first sample -
-	// that (not a zero byte count) is how "never sampled" is distinguished from "sampled, 0 bytes".
-	wgLastRxBytes: integer('wgLastRxBytes').notNull().default(0),
-	wgLastTxBytes: integer('wgLastTxBytes').notNull().default(0),
-	wgLastSampledAt: integer('wgLastSampledAt', { mode: 'timestamp' }),
+		// Last raw cumulative rx/tx reported by `wg show` (see wg/shell.ts's wgShow), used by
+		// wg/traffic.ts to compute a per-tick delta. wgLastSampledAt is null until the first sample -
+		// that (not a zero byte count) is how "never sampled" is distinguished from "sampled, 0 bytes".
+		wgLastRxBytes: integer('wgLastRxBytes').notNull().default(0),
+		wgLastTxBytes: integer('wgLastTxBytes').notNull().default(0),
+		wgLastSampledAt: integer('wgLastSampledAt', { mode: 'timestamp' }),
 
-	// Lifetime traffic totals since statsSince, manually resettable (see api/traffic.ts).
-	lifetimeRxBytes: integer('lifetimeRxBytes').notNull().default(0),
-	lifetimeTxBytes: integer('lifetimeTxBytes').notNull().default(0),
-	// SQLite's ALTER TABLE ADD COLUMN refuses a non-constant default (e.g. `unixepoch()`) on a
-	// table that already has rows ("Cannot add a column with non-constant default") - the literal
-	// `0` default lets the migration add the column, then an UPDATE in the same migration backfills
-	// existing rows to the real current time (see drizzle/0003_futuristic_black_knight.sql).
-	// drizzle-orm's sqlite dialect always prefers a static `.default()` over `$defaultFn()` when
-	// both are set (it never even calls defaultFn), so this `0` would otherwise leak into every
-	// new row's insert too - every create-server/create-peer handler must pass statsSince: new
-	// Date() explicitly (see api/servers.ts, api/serversPeers.ts) rather than relying on this
-	// column default for "now".
-	statsSince: integer('statsSince', { mode: 'timestamp' }).notNull().default(sql`0`),
-});
+		// Lifetime traffic totals since statsSince, manually resettable (see api/traffic.ts).
+		lifetimeRxBytes: integer('lifetimeRxBytes').notNull().default(0),
+		lifetimeTxBytes: integer('lifetimeTxBytes').notNull().default(0),
+		// SQLite's ALTER TABLE ADD COLUMN refuses a non-constant default (e.g. `unixepoch()`) on a
+		// table that already has rows ("Cannot add a column with non-constant default") - the literal
+		// `0` default lets the migration add the column, then an UPDATE in the same migration backfills
+		// existing rows to the real current time (see drizzle/0003_futuristic_black_knight.sql).
+		// drizzle-orm's sqlite dialect always prefers a static `.default()` over `$defaultFn()` when
+		// both are set (it never even calls defaultFn), so this `0` would otherwise leak into every
+		// new row's insert too - every create-server/create-peer handler must pass statsSince: new
+		// Date() explicitly (see api/servers.ts, api/serversPeers.ts) rather than relying on this
+		// column default for "now".
+		statsSince: integer('statsSince', { mode: 'timestamp' }).notNull().default(sql`0`),
+	},
+	// one wgAddress per server - resolvePeerAddress (wg/addressing.ts) checks this in-app, but
+	// only the DB constraint closes the race between two concurrent peer creates/updates.
+	(t) => [unique().on(t.serverPeerId, t.wgAddress)]
+);
 
 export const peersRelation = relations(peersTable, ({ one, many }) => ({
 	serverPeer: one(serverPeersTable, {
@@ -306,3 +312,24 @@ export const trafficBucketsTable = sqliteTable(
 );
 
 export type TrafficBucket = typeof trafficBucketsTable.$inferSelect;
+
+// Expiring admin login sessions issued by the login flow.
+export const adminSessionsTable = sqliteTable(
+	'adminSessions',
+	{
+		id: text('id')
+			.primaryKey()
+			.$defaultFn(() => nanoid()),
+
+		token: text('token').notNull().unique(),
+
+		createdAt: integer('createdAt', { mode: 'timestamp' })
+			.notNull()
+			.$defaultFn(() => new Date()),
+
+		expiresAt: integer('expiresAt', { mode: 'timestamp' }).notNull(),
+	},
+	(t) => [index('adminSessions_token_idx').on(t.token), index('adminSessions_expiresAt_idx').on(t.expiresAt)]
+);
+
+export type AdminSession = typeof adminSessionsTable.$inferSelect;

@@ -62,6 +62,7 @@ import { ref, reactive, watch } from 'vue';
 import { useToast } from '@app/composables/useToast';
 import { useMutation, useQueryClient } from '@tanstack/vue-query';
 import type { ServerPeer } from '@server/db/schema';
+import { CIDR_REGEX, INTERFACE_NAME_REGEX, IPV4_ADDRESS_REGEX, WG_LISTEN_PORT_MAX, WG_LISTEN_PORT_MIN } from '@server/lib/validation';
 import { eden } from '@app/queries/edenClient';
 import BaseButton from './BaseButton.vue';
 import BaseInput from './BaseInput.vue';
@@ -104,31 +105,25 @@ const validate = () => {
 	errors.cidrRange = '';
 
 	// Interface Name validation
-	const interfaceRegex = /^[a-zA-Z0-9_=+.-]{1,15}$/;
-	if (!interfaceRegex.test(form.interfaceName)) {
+	if (!INTERFACE_NAME_REGEX.test(form.interfaceName)) {
 		errors.interfaceName = 'Invalid interface name. Must be 1-15 alphanumeric characters (allows _, =, +, ., -).';
 		isValid = false;
 	}
 
-	// CIDR validation helper
-	const cidrRegex = /^(?:\d{1,3}\.){3}\d{1,3}\/(?:[0-9]|[1-2][0-9]|3[0-2])$/;
-
 	// WireGuard Address validation
-	// Allow simple IP or CIDR
-	const ipv4Regex = /^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)(?:\/(?:[0-9]|[1-2][0-9]|3[0-2]))?$/;
-	if (!ipv4Regex.test(form.wgAddress)) {
+	if (!IPV4_ADDRESS_REGEX.test(form.wgAddress)) {
 		errors.wgAddress = 'Invalid WireGuard Address. Must be a valid IP address (e.g., 10.8.0.1).';
 		isValid = false;
 	}
 
 	// Listen Port validation
-	if (form.wgListenPort < 1 || form.wgListenPort > 65535) {
-		errors.wgListenPort = 'Port must be between 1 and 65535.';
+	if (form.wgListenPort < WG_LISTEN_PORT_MIN || form.wgListenPort > WG_LISTEN_PORT_MAX) {
+		errors.wgListenPort = `Port must be between ${WG_LISTEN_PORT_MIN} and ${WG_LISTEN_PORT_MAX}.`;
 		isValid = false;
 	}
 
 	// CIDR Range validation
-	if (!cidrRegex.test(form.cidrRange)) {
+	if (!CIDR_REGEX.test(form.cidrRange)) {
 		errors.cidrRange = 'Invalid CIDR range (e.g., 10.8.0.0/24).';
 		isValid = false;
 	}

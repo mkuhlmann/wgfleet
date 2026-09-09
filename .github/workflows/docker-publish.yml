@@ -5,6 +5,9 @@ on:
     branches: ['latest']
     # Publish semver tags as releases.
     tags: ['v*.*.*']
+  # Allows the release workflow to dispatch a build for a tag it just pushed -
+  # a tag pushed with the default GITHUB_TOKEN doesn't trigger the `push` event above.
+  workflow_dispatch:
 
 env:
   # Use docker.io for Docker Hub if empty

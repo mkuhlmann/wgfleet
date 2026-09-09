@@ -2,7 +2,7 @@
 	<div class="crt-scanlines min-h-screen bg-bg text-text">
 		<nav class="flex items-center gap-6 px-4 py-3 border-b border-border">
 			<RouterLink to="/servers" class="font-bold text-accent tracking-tight flex items-center gap-1">
-				<span class="text-muted font-normal">#</span>wg-api-manager
+				<span class="text-muted font-normal">#</span>wgfleet
 			</RouterLink>
 			<RouterLink to="/servers" class="nav-link">servers</RouterLink>
 			<div v-if="authStore.authTokenValidated" class="ml-auto">

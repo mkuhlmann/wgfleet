@@ -1,5 +1,5 @@
 {
-	"name": "@wg-manager/server",
+	"name": "@wgfleet/server",
 	"version": "1.0.50",
 	"scripts": {
 		"test": "NODE_ENV=test bun test --preload ./src/tests/setup.ts",

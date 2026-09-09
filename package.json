@@ -1,5 +1,5 @@
 {
-  "name": "wg-manager",
+  "name": "wgfleet",
   "scripts": {
     "dev": "bun --filter '*' dev",
     "start": "bun --cwd packages/server start"

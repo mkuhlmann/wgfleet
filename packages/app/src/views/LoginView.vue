@@ -2,7 +2,7 @@
 	<div class="flex items-center justify-center pt-16">
 		<div class="w-full max-w-sm border border-border rounded-sm bg-surface2 p-6">
 			<div class="text-xs uppercase tracking-wide text-muted mb-4">authenticate</div>
-			<h1 class="text-lg font-bold text-accent mb-6">wg-api-manager</h1>
+			<h1 class="text-lg font-bold text-accent mb-6">wgfleet</h1>
 			<form @submit.prevent="handleLogin" class="flex flex-col gap-4">
 				<div>
 					<label for="token" class="block text-sm text-muted mb-1.5"><span class="text-accent-dim">&gt;</span> administration token</label>

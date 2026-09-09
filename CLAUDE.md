@@ -47,7 +47,7 @@ Formatting: Prettier, tabs, single quotes, 250-char print width (`.prettierrc`).
 ### Two packages, one type contract, no codegen
 
 The frontend never calls a generated client or a hand-maintained schema package. `packages/app` depends on
-`@wg-manager/server: workspace:*` and both tsconfigs alias `@server/*` -> `packages/server/src/*`, so
+`@wgfleet/server: workspace:*` and both tsconfigs alias `@server/*` -> `packages/server/src/*`, so
 `packages/app/src/queries/edenClient.ts` does `treaty<App>(...)` (Eden Treaty) against
 `export type App = typeof _app` from `packages/server/src/index.ts` directly. This means:
 - **Adding/changing a server route or its TypeBox (`t.Object(...)`) schema changes the frontend's types
@@ -153,7 +153,7 @@ in the modal components that use them), a single Pinia store for the in-memory (
 
 ### Issue tracker
 
-Issues live in GitHub Issues (`mkuhlmann/wg-api-manager`), via the `gh` CLI. See `docs/agents/issue-tracker.md`.
+Issues live in GitHub Issues (`mkuhlmann/wgfleet`), via the `gh` CLI. See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 

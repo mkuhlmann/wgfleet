@@ -1,7 +1,7 @@
 services:
-  wg-api-manager:
-    image: ghcr.io/mkuhlmann/wg-api-manager:latest
-    container_name: wg-api-manager
+  wgfleet:
+    image: ghcr.io/mkuhlmann/wgfleet:latest
+    container_name: wgfleet
     environment:
       - ADMIN_TOKEN=CHANGE_ME
     volumes:

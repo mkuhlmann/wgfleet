@@ -1,6 +1,6 @@
 # UI Design System — "Signal"
 
-The wg-api-manager UI is built as an **operator terminal console**: a tool for
+The wgfleet UI is built as an **operator terminal console**: a tool for
 people who manage WireGuard fleets from a shell, not a generic SaaS admin
 panel. Every screen borrows real conventions from terminal emulators — a
 window chrome bar, box-drawing rules, bracket-tagged status and actions,

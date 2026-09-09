@@ -20,7 +20,7 @@ const _app = new Elysia()
 		swagger({
 			documentation: {
 				info: {
-					title: 'wg-api-manager',
+					title: 'wgfleet',
 					version: '1.0.0',
 				},
 				components: {

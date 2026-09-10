@@ -57,6 +57,45 @@
 			<div class="rule-line"></div>
 
 			<div class="flex flex-col gap-4">
+				<h2 class="text-base font-bold text-text"><span class="text-accent-dim">///</span> exit nodes</h2>
+				<p class="text-xs text-muted">
+					an exit node routes another client's internet traffic through its own uplink. this is not a grant - it lives on the peer, because it decides
+					<span class="text-text">routing</span>, not permission. a client with no exit node has no route to one at all, so it cannot use one by editing its own config. only one exit node per interface.
+				</p>
+
+				<div v-if="exitNodes.length === 0" class="text-center py-8 text-muted text-sm">no exit node on this server - mark a peer as one from the peers list</div>
+
+				<div v-else class="grid gap-4 grid-cols-[repeat(auto-fill,minmax(260px,1fr))]">
+					<BaseCard v-for="node in exitNodes" :key="node.id" :title="node.friendlyName ?? node.wgAddress" class="h-full flex flex-col">
+						<div class="flex flex-col gap-3">
+							<div class="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 text-sm text-muted">
+								<span class="whitespace-nowrap">address</span>
+								<span class="text-text text-right break-all">{{ node.wgAddress }}</span>
+
+								<span class="whitespace-nowrap">exit dns</span>
+								<span class="text-text text-right break-all">{{ node.exitDns ?? server.dns ?? '-' }}</span>
+
+								<span class="whitespace-nowrap">route table</span>
+								<span class="text-text text-right">{{ server.routeTableId }}</span>
+							</div>
+
+							<div>
+								<div class="text-sm text-muted mb-1.5">clients</div>
+								<div v-if="clientsOf(node.id).length === 0" class="text-xs text-muted">none assigned yet</div>
+								<div v-else class="flex flex-wrap gap-x-3 gap-y-1 text-xs">
+									<span v-for="client in clientsOf(node.id)" :key="client.id" class="text-accent-dim">
+										{{ client.friendlyName ?? client.wgAddress }}
+									</span>
+								</div>
+							</div>
+						</div>
+					</BaseCard>
+				</div>
+			</div>
+
+			<div class="rule-line"></div>
+
+			<div class="flex flex-col gap-4">
 				<h2 class="text-base font-bold text-text"><span class="text-accent-dim">///</span> policy json</h2>
 				<PolicyJsonPanel :server-id="server.id" />
 			</div>
@@ -69,7 +108,7 @@ import { queryServer, queryServerPeers } from '@app/queries/queryServers';
 import { queryServerTags } from '@app/queries/queryPolicy';
 import { useQuery, useQueryClient } from '@tanstack/vue-query';
 import { useRoute } from 'vue-router';
-import { ref } from 'vue';
+import { ref, computed } from 'vue';
 import { eden } from '@app/queries/edenClient';
 import { invalidate } from '@app/queries/keys';
 import type { PeerTag } from '@server/db/schema';
@@ -85,6 +124,11 @@ const queryClient = useQueryClient();
 const { data: server, isLoading } = useQuery(queryServer(route.params.id as string));
 const { data: tags } = useQuery(queryServerTags(route.params.id as string));
 const { data: peers } = useQuery(queryServerPeers(route.params.id as string));
+
+// Exit assignment isn't a grant (it's peers.exitPeerId - see docs/design/exit-nodes.md), so
+// it gets its own panel rather than a row in GrantsTable.
+const exitNodes = computed(() => (peers.value ?? []).filter((p) => p.isExitNode));
+const clientsOf = (exitPeerId: string) => (peers.value ?? []).filter((p) => p.exitPeerId === exitPeerId);
 
 const showAddTagModal = ref(false);
 const showEditTagModal = ref(false);

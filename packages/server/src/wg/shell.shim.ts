@@ -86,6 +86,10 @@ export const stopServer = async (server: ServerPeer) => {
 	upInterfaces.delete(server.interfaceName);
 };
 
+export const applyExitRouting = async (commands: string[]) => {
+	log.info(`(shim) apply exit routing:\n${commands.join('\n')}`);
+};
+
 export const applyFirewall = async (ruleset: string) => {
 	log.info(`[shim] "applying" firewall ruleset (no real network changes made) - written to /tmp/wgmgr.nft`);
 	await Bun.write('/tmp/wgmgr.nft', ruleset, { mode: 0o600 });

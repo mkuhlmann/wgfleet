@@ -43,6 +43,13 @@
       "when": 1788750038642,
       "tag": "0005_mighty_peter_quill",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1789072914113,
+      "tag": "0006_windy_ender_wiggin",
+      "breakpoints": true
     }
   ]
 }

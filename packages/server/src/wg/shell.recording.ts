@@ -13,22 +13,26 @@ export type RecordedCall =
 	| { fn: 'reloadServer'; interfaceName: string }
 	| { fn: 'stopServer'; interfaceName: string }
 	| { fn: 'applyFirewall'; ruleset: string }
-	| { fn: 'resetFirewall' };
+	| { fn: 'resetFirewall' }
+	| { fn: 'applyExitRouting'; commands: string[] };
 
 const calls: RecordedCall[] = [];
 let lastAppliedRuleset: string | null = null;
+let lastAppliedExitRouting: string[] | null = null;
 const upInterfaces = new Set<string>();
 
 export const shellCallLog = {
 	calls: () => [...calls],
 	callsFor: (interfaceName: string) => calls.filter((c) => 'interfaceName' in c && c.interfaceName === interfaceName),
 	lastAppliedRuleset: () => lastAppliedRuleset,
+	lastAppliedExitRouting: () => lastAppliedExitRouting,
 	isUp: (interfaceName: string) => upInterfaces.has(interfaceName),
 	// Tests share one process (see tests/setup.ts) - call this in beforeEach/afterEach to stop
 	// one test's recorded calls leaking into the next.
 	reset: () => {
 		calls.length = 0;
 		lastAppliedRuleset = null;
+		lastAppliedExitRouting = null;
 		upInterfaces.clear();
 	},
 };
@@ -68,4 +72,9 @@ export const applyFirewall = async (ruleset: string) => {
 export const resetFirewall = async () => {
 	lastAppliedRuleset = null;
 	calls.push({ fn: 'resetFirewall' });
+};
+
+export const applyExitRouting = async (commands: string[]) => {
+	lastAppliedExitRouting = commands;
+	calls.push({ fn: 'applyExitRouting', commands });
 };

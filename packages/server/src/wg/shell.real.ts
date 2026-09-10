@@ -104,6 +104,17 @@ export const stopServer = async (server: ServerPeer) => {
 	await cmd(`ip link delete dev ${server.interfaceName}`);
 };
 
+// Exit-node policy routing (see wg/exitRouting.ts). Takes an already-built command list
+// rather than the servers themselves so that every `ip` invocation is decided by the pure
+// builder there and this adapter stays a dumb executor - the same split as
+// applyFirewall/buildRuleset. Commands are ordered (drain before repopulate) so they run
+// sequentially, not concurrently.
+export const applyExitRouting = async (commands: string[]) => {
+	for (const command of commands) {
+		await cmd(command);
+	}
+};
+
 export const applyFirewall = async (ruleset: string) => {
 	// feed the generated script on stdin rather than a temp file - no path to
 	// inject, and no interpolation of the ruleset into a shell command at all.

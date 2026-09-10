@@ -23,6 +23,8 @@ const server = (overrides: Partial<FirewallServer> = {}): FirewallServer => ({
 	tags: [],
 	grants: [],
 	governedIps: [],
+	exitClientIps: [],
+	exitPeerIp: null,
 	...overrides,
 });
 
@@ -251,5 +253,76 @@ describe('buildRuleset', () => {
 		expect(ruleset).not.toContain('oifname !=');
 		// only the baseline invalid-state drop is present - no egress guard drop
 		expect(ruleset.match(/\bdrop\b/g)).toEqual(['drop']);
+	});
+
+	describe('exit nodes', () => {
+		it("accepts an exit client's internet-bound traffic leaving via the wg interface itself", () => {
+			// An `internet`-dst grant compiles to `oifname != <managed>` and so never matches
+			// exit traffic, which leaves *via* the wg interface towards the exit node. Without
+			// this rule a governed exit client would be dropped by the default-deny and its exit
+			// node would silently do nothing.
+			const ruleset = buildRuleset([server({ cidrRange: '10.20.20.0/24', exitPeerIp: '10.20.20.2', exitClientIps: ['10.20.20.3'] })]);
+
+			expect(ruleset).toContain('elements = { 10.20.20.3 }');
+			expect(ruleset).toContain('ip saddr @s0_exitclients oifname "wg0" ip daddr != 10.20.20.0/24 accept');
+		});
+
+		it('scopes the accept to internet-bound traffic, leaving peer-to-peer entirely to grants', () => {
+			const ruleset = buildRuleset([server({ cidrRange: '10.20.20.0/24', exitPeerIp: '10.20.20.2', exitClientIps: ['10.20.20.3'] })]);
+
+			// `ip daddr != cidrRange` is what keeps it from being a blanket allow within the vpn
+			expect(ruleset).toContain('ip daddr != 10.20.20.0/24');
+		});
+
+		it('places the exit accept after every explicit grant, so a deny above it still wins', () => {
+			const office = tag({ id: 't-office', name: 'office', memberIps: ['10.20.20.3'] });
+			const denyAll = grant({ action: 'deny', src: { kind: 'tag', tagId: 't-office' }, dst: { kind: 'any' } });
+			const ruleset = buildRuleset([server({ cidrRange: '10.20.20.0/24', tags: [office], grants: [denyAll], governedIps: office.memberIps, exitPeerIp: '10.20.20.2', exitClientIps: ['10.20.20.3'] })]);
+
+			const denyAt = ruleset.indexOf('ip saddr @s0t0 drop');
+			const exitAt = ruleset.indexOf('@s0_exitclients');
+
+			expect(denyAt).toBeGreaterThanOrEqual(0);
+			expect(exitAt).toBeGreaterThan(denyAt);
+		});
+
+		it('emits the exit chain even for a server with no tags and no grants', () => {
+			// membership of exitClientIps is the only policy such a server has - skipping the
+			// chain (as an entirely policy-free server does) would drop the accept with it
+			const ruleset = buildRuleset([server({ exitPeerIp: '10.20.20.2', exitClientIps: ['10.20.20.3'] })]);
+
+			expect(ruleset).toContain('chain fwd_s0 {');
+		});
+
+		it('emits nothing for an exit node with no clients assigned', () => {
+			const ruleset = buildRuleset([server({ exitPeerIp: '10.20.20.2', exitClientIps: [] })]);
+
+			expect(ruleset).not.toContain('exitclients');
+			expect(ruleset).not.toContain('chain fwd_s0 {');
+		});
+
+		it('does not masquerade exit traffic even when the server also has NAT on', () => {
+			// exit traffic leaves via a managed interface, so the `oifname != <managed>`
+			// masquerade rule must not match it - no double NAT, the exit node does its own.
+			const ruleset = buildRuleset([server({ cidrRange: '10.20.20.0/24', enableNat: true, exitPeerIp: '10.20.20.2', exitClientIps: ['10.20.20.3'] })]);
+
+			expect(ruleset).toContain('ip saddr 10.20.20.0/24 oifname != { "wg0" } masquerade');
+			expect(ruleset).toContain('ip saddr @s0_exitclients oifname "wg0"');
+		});
+
+		it('keeps exit clients out of the governed set, so assigning an exit node does not lock a peer down', () => {
+			const ruleset = buildRuleset([server({ exitPeerIp: '10.20.20.2', exitClientIps: ['10.20.20.3'] })]);
+
+			// s0_governed is emitted but empty - an exit client with no tags stays ungoverned
+			expect(ruleset).toContain('set s0_governed {');
+			expect(ruleset).not.toContain('set s0_governed {\n\t\ttype ipv4_addr\n\t\telements');
+		});
+
+		it('omits the exit accept when the exit node reference is dangling', () => {
+			const ruleset = buildRuleset([server({ exitPeerIp: null, exitClientIps: ['10.20.20.3'] })]);
+
+			const fwdBody = ruleset.match(/chain fwd_s0 \{([\s\S]*?)\n\t\}/)![1];
+			expect(fwdBody).not.toContain('accept');
+		});
 	});
 });

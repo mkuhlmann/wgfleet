@@ -41,6 +41,11 @@
 				<small class="text-muted text-xs">number of ips to reserve at the start of the subnet range</small>
 			</div>
 			<div class="field">
+				<label for="dns" class="mb-1.5 text-sm text-muted block"><span class="text-accent-dim">&gt;</span> dns</label>
+				<BaseInput id="dns" v-model="form.dns" class="w-full" placeholder="leave empty to omit" />
+				<small class="text-muted text-xs">resolver handed to clients as <span class="text-text">DNS =</span> in their config. an exit node can override it for its own clients</small>
+			</div>
+			<div class="field">
 				<button type="button" class="flex items-center gap-2 text-sm text-text" @click="form.enableNat = !form.enableNat">
 					<span class="text-accent-dim">{{ form.enableNat ? '[x]' : '[ ]' }}</span>
 					<span><span class="text-accent-dim">&gt;</span> enable nat</span>
@@ -89,6 +94,7 @@ const form = reactive({
 	cidrRange: '10.0.0.0/24',
 	reservedIps: 50,
 	enableNat: false,
+	dns: '',
 });
 
 const errors = reactive({
@@ -144,6 +150,7 @@ watch(
 			form.cidrRange = server.cidrRange ?? '10.0.0.0/24';
 			form.reservedIps = server.reservedIps ?? 50;
 			form.enableNat = server.enableNat ?? false;
+			form.dns = server.dns ?? '';
 			isEditMode.value = true;
 		} else {
 			isEditMode.value = false;
@@ -156,6 +163,7 @@ watch(
 			form.cidrRange = '10.0.0.0/24';
 			form.reservedIps = 50;
 			form.enableNat = false;
+			form.dns = '';
 		}
 		// Clear errors when opening/changing server
 		errors.interfaceName = '';
@@ -166,8 +174,15 @@ watch(
 	{ immediate: true }
 );
 
+// dns is the one clearable field, and create/patch differ on how: the create schema takes
+// `t.Optional(t.String())` (omit it) while patch takes `t.Optional(t.Nullable(t.String()))`
+// (null clears it). Two payload types rather than one, so the difference stays type-checked -
+// the app types these straight off the server's route schemas, with no codegen in between.
+type CreateServerPayload = Omit<typeof form, 'dns'> & { dns?: string };
+type UpdateServerPayload = Omit<typeof form, 'dns'> & { dns: string | null };
+
 const createServer = useMutation({
-	mutationFn: async (data: typeof form) => {
+	mutationFn: async (data: CreateServerPayload) => {
 		const res = await eden.api.v1.wg.servers.post(data);
 		return res.data;
 	},
@@ -186,7 +201,7 @@ const createServer = useMutation({
 });
 
 const updateServer = useMutation({
-	mutationFn: async (data: typeof form) => {
+	mutationFn: async (data: UpdateServerPayload) => {
 		if (!props.server) return;
 		const res = await eden.api.v1.wg.servers({ id: props.server?.id }).patch(data);
 		return res.data;
@@ -210,9 +225,10 @@ const handleSubmit = () => {
 		return;
 	}
 	if (isEditMode.value) {
-		updateServer.mutate(form);
+		// null clears it server-side; '' would be stored as an empty string
+		updateServer.mutate({ ...form, dns: form.dns || null });
 	} else {
-		createServer.mutate(form);
+		createServer.mutate({ ...form, dns: form.dns || undefined });
 	}
 };
 </script>

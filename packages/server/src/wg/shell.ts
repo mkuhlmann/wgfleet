@@ -61,6 +61,9 @@ export const isInterfaceUp = capabilities.network ? real.isInterfaceUp : shim.is
 export const startServer = capabilities.network ? real.startServer : shim.startServer;
 export const reloadServer = capabilities.network ? real.reloadServer : shim.reloadServer;
 export const stopServer = capabilities.network ? real.stopServer : shim.stopServer;
+// `network`, not `firewall`: exit routing is pure `ip rule`/`ip route` and must not depend on
+// nft being available - see the rejected-alternative note in wg/exitRouting.ts.
+export const applyExitRouting = capabilities.network ? real.applyExitRouting : shim.applyExitRouting;
 
 export const applyFirewall = capabilities.firewall ? real.applyFirewall : shim.applyFirewall;
 export const resetFirewall = capabilities.firewall ? real.resetFirewall : shim.resetFirewall;

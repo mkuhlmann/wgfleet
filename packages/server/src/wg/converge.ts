@@ -1,6 +1,7 @@
 import { resolveServer } from '@server/db/servers';
 import { isInterfaceUp, reloadServer, startServer } from './shell';
 import { syncFirewall } from './firewall';
+import { syncExitRouting } from './exitRouting';
 import { createLog } from '@server/lib/log';
 
 const log = createLog('wg:converge');
@@ -20,7 +21,9 @@ let chain: Promise<void> = Promise.resolve();
  * This is the one place that decides start-vs-reload and the only place a failure in either
  * step is observable - every route handler that changes a server's or a peer's config calls
  * this instead of reaching for wg/shell and wg/firewall directly. Pure policy changes (tags,
- * grants) don't touch the interface and should call syncFirewall() alone instead.
+ * grants) don't touch the interface and should call syncFirewall() alone instead - but note
+ * that anything touching a peer's isExitNode/exitPeerId does change the interface config
+ * (the exit node's AllowedIPs, and `Table = off` - see wg/config.ts) and must converge.
  */
 export const converge = async (serverId: string): Promise<ConvergeResult> => {
 	const run = async (): Promise<ConvergeResult> => {
@@ -41,6 +44,11 @@ export const converge = async (serverId: string): Promise<ConvergeResult> => {
 		// syncFirewall never throws (it catches and logs internally - see firewall.ts) so this
 		// is always reached, but await it anyway rather than leaving it fire-and-forget.
 		await syncFirewall();
+
+		// Last, and specifically after the interface is up: exit routing installs
+		// `ip route ... dev <interfaceName>`, which needs the device to already exist.
+		// Same never-throws contract as syncFirewall.
+		await syncExitRouting();
 
 		return { ok: true };
 	};

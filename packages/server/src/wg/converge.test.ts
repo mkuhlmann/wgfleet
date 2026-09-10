@@ -52,7 +52,10 @@ describe('converge', () => {
 		const first = await converge('convergeTest-serverA');
 		expect(first).toEqual({ ok: true });
 		expect(shellCallLog.callsFor('wgConvA')).toEqual([{ fn: 'startServer', interfaceName: 'wgConvA' }]);
-		expect(shellCallLog.calls().at(-1)).toEqual({ fn: 'applyFirewall', ruleset: shellCallLog.lastAppliedRuleset() });
+		// firewall, then exit routing last - the latter installs `ip route ... dev <iface>` and
+		// so has to run after the interface exists (see converge()).
+		expect(shellCallLog.calls().at(-2)).toEqual({ fn: 'applyFirewall', ruleset: shellCallLog.lastAppliedRuleset() });
+		expect(shellCallLog.calls().at(-1)).toEqual({ fn: 'applyExitRouting', commands: shellCallLog.lastAppliedExitRouting() });
 
 		// no shellCallLog.reset() here - the recording adapter's isInterfaceUp state (set by
 		// the startServer call above) must carry over, same as a real interface would stay up

@@ -37,6 +37,21 @@ export const serverPeersTable = sqliteTable('serverPeers', {
 	// turning it into an internet gateway.
 	enableNat: integer('enableNat', { mode: 'boolean' }).notNull().default(false),
 
+	// Resolver handed to clients as `DNS =` in their generated config (wg/config.ts). Null
+	// omits the line entirely, which is today's behaviour. Lives on the server rather than
+	// per-peer because it describes the network the tunnel leads into, not one client.
+	dns: text('dns'),
+
+	// Routing table this interface's exit-node traffic is policy-routed into (see
+	// wg/exitRouting.ts). Per-interface rather than per-peer so unmarking and re-marking an
+	// exit node never churns the table number under live traffic, and allocated explicitly
+	// (lowest free in EXIT_ROUTE_TABLE_MIN..MAX, see db/servers.ts's allocateRouteTableId)
+	// rather than derived from an ordinal - deleting a server must not renumber the tables
+	// of the servers that outlive it. Same `.default(sql`0`)` caveat as statsSince below:
+	// drizzle's sqlite dialect prefers a static default over $defaultFn, so every
+	// create-server path must pass a real value explicitly.
+	routeTableId: integer('routeTableId').notNull().default(sql`0`),
+
 	// Lifetime traffic totals since statsSince, manually resettable (see api/traffic.ts). Kept
 	// as running counters rather than derived from trafficBucketsTable because that table is
 	// pruned (see wg/traffic.ts) and because a server's total must keep counting traffic from
@@ -240,6 +255,25 @@ export const peersTable = sqliteTable(
 		// no groupId column any more - a peer's tags are the many-to-many peerTagAssignmentsTable.
 		// no tags and no grant naming this peer directly = unrestricted (today's behaviour preserved).
 
+		// --- exit nodes (see wg/exitRouting.ts and docs/design/exit-nodes.md) ---------------
+		// This peer is its server's exit node: internet-bound traffic from peers that point
+		// their exitPeerId at it is policy-routed into its tunnel and NAT'd by its own machine.
+		// At most one per server - only one peer can own AllowedIPs 0.0.0.0/0 on a wg interface
+		// (enforced in api/serversPeers.ts, not by the db).
+		isExitNode: integer('isExitNode', { mode: 'boolean' }).notNull().default(false),
+
+		// The exit node this peer reaches the internet through, or null for "no exit node".
+		// Must name a peer on the same server carrying isExitNode. This column is both the
+		// permission and the routing instruction: no exitPeerId means no `ip rule`, so the
+		// peer physically cannot use an exit node even if it hand-edits its own AllowedIPs.
+		exitPeerId: text('exitPeerId').references((): any => peersTable.id, { onDelete: 'set null' }),
+
+		// Resolver handed to clients using *this* peer as their exit node, in the ?exit=true
+		// config rendering only (wg/config.ts). Only meaningful on an isExitNode row; falls
+		// back to the server's `dns` when null. Sending DNS to the local ISP is the main thing
+		// an exit node exists to prevent, so it needs to be overridable per exit node.
+		exitDns: text('exitDns'),
+
 		// Last raw cumulative rx/tx reported by `wg show` (see wg/shell.ts's wgShow), used by
 		// wg/traffic.ts to compute a per-tick delta. wgLastSampledAt is null until the first sample -
 		// that (not a zero byte count) is how "never sampled" is distinguished from "sampled, 0 bytes".
@@ -270,6 +304,11 @@ export const peersRelation = relations(peersTable, ({ one, many }) => ({
 	serverPeer: one(serverPeersTable, {
 		fields: [peersTable.serverPeerId],
 		references: [serverPeersTable.id],
+	}),
+	exitPeer: one(peersTable, {
+		fields: [peersTable.exitPeerId],
+		references: [peersTable.id],
+		relationName: 'peerExitPeer',
 	}),
 	tagAssignments: many(peerTagAssignmentsTable),
 }));

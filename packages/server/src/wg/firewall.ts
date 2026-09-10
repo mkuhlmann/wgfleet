@@ -41,6 +41,16 @@ export type FirewallServer = {
 	// ips of peers that must be default-denied once nothing in `grants` matches - see the
 	// "governed" note above. Anyone not in this set falls through to `return`, unrestricted.
 	governedIps: string[];
+	// ips of peers whose `exitPeerId` names this server's exit node (wg/exitRouting.ts).
+	// Their internet-bound traffic leaves *via* this wg interface (to the exit node) rather
+	// than via a non-wg one, so it matches neither an `internet`-dst grant (compiled to
+	// `oifname != <managed>`) nor the base chain's egress guard - it needs the explicit
+	// accept emitted at the bottom of `fwd_s{i}` below. Deliberately *not* folded into
+	// governedIps: assigning an exit node must not change whether a peer is governed.
+	exitClientIps: string[];
+	// the exit node's own ip, or null - the accept below has to exclude traffic aimed at the
+	// tunnel itself, which is ordinary peer-to-peer traffic and governed by grants as usual
+	exitPeerIp: string | null;
 };
 
 // nft identifiers must start with a letter and only accept a limited charset. nanoid
@@ -141,13 +151,20 @@ export const buildRuleset = (servers: FirewallServer[]): string => {
 	const natLines: string[] = [];
 
 	servers.forEach((server, i) => {
-		if (server.tags.length === 0 && server.grants.length === 0) return;
+		// Nothing to enforce: no policy at all and no exit clients to allow through. Emitting
+		// no chain for this server is what keeps a deployment that never touched either
+		// feature byte-identical to before.
+		if (server.tags.length === 0 && server.grants.length === 0 && server.exitClientIps.length === 0) return;
 
 		const governedName = `s${i}_governed`;
 		const fwdName = `fwd_s${i}`;
 		const inName = `in_s${i}`;
 
 		sets.push(renderSet(governedName, server.governedIps));
+		const exitClientsName = `s${i}_exitclients`;
+		if (server.exitClientIps.length) {
+			sets.push(renderSet(exitClientsName, server.exitClientIps, 'exit node clients'));
+		}
 		server.tags.forEach((tag, j) => {
 			sets.push(renderSet(`s${i}t${j}`, tag.memberIps, tag.name));
 		});
@@ -165,6 +182,15 @@ export const buildRuleset = (servers: FirewallServer[]): string => {
 			if (grant.dst.kind === 'server') continue;
 			const line = renderGrantRule(grant);
 			if (line) fwdBody.push(line);
+		}
+		// Deliberately *after* every explicit grant: an admin's `deny` placed above still wins,
+		// so the ordered grants list keeps its authority and peers.exitPeerId only ever adds
+		// this one narrow allowance at the bottom. `ip daddr != cidrRange` keeps it to
+		// internet-bound traffic - reaching other peers on this interface stays entirely a
+		// matter of grants. Without this, a *governed* exit client would be dropped by the
+		// default-deny below and its exit node would silently do nothing.
+		if (server.exitClientIps.length && server.exitPeerIp) {
+			fwdBody.push(`\tip saddr @${exitClientsName} oifname ${quote(server.interfaceName)} ip daddr != ${server.cidrRange} accept comment ${quote('exit node')}`);
 		}
 		fwdBody.push(`\tip saddr @${governedName} drop`); // governed, nothing matched -> default deny
 		fwdBody.push(`\treturn`); // ungoverned -> unrestricted, as before
@@ -318,6 +344,10 @@ const toFirewallServer = (graph: PolicyGraph): FirewallServer => {
 		firewallGrants.push({ action: grant.action, src, dst, protocol: grant.protocol, ports: grant.ports, comment: grant.comment });
 	}
 
+	// At most one exit node per server (only one peer can own AllowedIPs 0.0.0.0/0 on a wg
+	// interface) - api-enforced; pick deterministically if a direct db write broke that.
+	const exitPeer = graph.peers.filter((p) => p.isExitNode).sort((a, b) => a.id.localeCompare(b.id))[0];
+
 	return {
 		interfaceName: graph.server.interfaceName,
 		cidrRange: graph.server.cidrRange,
@@ -326,6 +356,8 @@ const toFirewallServer = (graph: PolicyGraph): FirewallServer => {
 		tags: firewallTags,
 		grants: firewallGrants,
 		governedIps: [...governedPeerIds].map((id) => peerIp.get(id)).filter((ip): ip is string => Boolean(ip)),
+		exitClientIps: exitPeer ? graph.peers.filter((p) => p.exitPeerId === exitPeer.id && p.id !== exitPeer.id).map((p) => p.wgAddress) : [],
+		exitPeerIp: exitPeer?.wgAddress ?? null,
 	};
 };
 

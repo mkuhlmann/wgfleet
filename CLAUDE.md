@@ -76,7 +76,9 @@ route parameterized by that server's id, including all of its peers, tags and gr
 
 `src/db/schema.ts` defines six tables: `serverPeersTable` (one per WireGuard interface/server), `peersTable`
 (clients, FK'd to a server), `peerTagsTable`, `peerTagAssignmentsTable` and `policyGrantsTable` (see "Restricted
-clients" below). **SQLite foreign-key enforcement is never turned on** (no `PRAGMA foreign_keys = ON` anywhere) -
+clients" below). `peersTable` also carries the exit-node columns (`isExitNode`, `exitPeerId`, `exitDns`) and
+`serverPeersTable` the interface's `dns` and its allocated policy-routing table (`routeTableId`) - see "Exit
+nodes" below. **SQLite foreign-key enforcement is never turned on** (no `PRAGMA foreign_keys = ON` anywhere) -
 `onDelete` clauses in the schema are declarative intent only; cascade/cleanup on delete is done by hand in the
 API handler (see `DELETE /wg/servers/:id/tags/:tagId` in `src/api/policy.ts` for the pattern: an explicit
 `db.transaction(...)` that unassigns members and deletes referencing grants before deleting the row itself).
@@ -92,15 +94,16 @@ fakes) **per capability**, not as a single on/off switch:
 | Axis | Probed by | Powers |
 |---|---|---|
 | `crypto` | `Bun.which('wg')` | `wgGenKey`/`wgGenPsk`/`wgDerivePublicKey` |
-| `network` | `wg-quick`+`ip` present, and an actual `ip link add ... type dummy` probe (binaries can exist without `NET_ADMIN`) | `startServer`/`reloadServer`/`stopServer`/`wgShow`/`isInterfaceUp` |
+| `network` | `wg-quick`+`ip` present, and an actual `ip link add ... type dummy` probe (binaries can exist without `NET_ADMIN`) | `startServer`/`reloadServer`/`stopServer`/`wgShow`/`isInterfaceUp`/`applyExitRouting` |
 | `firewall` | `nft` present and `nft list tables` actually succeeds | `applyFirewall`/`resetFirewall` |
 
 In production (`NODE_ENV=production`), missing any capability throws on boot unless `WG_DEV_SHIM=true` is set
 explicitly - it will not silently fall back to shimmed behavior. Outside production, each missing capability
 logs a warning and shims just that axis. **When adding a new exported function to this layer, add it to all
-three files (`shell.ts`, `shell.real.ts`, `shell.shim.ts`) and to the `mock.module('@server/wg/shell', ...)`
-block in `src/tests/setup.ts`**, which replaces the whole module for every test - a function missing there is
-`undefined` in every test.
+four files (`shell.ts`, `shell.real.ts`, `shell.shim.ts`, `shell.recording.ts`)** - `src/tests/setup.ts`'s
+`mock.module('@server/wg/shell', ...)` re-exports `shell.recording.ts` wholesale for every test, so a function
+missing from that adapter is `undefined` in every test. `shell.recording.ts` behaves like the shim but also
+keeps a call log, which is how tests assert *that* a mutation reloaded an interface or resynced policy.
 
 Local dev/tests never need root or real WireGuard tooling: `WG_DEV_SHIM=true bun run dev` (or just running
 outside a privileged container) exercises the full app against the shim.
@@ -138,6 +141,38 @@ load state from the db and apply it. Keep new test scenarios on the pure functio
 `NODE_ENV=test` is a single in-memory database shared across *all* test files in the same run, so anything
 reading "all servers" from the db in a test would pick up fixtures inserted by unrelated test files (this is why
 existing fixtures prefix ids per-file, e.g. `serversRouter-server`, `peersRouters-server`, `policyRouter-server`).
+
+### Exit nodes: the peer as internet gateway, and routing as the permission
+
+A peer marked `peers.isExitNode` lends its own uplink to other clients: a peer with
+`peers.exitPeerId` pointing at it gets a **second config rendering** (`?exit=true` on either
+peer-config route) whose only difference is `AllowedIPs = 0.0.0.0/0, ::/0` - same key, same
+address, same endpoint - so the client switches exit path by switching config file, with no
+server-side state change. **Read `docs/design/exit-nodes.md` before touching any of this**; it
+covers the full traffic path and the rejected alternatives. The three things most likely to
+surprise:
+
+- **The `ip rule` is the permission, not the nft rule.** `wg/exitRouting.ts` installs
+  `ip rule from <client>/32 table <server.routeTableId>` + `default dev <iface>` only for peers
+  with an `exitPeerId`. A peer without one has no route to the exit node at all, so it can't
+  reach that uplink by hand-editing its own `AllowedIPs`. The nft accept in `fwd_s{i}` exists
+  only so a *governed* exit client isn't dropped by its default-deny first, and is emitted
+  **after** every explicit grant so an admin `deny` still wins.
+- **An exit-bearing interface's server config emits `Table = off`.** The exit peer owns
+  `AllowedIPs = 0.0.0.0/0` server-side, and `wg-quick` would turn that into a default route on
+  the *manager's own host*. With `Table = off` the connected route from `Address` is what makes
+  peers routable, which is why `generateServerConfig` derives that prefix from `cidrRange`
+  rather than assuming `/24`.
+- **One exit node per interface**, api-enforced (`assertExitNodeInvariants` in
+  `api/serversPeers.ts`) - only one peer can own `0.0.0.0/0` on a wg interface. That's a
+  wireguard constraint, not a policy choice. Advertised subnet routes (Tailscale's other half)
+  are deliberately deferred and specced at the bottom of the design doc.
+
+Like `firewall.ts`, `exitRouting.ts` splits into a pure `buildExitRouting(servers)` (what
+`exitRouting.test.ts` drives) and a thin `syncExitRouting()`; it runs at the *end* of
+`converge()` because `ip route ... dev <iface>` needs the device to exist. Anything touching
+`isExitNode`/`exitPeerId` changes the interface config too, so it must `converge()`, not just
+`syncFirewall()`.
 
 ### Frontend: no component library, one design system
 

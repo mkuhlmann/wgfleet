@@ -12,3 +12,17 @@ export const IPV4_ADDRESS_REGEX = /^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\
 
 export const WG_LISTEN_PORT_MIN = 1;
 export const WG_LISTEN_PORT_MAX = 65535;
+
+/**
+ * Splits the comma-separated CIDR list stored in `peers.advertisedRoutes` (and typed into the
+ * peer form) into its entries. Tolerant of whitespace, newlines and trailing commas, because
+ * a human types this field and pasting a list with spaces after the commas must not turn into
+ * a validation error. Deliberately does *not* validate - CIDR_REGEX above and
+ * resolveAdvertisedRoutes (wg/addressing.ts, which also network-aligns each entry) do that;
+ * this only has to agree about what the separators are.
+ */
+export const parseCidrList = (value: string | null | undefined): string[] =>
+	(value ?? '')
+		.split(/[\s,]+/)
+		.map((entry) => entry.trim())
+		.filter(Boolean);

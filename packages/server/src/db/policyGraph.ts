@@ -2,6 +2,7 @@ import { db } from './index';
 import { peerTagAssignmentsTable, peerTagsTable, peersTable, policyGrantsTable, type Peer, type PeerTag, type PeerTagAssignment, type PolicyGrant, type ServerPeer } from './schema';
 import { asc, eq, inArray } from 'drizzle-orm';
 import { resolveServer } from './servers';
+import { advertisedRoutesOf } from '@server/wg/addressing';
 
 /**
  * One server's full policy graph: its tags, peers, peer<->tag assignments and grants
@@ -120,6 +121,11 @@ export function toPolicyDocument(graph: PolicyGraph): PolicyDocument {
  * Client-side AllowedIPs is a routing hint, not the enforcement boundary - see wg/config.ts.
  * Only `allow` grants matter here, filtered to the ones applicable to this one peer (by its
  * own id or any of its tags).
+ *
+ * The `cidr`-dst grants appended here are also what makes an advertised subnet route
+ * (`peers.advertisedRoutes`) show up in a permitted client's normal config: advertising adds
+ * no new permission mechanism, so "which clients get the LAN in their AllowedIPs" is answered
+ * by the same ordered grants list as every other destination.
  */
 export function allowedIpsForPeer(graph: PolicyGraph, peer: Peer): string {
 	const tagIds = new Set(graph.assignments.filter((a) => a.peerId === peer.id).map((a) => a.tagId));
@@ -130,7 +136,12 @@ export function allowedIpsForPeer(graph: PolicyGraph, peer: Peer): string {
 
 	if (applicable.some((g) => g.dstKind === 'internet' || g.dstKind === 'any')) return '0.0.0.0/0';
 
-	const extraCidrs = applicable.filter((g) => g.dstKind === 'cidr' && g.dstCidr).map((g) => g.dstCidr!);
+	// A grant that hands a peer a LAN it advertises itself would route that LAN into the
+	// tunnel on the machine that *is* its gateway - a loop, and the one case where a routing
+	// hint can break the advertiser rather than merely be too narrow. Grants are written
+	// against tags, so this is easy to hit by accident: tag the advertiser like its peers.
+	const ownRoutes = new Set(advertisedRoutesOf(peer));
+	const extraCidrs = applicable.filter((g) => g.dstKind === 'cidr' && g.dstCidr && !ownRoutes.has(g.dstCidr)).map((g) => g.dstCidr!);
 
 	return [graph.server.cidrRange, ...extraCidrs].join(', ');
 }

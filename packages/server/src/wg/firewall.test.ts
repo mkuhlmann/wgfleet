@@ -25,6 +25,7 @@ const server = (overrides: Partial<FirewallServer> = {}): FirewallServer => ({
 	governedIps: [],
 	exitClientIps: [],
 	exitPeerIp: null,
+	advertisedRoutes: [],
 	...overrides,
 });
 
@@ -71,10 +72,7 @@ describe('buildRuleset', () => {
 	it('scopes sets and chains per-server, even with overlapping CIDRs', () => {
 		const officeA = tag({ id: 'a-office', name: 'office', memberIps: ['10.0.0.2'] });
 		const officeB = tag({ id: 'b-office', name: 'office', memberIps: ['10.0.0.2'] }); // same ip, different server
-		const ruleset = buildRuleset([
-			server({ interfaceName: 'wg0', cidrRange: '10.0.0.0/24', tags: [officeA], governedIps: ['10.0.0.2'] }),
-			server({ interfaceName: 'wg1', cidrRange: '10.0.0.0/24', tags: [officeB], governedIps: ['10.0.0.2'] }),
-		]);
+		const ruleset = buildRuleset([server({ interfaceName: 'wg0', cidrRange: '10.0.0.0/24', tags: [officeA], governedIps: ['10.0.0.2'] }), server({ interfaceName: 'wg1', cidrRange: '10.0.0.0/24', tags: [officeB], governedIps: ['10.0.0.2'] })]);
 
 		expect(ruleset).toContain('iifname "wg0" jump fwd_s0');
 		expect(ruleset).toContain('iifname "wg1" jump fwd_s1');
@@ -323,6 +321,59 @@ describe('buildRuleset', () => {
 
 			const fwdBody = ruleset.match(/chain fwd_s0 \{([\s\S]*?)\n\t\}/)![1];
 			expect(fwdBody).not.toContain('accept');
+		});
+	});
+
+	describe('advertised subnet routes', () => {
+		it('needs no rule of its own - a cidr-dst grant already compiles to the accept', () => {
+			const office = tag({ id: 't-office', name: 'office', memberIps: ['10.20.20.3'] });
+			const toLan = grant({ src: { kind: 'tag', tagId: 't-office' }, dst: { kind: 'cidr', cidr: '192.168.1.0/24' } });
+			const ruleset = buildRuleset([server({ tags: [office], grants: [toLan], governedIps: office.memberIps, advertisedRoutes: ['192.168.1.0/24'] })]);
+
+			expect(ruleset).toContain('ip saddr @s0t0 ip daddr 192.168.1.0/24 accept');
+		});
+
+		it('changes nothing at all on an interface with no exit clients', () => {
+			// the column is invisible to the firewall except through the exit accept below
+			const withRoutes = buildRuleset([server({ tags: [tag({ id: 't-office', memberIps: ['10.20.20.3'] })], advertisedRoutes: ['192.168.1.0/24'] })]);
+			const without = buildRuleset([server({ tags: [tag({ id: 't-office', memberIps: ['10.20.20.3'] })] })]);
+
+			expect(withRoutes).toBe(without);
+		});
+
+		it('excludes an advertised LAN from the exit accept, so reaching it still needs a grant', () => {
+			// Without this, a governed exit client would reach every advertised LAN on the
+			// interface for free: that traffic leaves via the same wg interface and is neither
+			// inside cidrRange nor matched by an `internet`-dst grant. Advertising deliberately
+			// adds no permission mechanism, so the grants list has to stay the only way in.
+			const ruleset = buildRuleset([server({ cidrRange: '10.20.20.0/24', exitPeerIp: '10.20.20.2', exitClientIps: ['10.20.20.3'], advertisedRoutes: ['192.168.1.0/24'] })]);
+
+			expect(ruleset).toContain('ip saddr @s0_exitclients oifname "wg0" ip daddr != { 10.20.20.0/24, 192.168.1.0/24 } accept');
+		});
+
+		it('keeps the single-prefix form when nothing is advertised', () => {
+			const ruleset = buildRuleset([server({ cidrRange: '10.20.20.0/24', exitPeerIp: '10.20.20.2', exitClientIps: ['10.20.20.3'] })]);
+
+			expect(ruleset).toContain('ip daddr != 10.20.20.0/24 accept');
+		});
+
+		it('a grant above the exit accept still lets an exit client reach an advertised LAN', () => {
+			const office = tag({ id: 't-office', name: 'office', memberIps: ['10.20.20.3'] });
+			const toLan = grant({ src: { kind: 'tag', tagId: 't-office' }, dst: { kind: 'cidr', cidr: '192.168.1.0/24' } });
+			const ruleset = buildRuleset([server({ cidrRange: '10.20.20.0/24', tags: [office], grants: [toLan], governedIps: office.memberIps, exitPeerIp: '10.20.20.2', exitClientIps: ['10.20.20.3'], advertisedRoutes: ['192.168.1.0/24'] })]);
+
+			const grantAt = ruleset.indexOf('ip daddr 192.168.1.0/24 accept');
+			const exitAt = ruleset.indexOf('@s0_exitclients');
+
+			expect(grantAt).toBeGreaterThanOrEqual(0);
+			expect(grantAt).toBeLessThan(exitAt);
+		});
+
+		it('ignores a non-ipv4 advertised prefix rather than emitting an nft type error', () => {
+			const ruleset = buildRuleset([server({ cidrRange: '10.20.20.0/24', exitPeerIp: '10.20.20.2', exitClientIps: ['10.20.20.3'], advertisedRoutes: ['fd00::/64'] })]);
+
+			expect(ruleset).toContain('ip daddr != 10.20.20.0/24 accept');
+			expect(ruleset).not.toContain('fd00');
 		});
 	});
 });

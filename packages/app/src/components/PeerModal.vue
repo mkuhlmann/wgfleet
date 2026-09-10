@@ -65,6 +65,18 @@
 				</small>
 			</div>
 
+			<div class="rule-line"></div>
+
+			<div class="field">
+				<label for="advertisedRoutes" class="mb-1.5 text-sm text-muted block"><span class="text-accent-dim">&gt;</span> advertised subnet routes</label>
+				<BaseInput id="advertisedRoutes" v-model="form.advertisedRoutes" class="w-full" placeholder="e.g. 192.168.1.0/24, 10.10.0.0/16" />
+				<small class="text-muted text-xs">
+					networks behind this peer, reachable through it. unlike an exit node this grants nothing on its own - clients reach an advertised network only through an
+					<span class="text-text">allow &rarr; cidr</span> grant. one owner per prefix, across every interface on this host
+				</small>
+				<span v-if="errors.advertisedRoutes" class="text-down text-xs block mt-1">{{ errors.advertisedRoutes }}</span>
+			</div>
+
 			<div class="flex justify-end gap-2 mt-2">
 				<BaseButton @click="visible = false" variant="ghost" type="button">cancel</BaseButton>
 				<BaseButton type="submit" variant="primary">
@@ -80,7 +92,7 @@ import { ref, reactive, watch, computed } from 'vue';
 import { useToast } from '@app/composables/useToast';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query';
 import type { Peer, ServerPeer } from '@server/db/schema';
-import { IPV4_ADDRESS_REGEX } from '@server/lib/validation';
+import { CIDR_REGEX, IPV4_ADDRESS_REGEX, parseCidrList } from '@server/lib/validation';
 import { eden } from '@app/queries/edenClient';
 import { queryServerTags } from '@app/queries/queryPolicy';
 import { queryServerPeers } from '@app/queries/queryServers';
@@ -112,6 +124,7 @@ const form = reactive<{
 	isExitNode: boolean;
 	exitPeerId: string | null;
 	exitDns: string;
+	advertisedRoutes: string;
 }>({
 	friendlyName: '',
 	wgAddress: '',
@@ -119,6 +132,7 @@ const form = reactive<{
 	isExitNode: false,
 	exitPeerId: null,
 	exitDns: '',
+	advertisedRoutes: '',
 });
 
 // Every *other* peer on this server that is marked as an exit node - the server allows only
@@ -141,12 +155,14 @@ const toggleTag = (tagId: string) => {
 const errors = reactive({
 	wgAddress: '',
 	isExitNode: '',
+	advertisedRoutes: '',
 });
 
 const validate = () => {
 	let isValid = true;
 	errors.wgAddress = '';
 	errors.isExitNode = '';
+	errors.advertisedRoutes = '';
 
 	if (form.wgAddress) {
 		if (!IPV4_ADDRESS_REGEX.test(form.wgAddress)) {
@@ -168,6 +184,19 @@ const validate = () => {
 		isValid = false;
 	}
 
+	// Format only. Whether a prefix overlaps another peer's advertisement or the server's own
+	// range depends on every other peer, so that check stays server-side
+	// (resolveAdvertisedRoutesFor in api/serversPeers.ts) and surfaces as a toast.
+	for (const entry of parseCidrList(form.advertisedRoutes)) {
+		if (!CIDR_REGEX.test(entry)) {
+			errors.advertisedRoutes = `Invalid CIDR: ${entry}. Subnet routes are IPv4 only, e.g. 192.168.1.0/24.`;
+			isValid = false;
+		} else if (entry.endsWith('/0')) {
+			errors.advertisedRoutes = 'A default route is what an exit node advertises - use the exit node checkbox instead of 0.0.0.0/0.';
+			isValid = false;
+		}
+	}
+
 	return isValid;
 };
 
@@ -181,6 +210,7 @@ watch(
 			form.isExitNode = peer.isExitNode ?? false;
 			form.exitPeerId = peer.exitPeerId ?? null;
 			form.exitDns = peer.exitDns ?? '';
+			form.advertisedRoutes = peer.advertisedRoutes ?? '';
 			isEditMode.value = true;
 		} else {
 			isEditMode.value = false;
@@ -190,16 +220,18 @@ watch(
 			form.isExitNode = false;
 			form.exitPeerId = null;
 			form.exitDns = '';
+			form.advertisedRoutes = '';
 		}
 		errors.wgAddress = '';
 		errors.isExitNode = '';
+		errors.advertisedRoutes = '';
 	},
 	{ immediate: true }
 );
 
-// exitDns is clearable: '' from the input becomes null (clear), which `typeof form`'s
-// `string` doesn't allow.
-type PeerPayload = Omit<typeof form, 'exitDns'> & { exitDns: string | null };
+// exitDns and advertisedRoutes are clearable: '' from the input becomes null (clear), which
+// `typeof form`'s `string` doesn't allow.
+type PeerPayload = Omit<typeof form, 'exitDns' | 'advertisedRoutes'> & { exitDns: string | null; advertisedRoutes: string | null };
 
 const createPeer = useMutation({
 	mutationFn: async (data: PeerPayload) => {
@@ -244,7 +276,7 @@ const handleSubmit = () => {
 	if (!validate()) {
 		return;
 	}
-	const data = { ...form, exitDns: form.exitDns || null };
+	const data = { ...form, exitDns: form.exitDns || null, advertisedRoutes: form.advertisedRoutes || null };
 	if (data.wgAddress === '') {
 		data.wgAddress = undefined;
 	}

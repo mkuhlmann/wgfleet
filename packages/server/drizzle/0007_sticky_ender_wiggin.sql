@@ -1,0 +1,1 @@
+ALTER TABLE `peers` ADD `advertisedRoutes` text;

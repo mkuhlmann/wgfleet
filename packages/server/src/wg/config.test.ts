@@ -8,6 +8,10 @@ import { generatePeerConfig, generateServerConfig } from './config';
 // test file (see tests/setup.ts and CLAUDE.md), so unprefixed ids would collide.
 const SERVER = 'configTest-server';
 const PLAIN = 'configTest-server-plain';
+// advertisement-only, and advertisement on the same peer as the exit node - the two features
+// compose, and each one on its own has to be enough to turn `Table = off` on.
+const ADV = 'configTest-server-adv';
+const BOTH = 'configTest-server-both';
 
 const peer = async (id: string): Promise<Peer> => (await db.query.peersTable.findFirst({ where: eq(peersTable.id, id) }))!;
 
@@ -41,6 +45,30 @@ describe('wg config generation', () => {
 					wgPublicKey: 'serverPublicKey',
 					routeTableId: 52901,
 				},
+				{
+					id: ADV,
+					interfaceName: 'wgCfg2',
+					cidrRange: '10.46.46.0/24',
+					reservedIps: 10,
+					wgAddress: '10.46.46.1',
+					wgListenPort: 51946,
+					wgEndpoint: 'cfghost:51946',
+					wgPrivateKey: 'serverPrivateKey',
+					wgPublicKey: 'serverPublicKey',
+					routeTableId: 52902,
+				},
+				{
+					id: BOTH,
+					interfaceName: 'wgCfg3',
+					cidrRange: '10.47.47.0/24',
+					reservedIps: 10,
+					wgAddress: '10.47.47.1',
+					wgListenPort: 51947,
+					wgEndpoint: 'cfghost:51947',
+					wgPrivateKey: 'serverPrivateKey',
+					wgPublicKey: 'serverPublicKey',
+					routeTableId: 52903,
+				},
 			])
 			.execute();
 
@@ -50,6 +78,9 @@ describe('wg config generation', () => {
 				{ id: 'configTest-exit', serverPeerId: SERVER, wgAddress: '10.44.0.2', wgPrivateKey: 'exitPriv', wgPublicKey: 'exitPub', isExitNode: true, exitDns: '9.9.9.9' },
 				{ id: 'configTest-client', serverPeerId: SERVER, wgAddress: '10.44.0.3', wgPrivateKey: 'clientPriv', wgPublicKey: 'clientPub', exitPeerId: 'configTest-exit' },
 				{ id: 'configTest-plainPeer', serverPeerId: PLAIN, wgAddress: '10.45.45.2', wgPrivateKey: 'plainPriv', wgPublicKey: 'plainPub' },
+				{ id: 'configTest-advertiser', serverPeerId: ADV, wgAddress: '10.46.46.2', wgPrivateKey: 'advPriv', wgPublicKey: 'advPub', advertisedRoutes: '192.168.1.0/24,10.10.0.0/16' },
+				{ id: 'configTest-advPeer', serverPeerId: ADV, wgAddress: '10.46.46.3', wgPrivateKey: 'advPeerPriv', wgPublicKey: 'advPeerPub' },
+				{ id: 'configTest-both', serverPeerId: BOTH, wgAddress: '10.47.47.2', wgPrivateKey: 'bothPriv', wgPublicKey: 'bothPub', isExitNode: true, advertisedRoutes: '192.168.7.0/24' },
 			])
 			.execute();
 	});
@@ -141,6 +172,59 @@ describe('wg config generation', () => {
 			const withNat = await generatePeerConfig(await peer('configTest-exit'), { nat: true });
 
 			expect(withNat).toContain('$(ip -4 route show default');
+		});
+	});
+
+	describe('advertised subnet routes', () => {
+		const serverRow = async (id: string) => (await db.query.serverPeersTable.findFirst({ where: eq(serverPeersTable.id, id) }))!;
+
+		it("appends every advertised prefix to the advertiser's server-side AllowedIPs", async () => {
+			const config = await generateServerConfig(await serverRow(ADV));
+
+			expect(config).toContain('AllowedIPs = 10.46.46.2, 192.168.1.0/24, 10.10.0.0/16');
+			// no other peer on the interface is affected
+			expect(config).toContain('AllowedIPs = 10.46.46.3\n');
+		});
+
+		it('sets Table = off for an advertisement-only interface too', async () => {
+			// otherwise wg-quick installs these routes as well, and two systems end up managing
+			// the same ones - the reconciler in wg/exitRouting.ts could no longer tell a stale
+			// route of its own from one wg-quick put there.
+			expect(await generateServerConfig(await serverRow(ADV))).toContain('Table = off');
+		});
+
+		it('composes with the exit node on a peer that is both', async () => {
+			const config = await generateServerConfig(await serverRow(BOTH));
+
+			// the /0 already covers the LAN - the explicit entry is what makes `wg show` name
+			// the owner of that prefix
+			expect(config).toContain('AllowedIPs = 0.0.0.0/0, 10.47.47.2/32, 192.168.7.0/24');
+		});
+
+		it("leaves the advertiser's own client config unchanged - it is the gateway, not a client of it", async () => {
+			const config = await generatePeerConfig(await peer('configTest-advertiser'));
+
+			expect(config).toContain('AllowedIPs = 10.46.46.0/24');
+		});
+
+		it("scopes the advertiser's ?nat= masquerade to the vpn subnet and its lan interface", async () => {
+			// A blanket masquerade (what an exit node gets) would also rewrite the machine's own
+			// LAN traffic; and the LAN interface, like the exit node's uplink, can only be
+			// resolved on that machine.
+			const withNat = await generatePeerConfig(await peer('configTest-advertiser'), { nat: true });
+
+			expect(withNat).toContain('net.ipv4.ip_forward=1');
+			expect(withNat).toContain('PostUp = iptables -t nat -A POSTROUTING -s 10.46.46.0/24 -o $(ip -4 route show 192.168.1.0/24 | awk ');
+			expect(withNat).toContain('PostDown = iptables -t nat -D POSTROUTING -s 10.46.46.0/24 -o $(ip -4 route show 10.10.0.0/16 | awk ');
+			// not the exit node's blanket rule
+			expect(withNat).not.toContain('-o $(ip -4 route show default');
+		});
+
+		it('gives a peer that is both roles both masquerade rules', async () => {
+			const withNat = await generatePeerConfig(await peer('configTest-both'), { nat: true });
+
+			expect(withNat).toContain('-o $(ip -4 route show default | awk ');
+			expect(withNat).toContain('-s 10.47.47.0/24 -o $(ip -4 route show 192.168.7.0/24 | awk ');
 		});
 	});
 });

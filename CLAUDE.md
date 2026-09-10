@@ -76,7 +76,8 @@ route parameterized by that server's id, including all of its peers, tags and gr
 
 `src/db/schema.ts` defines six tables: `serverPeersTable` (one per WireGuard interface/server), `peersTable`
 (clients, FK'd to a server), `peerTagsTable`, `peerTagAssignmentsTable` and `policyGrantsTable` (see "Restricted
-clients" below). `peersTable` also carries the exit-node columns (`isExitNode`, `exitPeerId`, `exitDns`) and
+clients" below). `peersTable` also carries the exit-node columns (`isExitNode`, `exitPeerId`, `exitDns`,
+`advertisedRoutes`) and
 `serverPeersTable` the interface's `dns` and its allocated policy-routing table (`routeTableId`) - see "Exit
 nodes" below. **SQLite foreign-key enforcement is never turned on** (no `PRAGMA foreign_keys = ON` anywhere) -
 `onDelete` clauses in the schema are declarative intent only; cascade/cleanup on delete is done by hand in the
@@ -148,9 +149,8 @@ A peer marked `peers.isExitNode` lends its own uplink to other clients: a peer w
 `peers.exitPeerId` pointing at it gets a **second config rendering** (`?exit=true` on either
 peer-config route) whose only difference is `AllowedIPs = 0.0.0.0/0, ::/0` - same key, same
 address, same endpoint - so the client switches exit path by switching config file, with no
-server-side state change. **Read `docs/design/exit-nodes.md` before touching any of this**; it
-covers the full traffic path and the rejected alternatives. The three things most likely to
-surprise:
+server-side state change. The full traffic path and the rejected alternatives are in the
+top-of-file comment on `wg/exitRouting.ts`. The three things most likely to surprise:
 
 - **The `ip rule` is the permission, not the nft rule.** `wg/exitRouting.ts` installs
   `ip rule from <client>/32 table <server.routeTableId>` + `default dev <iface>` only for peers
@@ -165,8 +165,20 @@ surprise:
   rather than assuming `/24`.
 - **One exit node per interface**, api-enforced (`assertExitNodeInvariants` in
   `api/serversPeers.ts`) - only one peer can own `0.0.0.0/0` on a wg interface. That's a
-  wireguard constraint, not a policy choice. Advertised subnet routes (Tailscale's other half)
-  are deliberately deferred and specced at the bottom of the design doc.
+  wireguard constraint, not a policy choice.
+
+The same peer column set carries Tailscale's *other* half, **advertised subnet routes**
+(`peers.advertisedRoutes`, a comma-separated ipv4 CIDR list of LANs behind that peer). It shares the `Table = off`
+story and `wg/exitRouting.ts`, and nothing else - it is destination-routed (`ip route <cidr> dev <iface>` in the
+**main** table, tagged `proto static` so a full reconcile can drain exactly its own routes; no `ip rule`, no
+per-client state) and permissioned by an ordinary `dstKind: 'cidr'` grant rather than by a column. So it adds no
+nft rule of its own - only a *subtraction*: the exit accept's `ip daddr != <cidrRange>` grows to
+`!= { cidrRange, ...advertisedRoutes }`, or a governed exit client would reach every advertised LAN without a
+grant. Overlap is rejected in `resolveAdvertisedRoutes` (`wg/addressing.ts`, pure) and checked **host-wide**, not
+per interface: cryptokey routing gives one owner per prefix on an interface (the analogue of two exit nodes), but
+the route itself is a single main-table entry, so a prefix another interface already advertises - or another
+interface's own `cidrRange`, whose connected route would be overwritten - is just as unusable. That function also
+network-aligns each entry, since `ip route` and nft both reject a prefix with host bits set.
 
 Like `firewall.ts`, `exitRouting.ts` splits into a pure `buildExitRouting(servers)` (what
 `exitRouting.test.ts` drives) and a thin `syncExitRouting()`; it runs at the *end* of

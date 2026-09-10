@@ -79,6 +79,7 @@
 								<span v-for="name in tagNames(peer.tagIds)" :key="name" class="text-accent-dim border border-accent-dim/40 rounded-sm px-1.5 py-0.5">[{{ name }}]</span>
 								<span v-if="peer.isExitNode" class="text-accent border border-accent/40 rounded-sm px-1.5 py-0.5">exit</span>
 								<span v-if="peer.exitPeerId" class="text-muted border border-border rounded-sm px-1.5 py-0.5">via {{ exitNodeLabel(peer.exitPeerId) }}</span>
+								<span v-if="advertisedRoutes(peer).length" class="text-muted border border-border rounded-sm px-1.5 py-0.5">subnets</span>
 							</div>
 
 							<div v-if="peer.isExitNode && !isReachable(peer)" class="text-xs text-down">exit node offline - {{ exitClientCount(peer.id) }} client(s) have no internet while it stays down. there is no fallback to the hub by design</div>
@@ -89,6 +90,11 @@
 
 								<span class="whitespace-nowrap">address</span>
 								<span class="text-text text-right break-all">{{ peer.wgAddress }}</span>
+
+								<template v-if="advertisedRoutes(peer).length">
+									<span class="whitespace-nowrap">advertises</span>
+									<span class="text-text text-right break-all">{{ advertisedRoutes(peer).join(', ') }}</span>
+								</template>
 
 								<template v-if="peer.peerInfo">
 									<span class="whitespace-nowrap">handshake</span>
@@ -108,7 +114,7 @@
 								<BaseButton @click="showQrCode(peer.id)" variant="secondary" size="sm">qr</BaseButton>
 								<BaseButton @click="showConfig(peer.id)" variant="secondary" size="sm">cfg</BaseButton>
 								<BaseButton v-if="peer.exitPeerId" @click="showConfig(peer.id, { exit: true })" variant="secondary" size="sm">cfg via exit</BaseButton>
-								<BaseButton v-if="peer.isExitNode" @click="showConfig(peer.id, { nat: true })" variant="secondary" size="sm">cfg + nat</BaseButton>
+								<BaseButton v-if="peer.isExitNode || advertisedRoutes(peer).length" @click="showConfig(peer.id, { nat: true })" variant="secondary" size="sm">cfg + nat</BaseButton>
 								<BaseButton @click="editPeer(peer)" variant="secondary" size="sm">edit</BaseButton>
 								<BaseButton @click="deletePeer(peer.id)" variant="danger" size="sm">del</BaseButton>
 							</div>
@@ -139,9 +145,10 @@
 					</td>
 					<td class="px-4 py-3 text-muted text-xs">
 						<span v-if="tagNames(peer.tagIds).length" class="text-accent-dim">[{{ tagNames(peer.tagIds).join('] [') }}]</span>
-						<span v-else-if="!peer.isExitNode && !peer.exitPeerId">-</span>
+						<span v-else-if="!peer.isExitNode && !peer.exitPeerId && !advertisedRoutes(peer).length">-</span>
 						<span v-if="peer.isExitNode" class="text-accent ml-1">[exit]</span>
 						<span v-if="peer.exitPeerId" class="ml-1">via {{ exitNodeLabel(peer.exitPeerId) }}</span>
+						<span v-if="advertisedRoutes(peer).length" class="ml-1">{{ advertisedRoutes(peer).join(' ') }}</span>
 					</td>
 					<td class="px-4 py-3 text-muted text-xs">
 						<div v-if="peer.peerInfo">
@@ -155,7 +162,7 @@
 							<BaseButton @click="showQrCode(peer.id)" variant="ghost" size="sm">qr</BaseButton>
 							<BaseButton @click="showConfig(peer.id)" variant="ghost" size="sm">cfg</BaseButton>
 							<BaseButton v-if="peer.exitPeerId" @click="showConfig(peer.id, { exit: true })" variant="ghost" size="sm">cfg via exit</BaseButton>
-							<BaseButton v-if="peer.isExitNode" @click="showConfig(peer.id, { nat: true })" variant="ghost" size="sm">cfg + nat</BaseButton>
+							<BaseButton v-if="peer.isExitNode || advertisedRoutes(peer).length" @click="showConfig(peer.id, { nat: true })" variant="ghost" size="sm">cfg + nat</BaseButton>
 							<BaseButton @click="showTraffic(peer)" variant="ghost" size="sm">t</BaseButton>
 							<BaseButton @click="editPeer(peer)" variant="ghost" size="sm">edit</BaseButton>
 							<BaseButton @click="deletePeer(peer.id)" variant="ghost" size="sm" class="text-down!">del</BaseButton>
@@ -202,6 +209,7 @@ import TrafficCard from '@app/components/TrafficCard.vue';
 import { formatBytes } from '@app/lib/format';
 import { useToast } from '@app/composables/useToast';
 import type { Peer } from '@server/db/schema';
+import { parseCidrList } from '@server/lib/validation';
 
 // wgLast* are internal delta-tracking bookkeeping the api never returns (see serversPeers.ts) -
 // every peer object handled in this view/PeerModal omits them.
@@ -233,6 +241,10 @@ const exitNodeLabel = (peerId: string) => {
 	return node ? (node.friendlyName ?? node.wgAddress) : peerId;
 };
 const exitClientCount = (peerId: string) => (peers.value ?? []).filter((p) => p.exitPeerId === peerId).length;
+
+// The other half of the exit-node model (see wg/exitRouting.ts): LANs behind this peer.
+// Also decides whether ?nat= has anything to emit for it, hence the shared helper.
+const advertisedRoutes = (peer: { advertisedRoutes: string | null }) => parseCidrList(peer.advertisedRoutes);
 const isReachable = (peer: { peerInfo?: { connected: boolean } | null }) => peer.peerInfo?.connected ?? false;
 
 const queryClient = useQueryClient();

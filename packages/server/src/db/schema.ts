@@ -255,7 +255,7 @@ export const peersTable = sqliteTable(
 		// no groupId column any more - a peer's tags are the many-to-many peerTagAssignmentsTable.
 		// no tags and no grant naming this peer directly = unrestricted (today's behaviour preserved).
 
-		// --- exit nodes (see wg/exitRouting.ts and docs/design/exit-nodes.md) ---------------
+		// --- exit nodes (see wg/exitRouting.ts) ------------------------------------------
 		// This peer is its server's exit node: internet-bound traffic from peers that point
 		// their exitPeerId at it is policy-routed into its tunnel and NAT'd by its own machine.
 		// At most one per server - only one peer can own AllowedIPs 0.0.0.0/0 on a wg interface
@@ -273,6 +273,27 @@ export const peersTable = sqliteTable(
 		// back to the server's `dns` when null. Sending DNS to the local ISP is the main thing
 		// an exit node exists to prevent, so it needs to be overridable per exit node.
 		exitDns: text('exitDns'),
+
+		// --- advertised subnet routes (see wg/exitRouting.ts) ----------------------------
+		// Comma-separated ipv4 CIDR list of LANs reachable *behind* this peer, e.g.
+		// "192.168.1.0/24,10.10.0.0/16". Null/empty = advertises nothing, which is every
+		// pre-existing row.
+		//
+		// Deliberately a separate column from isExitNode rather than a generalisation of it:
+		// an exit node is *source*-routed (`ip rule from <client>` into a per-interface table)
+		// and permissioned by exitPeerId, whereas an advertised route is *destination*-routed
+		// (`ip route <cidr> dev <iface>` in the main table, no per-client state at all) and
+		// permissioned by the existing `dstKind: 'cidr'` grants. Sharing one column would
+		// couple two unrelated code paths for no gain. A peer can be both.
+		//
+		// Entries are stored network-aligned (see resolveAdvertisedRoutes in wg/addressing.ts):
+		// both `ip route` and nft reject a prefix with host bits set, so normalising on write
+		// keeps every consumer free to interpolate the stored value verbatim. Overlap with any
+		// other peer's routes - on this interface or any other - is rejected at the api layer,
+		// not here: cryptokey routing has one owner per prefix on an interface, and the route
+		// itself is one entry in the host's main table, so a second claim on an overlapping
+		// range would silently steal the first one's traffic.
+		advertisedRoutes: text('advertisedRoutes'),
 
 		// Last raw cumulative rx/tx reported by `wg show` (see wg/shell.ts's wgShow), used by
 		// wg/traffic.ts to compute a per-tick delta. wgLastSampledAt is null until the first sample -

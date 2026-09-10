@@ -50,6 +50,13 @@
       "when": 1789072914113,
       "tag": "0006_windy_ender_wiggin",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "6",
+      "when": 1789075964483,
+      "tag": "0007_sticky_ender_wiggin",
+      "breakpoints": true
     }
   ]
 }

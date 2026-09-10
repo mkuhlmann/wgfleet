@@ -2,6 +2,7 @@ import { beforeAll, describe, expect, it } from 'bun:test';
 import { db } from './index';
 import { peerTagAssignmentsTable, peerTagsTable, peersTable, policyGrantsTable, serverPeersTable } from './schema';
 import { allowedIpsForPeer, loadPolicyGraph, memberCountByTag, tagIdsByPeer, toPolicyDocument } from './policyGraph';
+import { eq } from 'drizzle-orm';
 
 describe('policyGraph', () => {
 	beforeAll(async () => {
@@ -157,6 +158,30 @@ describe('policyGraph', () => {
 			const graph = await loadPolicyGraph('policyGraph-server');
 			const devPeer = graph!.peers.find((p) => p.id === 'policyGraph-dev1')!;
 			expect(allowedIpsForPeer(graph!, devPeer)).toBe('10.90.90.0/24, 192.168.77.0/24');
+		});
+
+		it('hands a permitted client an advertised subnet route through that same cidr grant, with no new mechanism', async () => {
+			// This is the whole permission story for advertised routes: db1 advertising the LAN
+			// does not decide who reaches it, the existing dstKind cidr grant above does - so a
+			// permitted client's *normal* config gains the LAN with no extra rendering.
+			await db.update(peersTable).set({ advertisedRoutes: '192.168.77.0/24' }).where(eq(peersTable.id, 'policyGraph-db1')).execute();
+
+			const graph = await loadPolicyGraph('policyGraph-server');
+			const devPeer = graph!.peers.find((p) => p.id === 'policyGraph-dev1')!;
+
+			expect(allowedIpsForPeer(graph!, devPeer)).toContain('192.168.77.0/24');
+		});
+
+		it('leaves a LAN out of the AllowedIPs of the peer that advertises it', async () => {
+			// db1 advertises 192.168.77.0/24 (previous test) - tag it `dev` and the cidr grant
+			// applies to it too. Routing its own LAN into the tunnel would loop through the
+			// machine that *is* that LAN's gateway, so its own hint has to drop it.
+			await db.insert(peerTagAssignmentsTable).values({ peerId: 'policyGraph-db1', tagId: 'policyGraph-tag-dev' }).execute();
+
+			const graph = await loadPolicyGraph('policyGraph-server');
+			const advertiser = graph!.peers.find((p) => p.id === 'policyGraph-db1')!;
+
+			expect(allowedIpsForPeer(graph!, advertiser)).toBe('10.90.90.0/24');
 		});
 	});
 });

@@ -20,6 +20,14 @@ _Avoid_: "peer with internet access" (that's the `enableNat` + `internet`-grant 
 The per-interface policy-routing table (`serverPeers.routeTableId`, allocated from 52000-52999) holding the `default dev <iface>` route that exit clients' `ip rule`s point at. Per-interface rather than per-peer so unmarking and re-marking an exit node never churns the number under live traffic.
 _Avoid_: routing table (unqualified - the main table matters here too, and confusing the two is the `Table = off` bug)
 
+**Advertised Subnet Route**:
+A network *behind* a peer that the hub routes into that peer's tunnel (`peers.advertisedRoutes`), so permitted clients reach that LAN through it - Tailscale's `--advertise-routes`. Destination-based (`ip route <cidr> dev <iface>` in the main table, no per-client state) and permissioned by an ordinary `dstKind: 'cidr'` grant, which is what makes it a different mechanism from an exit node rather than a generalisation of one. One owner per prefix, host-wide - the route is a single main-table entry.
+_Avoid_: site-to-site (implies both ends are managed here; only the advertiser is), exit node with a prefix (the permission and the routing direction are both different)
+
+**Advertiser**:
+The peer that advertises a subnet route. Not a role the peer holds toward other peers - it forwards for the LAN, not for the vpn - so unlike an exit node nothing references it by id.
+_Avoid_: subnet router (Tailscale's term, but it suggests a distinct kind of node rather than an ordinary peer with a column set)
+
 **Config Rendering**:
-One of the several config texts `generatePeerConfig` can produce for a *single* peer row - normal, `?exit=true` (via its exit node), `?nat=true` (an exit node's own gateway config). Renderings differ only in `AllowedIPs`, `DNS` and `PostUp`; key, address and endpoint are identical, which is what lets a client switch behaviour by switching files.
+One of the several config texts `generatePeerConfig` can produce for a *single* peer row - normal, `?exit=true` (via its exit node), `?nat=true` (an exit node's or advertiser's own gateway config; the masquerade rule differs between the two). Renderings differ only in `AllowedIPs`, `DNS` and `PostUp`; key, address and endpoint are identical, which is what lets a client switch behaviour by switching files.
 _Avoid_: config variant/second config (implies a second peer identity, which this deliberately avoids)

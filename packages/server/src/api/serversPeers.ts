@@ -1,11 +1,11 @@
 import { Elysia, status, t } from 'elysia';
 import { db } from '../db';
-import { peerTagAssignmentsTable, peerTagsTable, peersTable, policyGrantsTable, type Peer } from '../db/schema';
+import { peerTagAssignmentsTable, peerTagsTable, peersTable, policyGrantsTable, type Peer, type ServerPeer } from '../db/schema';
 import { eq, and, inArray } from 'drizzle-orm';
 import { wgDerivePublicKey, wgGenKey, wgGenPsk } from '../wg/shell';
 import { converge } from '../wg/converge';
 import { wgManager } from '../wg/manager';
-import { resolvePeerAddress } from '../wg/addressing';
+import { advertisedRoutesOf, resolveAdvertisedRoutes, resolvePeerAddress } from '../wg/addressing';
 import { resolveServer } from '@server/db/servers';
 import { loadPolicyGraph, tagIdsByPeer } from '@server/db/policyGraph';
 import { auth } from './auth';
@@ -43,7 +43,7 @@ async function setPeerTags(peerId: string, tagIds: string[]) {
 }
 
 /**
- * Exit-node invariants (see wg/exitRouting.ts and docs/design/exit-nodes.md). None of these
+ * Exit-node invariants (see wg/exitRouting.ts). None of these
  * are db constraints - sqlite FK enforcement is never turned on in this codebase - so this is
  * the one place they hold. `peer` is null on create, where the two rules that need an
  * existing row (unmarking, and the grant conflict) cannot apply yet.
@@ -102,8 +102,10 @@ async function assertExitNodeInvariants(serverPeerId: string, peer: Peer | null,
 		// peer's traffic to the exit node and it never reaches the hub's own uplink, so the
 		// grant would be silently inert. Rejecting keeps the db out of a state the UI's
 		// three-way internet selector can't display. Only checkable for a grant naming the peer
-		// directly - a tag-derived internet grant depends on the whole policy graph and is left
-		// to the UI (documented in docs/design/exit-nodes.md).
+		// directly - a tag-derived internet grant depends on the whole policy graph, so adding a
+		// tag later can still produce that state. Routing wins and the grant is inert: a
+		// misleading policy row, no security consequence. The UI's three-way internet selector
+		// is what keeps it from being created in the first place.
 		if (peer) {
 			const conflicting = await db.query.policyGrantsTable.findFirst({
 				where: and(
@@ -122,6 +124,47 @@ async function assertExitNodeInvariants(serverPeerId: string, peer: Peer | null,
 	}
 
 	return null;
+}
+
+/**
+ * Validates a peer's advertised subnet routes and returns the normalised column value to store
+ * (applied by wg/exitRouting.ts). Like the exit-node invariants above this is the only place
+ * these hold - and like them the reason is that wireguard and the kernel, not this codebase,
+ * are what break: a prefix has exactly one owner both in cryptokey routing on an interface and
+ * in the host's main routing table, so a second claim on an overlapping range would silently
+ * steal the first one's traffic instead of failing visibly.
+ *
+ * That second scope is why the snapshot handed to resolveAdvertisedRoutes is host-wide rather
+ * than per-server: every *other* peer's advertisements plus every *other* interface's own
+ * `cidrRange`, whose connected route an `ip route replace` would overwrite.
+ *
+ * `undefined` in the body leaves the column alone; `null` or an empty string clears it.
+ */
+// Return type is inferred rather than annotated: elysia's `status()` returns a code-literal
+// generic, and naming it here widens it to every http status, which no longer matches the
+// route handler's response type.
+async function resolveAdvertisedRoutesFor(server: ServerPeer, peer: Peer | null, body: { advertisedRoutes?: string | null }) {
+	if (body.advertisedRoutes === undefined) return { ok: true as const, value: peer?.advertisedRoutes ?? null };
+
+	const [allServers, allPeers] = await Promise.all([db.query.serverPeersTable.findMany(), db.query.peersTable.findMany()]);
+
+	const interfaceOf = new Map(allServers.map((s) => [s.id, s.interfaceName]));
+
+	const reserved = [
+		...allServers.filter((s) => s.id !== server.id).map((s) => ({ label: `interface ${s.interfaceName}`, routes: [s.cidrRange] })),
+		...allPeers
+			.filter((p) => p.id !== peer?.id)
+			.map((p) => ({ label: p.serverPeerId === server.id ? (p.friendlyName ?? p.wgAddress) : `${p.friendlyName ?? p.wgAddress} on ${interfaceOf.get(p.serverPeerId) ?? p.serverPeerId}`, routes: advertisedRoutesOf(p) }))
+			.filter((p) => p.routes.length > 0),
+	];
+
+	const resolved = resolveAdvertisedRoutes(body.advertisedRoutes, server.cidrRange, reserved);
+	if (!resolved.ok) return { ok: false as const, error: status(400, resolved.message) };
+
+	// Stored comma-separated and network-aligned, so wg/config.ts, wg/exitRouting.ts and
+	// wg/firewall.ts can all interpolate the entries verbatim. Null rather than '' for empty,
+	// so "advertises nothing" is one value in the db instead of two.
+	return { ok: true as const, value: resolved.routes.length ? resolved.routes.join(',') : null };
 }
 
 export const serversPeersRoute = new Elysia()
@@ -187,6 +230,9 @@ export const serversPeersRoute = new Elysia()
 			const exitError = await assertExitNodeInvariants(server.id, null, body);
 			if (exitError) return exitError;
 
+			const advertised = await resolveAdvertisedRoutesFor(server, null, body);
+			if (!advertised.ok) return advertised.error;
+
 			const peer = await db
 				.insert(peersTable)
 				.values({
@@ -202,6 +248,7 @@ export const serversPeersRoute = new Elysia()
 					isExitNode: body.isExitNode ?? false,
 					exitPeerId: body.exitPeerId ?? null,
 					exitDns: body.exitDns ?? null,
+					advertisedRoutes: advertised.value,
 
 					// the column default is a literal 0 (epoch) - see schema.ts's statsSince comment
 					statsSince: new Date(),
@@ -228,6 +275,12 @@ export const serversPeersRoute = new Elysia()
 				isExitNode: t.Optional(t.Boolean()),
 				exitPeerId: t.Optional(t.Nullable(t.String())),
 				exitDns: t.Optional(t.Nullable(t.String())),
+				// comma-separated ipv4 CIDR list of LANs behind this peer, e.g.
+				// "192.168.1.0/24,10.10.0.0/16". A plain string rather than an array so the
+				// wire shape matches the column and the peer row this endpoint returns; entries
+				// are validated, network-aligned and overlap-checked in
+				// resolveAdvertisedRoutesFor. Omit to leave unchanged, null/"" to clear.
+				advertisedRoutes: t.Optional(t.Nullable(t.String())),
 			}),
 			params: t.Object({
 				id: t.String(),
@@ -279,6 +332,9 @@ export const serversPeersRoute = new Elysia()
 			const exitError = await assertExitNodeInvariants(server.id, peer, body);
 			if (exitError) return exitError;
 
+			const advertised = await resolveAdvertisedRoutesFor(server, peer, body);
+			if (!advertised.ok) return advertised.error;
+
 			const updatedPeer = await db
 				.update(peersTable)
 				.set({
@@ -288,6 +344,8 @@ export const serversPeersRoute = new Elysia()
 					// undefined = unchanged, null = explicitly clear (no exit node / no override)
 					exitPeerId: body.exitPeerId === undefined ? peer.exitPeerId : body.exitPeerId,
 					exitDns: body.exitDns === undefined ? peer.exitDns : body.exitDns,
+					// already resolved against undefined/null above
+					advertisedRoutes: advertised.value,
 				})
 				.where(and(eq(peersTable.id, params.peerId), eq(peersTable.serverPeerId, server.id)))
 				.returning();
@@ -312,6 +370,12 @@ export const serversPeersRoute = new Elysia()
 				isExitNode: t.Optional(t.Boolean()),
 				exitPeerId: t.Optional(t.Nullable(t.String())),
 				exitDns: t.Optional(t.Nullable(t.String())),
+				// comma-separated ipv4 CIDR list of LANs behind this peer, e.g.
+				// "192.168.1.0/24,10.10.0.0/16". A plain string rather than an array so the
+				// wire shape matches the column and the peer row this endpoint returns; entries
+				// are validated, network-aligned and overlap-checked in
+				// resolveAdvertisedRoutesFor. Omit to leave unchanged, null/"" to clear.
+				advertisedRoutes: t.Optional(t.Nullable(t.String())),
 			}),
 			params: t.Object({
 				id: t.String(),

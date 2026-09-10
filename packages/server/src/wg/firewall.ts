@@ -4,6 +4,7 @@ import { createLog } from '@server/lib/log';
 import { asc } from 'drizzle-orm';
 import { applyFirewall } from './shell';
 import { loadPolicyGraph, type PolicyGraph } from '@server/db/policyGraph';
+import { advertisedRoutesOf } from './addressing';
 
 const log = createLog('wg:firewall');
 
@@ -51,6 +52,14 @@ export type FirewallServer = {
 	// the exit node's own ip, or null - the accept below has to exclude traffic aimed at the
 	// tunnel itself, which is ordinary peer-to-peer traffic and governed by grants as usual
 	exitPeerIp: string | null;
+	// every subnet route advertised by a peer on this interface (`peers.advertisedRoutes`).
+	// Advertising needs no rule of its own - a `dstKind: 'cidr'` grant already compiles to
+	// `ip daddr <cidr> accept`, and replies from the LAN are `ct state established,related`.
+	// It appears here only to be *excluded* from the exit-clients accept below: an advertised
+	// LAN leaves via this same wg interface, so without the exclusion an exit client would
+	// reach every advertised LAN without a grant, quietly contradicting the rule that grants
+	// alone decide who reaches a cidr.
+	advertisedRoutes: string[];
 };
 
 // nft identifiers must start with a letter and only accept a limited charset. nanoid
@@ -68,6 +77,18 @@ const sanitizeComment = (value: string) => value.replace(/[\\"\r\n]/g, '').slice
 export const isIpv4Cidr = (value: string) => /^(?:\d{1,3}\.){3}\d{1,3}\/(?:[0-9]|[1-2][0-9]|3[0-2])$/.test(value);
 
 const quote = (value: string) => `"${value}"`;
+
+// `ip daddr != x` for one prefix, `ip daddr != { x, y }` for several - nft accepts a negated
+// anonymous set but not a single-element brace list in every version, and the bare form keeps
+// the ruleset byte-identical for an interface with no advertised routes.
+// Returns undefined when nothing is left to exclude, which can only happen if a directly
+// written cidrRange isn't ipv4 - the caller then drops the rule rather than emitting an empty
+// set literal that would fail the whole `nft -f` and leave the previous ruleset in place.
+const renderExcluded = (cidrs: string[]): string | undefined => {
+	const unique = [...new Set(cidrs.filter(isIpv4Cidr))].sort();
+	if (unique.length === 0) return undefined;
+	return unique.length === 1 ? unique[0] : `{ ${unique.join(', ')} }`;
+};
 
 /**
  * Pure ruleset builder - no db, no io. Takes an explicit, ordered list of servers
@@ -185,12 +206,13 @@ export const buildRuleset = (servers: FirewallServer[]): string => {
 		}
 		// Deliberately *after* every explicit grant: an admin's `deny` placed above still wins,
 		// so the ordered grants list keeps its authority and peers.exitPeerId only ever adds
-		// this one narrow allowance at the bottom. `ip daddr != cidrRange` keeps it to
-		// internet-bound traffic - reaching other peers on this interface stays entirely a
-		// matter of grants. Without this, a *governed* exit client would be dropped by the
-		// default-deny below and its exit node would silently do nothing.
-		if (server.exitClientIps.length && server.exitPeerIp) {
-			fwdBody.push(`\tip saddr @${exitClientsName} oifname ${quote(server.interfaceName)} ip daddr != ${server.cidrRange} accept comment ${quote('exit node')}`);
+		// this one narrow allowance at the bottom. `ip daddr !=` keeps it to internet-bound
+		// traffic - reaching other peers on this interface, or a LAN one of them advertises,
+		// stays entirely a matter of grants. Without this, a *governed* exit client would be
+		// dropped by the default-deny below and its exit node would silently do nothing.
+		const notLocal = renderExcluded([server.cidrRange, ...server.advertisedRoutes]);
+		if (server.exitClientIps.length && server.exitPeerIp && notLocal) {
+			fwdBody.push(`\tip saddr @${exitClientsName} oifname ${quote(server.interfaceName)} ip daddr != ${notLocal} accept comment ${quote('exit node')}`);
 		}
 		fwdBody.push(`\tip saddr @${governedName} drop`); // governed, nothing matched -> default deny
 		fwdBody.push(`\treturn`); // ungoverned -> unrestricted, as before
@@ -358,6 +380,7 @@ const toFirewallServer = (graph: PolicyGraph): FirewallServer => {
 		governedIps: [...governedPeerIds].map((id) => peerIp.get(id)).filter((ip): ip is string => Boolean(ip)),
 		exitClientIps: exitPeer ? graph.peers.filter((p) => p.exitPeerId === exitPeer.id && p.id !== exitPeer.id).map((p) => p.wgAddress) : [],
 		exitPeerIp: exitPeer?.wgAddress ?? null,
+		advertisedRoutes: graph.peers.flatMap(advertisedRoutesOf),
 	};
 };
 

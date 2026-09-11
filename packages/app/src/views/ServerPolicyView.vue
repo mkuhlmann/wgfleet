@@ -19,7 +19,7 @@
 
 				<div v-if="!tags || tags.length === 0" class="text-center py-8 text-muted text-sm">no tags yet - untagged peers stay fully unrestricted</div>
 
-				<div v-else class="grid gap-4 grid-cols-[repeat(auto-fill,minmax(220px,1fr))]">
+				<div v-else class="grid gap-4 grid-cols-[repeat(auto-fill,minmax(min(100%,280px),1fr))]">
 					<BaseCard v-for="tag in tags" :key="tag.id" :title="tag.friendlyName ?? tag.name" class="h-full flex flex-col">
 						<div class="flex-1 flex flex-col gap-3">
 							<div class="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 text-sm text-muted">
@@ -63,7 +63,7 @@
 
 				<div v-if="exitNodes.length === 0" class="text-center py-8 text-muted text-sm">no exit node on this server - mark a peer as one from the peers list</div>
 
-				<div v-else class="grid gap-4 grid-cols-[repeat(auto-fill,minmax(260px,1fr))]">
+				<div v-else class="grid gap-4 grid-cols-[repeat(auto-fill,minmax(min(100%,360px),1fr))]">
 					<BaseCard v-for="node in exitNodes" :key="node.id" :title="node.friendlyName ?? node.wgAddress" class="h-full flex flex-col">
 						<div class="flex flex-col gap-3">
 							<div class="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 text-sm text-muted">
@@ -102,7 +102,7 @@
 
 				<div v-if="advertisers.length === 0" class="text-center py-8 text-muted text-sm">no advertised subnet routes on this server - add one from a peer's edit dialog</div>
 
-				<div v-else class="grid gap-4 grid-cols-[repeat(auto-fill,minmax(260px,1fr))]">
+				<div v-else class="grid gap-4 grid-cols-[repeat(auto-fill,minmax(min(100%,360px),1fr))]">
 					<BaseCard v-for="peer in advertisers" :key="peer.id" :title="peer.friendlyName ?? peer.wgAddress" class="h-full flex flex-col">
 						<div class="flex flex-col gap-3">
 							<div class="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 text-sm text-muted">

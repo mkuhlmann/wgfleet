@@ -98,13 +98,13 @@
 
 								<template v-if="peer.peerInfo">
 									<span class="whitespace-nowrap">handshake</span>
-									<span class="text-text text-right break-words">{{ peer.peerInfo.wgLatestHandshake == 0 ? '-' : new Date(peer.peerInfo.wgLatestHandshake * 1000).toLocaleString() }}</span>
+									<span class="text-text text-right whitespace-nowrap">{{ peer.peerInfo.wgLatestHandshake == 0 ? '-' : new Date(peer.peerInfo.wgLatestHandshake * 1000).toLocaleString() }}</span>
 
 									<span class="whitespace-nowrap">received</span>
-									<span class="text-text text-right">{{ formatBytes(peer.peerInfo.wgTransferRx) }}</span>
+									<span class="text-text text-right whitespace-nowrap">{{ formatBytes(peer.peerInfo.wgTransferRx) }}</span>
 
 									<span class="whitespace-nowrap">transmitted</span>
-									<span class="text-text text-right">{{ formatBytes(peer.peerInfo.wgTransferTx) }}</span>
+									<span class="text-text text-right whitespace-nowrap">{{ formatBytes(peer.peerInfo.wgTransferTx) }}</span>
 								</template>
 							</div>
 						</div>

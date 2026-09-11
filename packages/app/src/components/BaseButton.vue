@@ -3,7 +3,7 @@
 		:is="as"
 		:type="as === 'button' ? 'button' : undefined"
 		:class="[
-			'inline-flex items-center justify-center gap-2 rounded-sm font-semibold tracking-wide transition-colors duration-150 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-bg',
+			'inline-flex items-center justify-center gap-2 rounded-sm font-semibold tracking-wide whitespace-nowrap transition-colors duration-150 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-bg',
 			variantClasses[variant],
 			sizeClasses[size],
 			{ 'opacity-50 cursor-not-allowed': disabled || loading },

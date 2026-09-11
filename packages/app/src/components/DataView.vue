@@ -33,7 +33,11 @@
 
 		<div v-else>
 			<!-- Grid Layout -->
-			<div v-if="currentLayout === 'grid'" class="grid gap-4 grid-cols-[repeat(auto-fill,minmax(300px,1fr))]">
+			<div
+				v-if="currentLayout === 'grid'"
+				class="grid gap-4"
+				:style="{ gridTemplateColumns: `repeat(auto-fill, minmax(min(100%, ${gridMinColWidth}), 1fr))` }"
+			>
 				<div v-for="item in filteredItems" :key="item.id">
 					<slot name="grid-item" :item="item" />
 				</div>
@@ -67,11 +71,13 @@ const props = withDefaults(
 		items: T[];
 		filterFields?: (keyof T)[];
 		defaultLayout?: 'grid' | 'table';
+		gridMinColWidth?: string;
 	}>(),
 	{
 		items: () => [],
 		filterFields: () => [],
 		defaultLayout: 'grid',
+		gridMinColWidth: '440px',
 	}
 );
 

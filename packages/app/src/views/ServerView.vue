@@ -209,7 +209,7 @@ import TrafficCard from '@app/components/TrafficCard.vue';
 import { formatBytes } from '@app/lib/format';
 import { useToast } from '@app/composables/useToast';
 import type { Peer } from '@server/db/schema';
-import { parseCidrList } from '@server/lib/validation';
+import { advertisedRoutesOf, exitTopologyOf } from '@server/lib/exitTopology';
 
 // wgLast* are internal delta-tracking bookkeeping the api never returns (see serversPeers.ts) -
 // every peer object handled in this view/PeerModal omits them.
@@ -234,8 +234,10 @@ const tagNameById = computed(() => new Map((tags.value ?? []).map((t) => [t.id, 
 const tagNames = (tagIds: string[] | undefined) => (tagIds ?? []).map((id) => tagNameById.value.get(id)).filter((name): name is string => Boolean(name));
 
 // At most one exit node per interface (a wireguard cryptokey-routing constraint - only one
-// peer can own AllowedIPs 0.0.0.0/0), enforced by the api.
-const exitNode = computed(() => (peers.value ?? []).find((p) => p.isExitNode));
+// peer can own AllowedIPs 0.0.0.0/0), enforced by the api. Derived by the same projection the
+// server config, the nft ruleset and the host's policy routing use - see lib/exitTopology.ts.
+const exitTopology = computed(() => exitTopologyOf(peers.value ?? []));
+const exitNode = computed(() => exitTopology.value.exitPeer);
 const exitNodeLabel = (peerId: string) => {
 	const node = (peers.value ?? []).find((p) => p.id === peerId);
 	return node ? (node.friendlyName ?? node.wgAddress) : peerId;
@@ -244,7 +246,7 @@ const exitClientCount = (peerId: string) => (peers.value ?? []).filter((p) => p.
 
 // The other half of the exit-node model (see wg/exitRouting.ts): LANs behind this peer.
 // Also decides whether ?nat= has anything to emit for it, hence the shared helper.
-const advertisedRoutes = (peer: { advertisedRoutes: string | null }) => parseCidrList(peer.advertisedRoutes);
+const advertisedRoutes = advertisedRoutesOf;
 const isReachable = (peer: { peerInfo?: { connected: boolean } | null }) => peer.peerInfo?.connected ?? false;
 
 const queryClient = useQueryClient();

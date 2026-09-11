@@ -5,9 +5,8 @@ import { eq, and, inArray } from 'drizzle-orm';
 import { wgDerivePublicKey, wgGenKey, wgGenPsk } from '../wg/shell';
 import { converge } from '../wg/converge';
 import { wgManager } from '../wg/manager';
-import { advertisedRoutesOf, resolveAdvertisedRoutes, resolvePeerAddress } from '../wg/addressing';
-import { resolveServer } from '@server/db/servers';
-import { loadPolicyGraph, tagIdsByPeer } from '@server/db/policyGraph';
+import { resolvePeerWrite } from '../wg/peerIntake';
+import { policyGraphOf, tagIdsByPeer } from '@server/db/policyGraph';
 import { auth } from './auth';
 import { createLog } from '@server/lib/log';
 import { generatePeerConfig } from '@server/wg/config';
@@ -22,17 +21,6 @@ export const PEER_CONFIG_QUERY = t.Object({
 	nat: t.Optional(t.BooleanString({ default: false })),
 });
 
-async function assertTagsBelongToServer(tagIds: string[] | undefined, serverPeerId: string) {
-	if (!tagIds || tagIds.length === 0) return null;
-	const tags = await db.query.peerTagsTable.findMany({
-		where: and(inArray(peerTagsTable.id, tagIds), eq(peerTagsTable.serverPeerId, serverPeerId)),
-	});
-	if (tags.length !== new Set(tagIds).size) {
-		return status(400, 'One or more tags not found on this server');
-	}
-	return null;
-}
-
 async function setPeerTags(peerId: string, tagIds: string[]) {
 	db.transaction((tx) => {
 		tx.delete(peerTagAssignmentsTable).where(eq(peerTagAssignmentsTable.peerId, peerId)).run();
@@ -42,142 +30,29 @@ async function setPeerTags(peerId: string, tagIds: string[]) {
 	});
 }
 
-/**
- * Exit-node invariants (see wg/exitRouting.ts). None of these
- * are db constraints - sqlite FK enforcement is never turned on in this codebase - so this is
- * the one place they hold. `peer` is null on create, where the two rules that need an
- * existing row (unmarking, and the grant conflict) cannot apply yet.
- */
-async function assertExitNodeInvariants(serverPeerId: string, peer: Peer | null, body: { isExitNode?: boolean; exitPeerId?: string | null }) {
-	const isExitNode = body.isExitNode ?? peer?.isExitNode ?? false;
-	const exitPeerId = body.exitPeerId === undefined ? (peer?.exitPeerId ?? null) : body.exitPeerId;
-
-	// An exit node routing its own internet traffic into itself is a loop, and its config
-	// can't express both roles anyway (it needs cidrRange AllowedIPs, not 0.0.0.0/0).
-	if (isExitNode && exitPeerId) {
-		return status(400, 'A peer cannot be an exit node and use an exit node at the same time');
-	}
-
-	if (body.isExitNode === true) {
-		// Only one peer per wg interface can own AllowedIPs 0.0.0.0/0 - a second exit node
-		// needs a second interface. This is a wireguard cryptokey-routing constraint, not a
-		// policy choice, so it's rejected rather than silently resolved.
-		const existing = await db.query.peersTable.findMany({
-			where: and(eq(peersTable.serverPeerId, serverPeerId), eq(peersTable.isExitNode, true)),
-		});
-		const other = existing.find((p) => p.id !== peer?.id);
-		if (other) {
-			return status(400, `This server already has an exit node (${other.friendlyName ?? other.wgAddress}). Only one peer per interface can be an exit node.`);
-		}
-	}
-
-	if (peer && body.isExitNode === false && peer.isExitNode) {
-		// Fail closed and loudly: silently unassigning the dependents would leave them with no
-		// internet at all, with nothing in the UI explaining why.
-		const dependents = await db.query.peersTable.findMany({ where: eq(peersTable.exitPeerId, peer.id) });
-		if (dependents.length) {
-			const names = dependents.map((p) => p.friendlyName ?? p.wgAddress).join(', ');
-			return status(400, `Still in use as an exit node by: ${names}. Reassign those peers first.`);
-		}
-	}
-
-	if (body.exitPeerId) {
-		if (peer && body.exitPeerId === peer.id) {
-			return status(400, 'A peer cannot use itself as its exit node');
-		}
-
-		const target = await db.query.peersTable.findFirst({
-			where: and(eq(peersTable.id, body.exitPeerId), eq(peersTable.serverPeerId, serverPeerId)),
-		});
-
-		if (!target) {
-			return status(400, 'Exit node not found on this server');
-		}
-
-		if (!target.isExitNode) {
-			return status(400, 'That peer is not marked as an exit node');
-		}
-
-		// Routing wins over an `internet` grant: with an exitPeerId set, the ip rule sends this
-		// peer's traffic to the exit node and it never reaches the hub's own uplink, so the
-		// grant would be silently inert. Rejecting keeps the db out of a state the UI's
-		// three-way internet selector can't display. Only checkable for a grant naming the peer
-		// directly - a tag-derived internet grant depends on the whole policy graph, so adding a
-		// tag later can still produce that state. Routing wins and the grant is inert: a
-		// misleading policy row, no security consequence. The UI's three-way internet selector
-		// is what keeps it from being created in the first place.
-		if (peer) {
-			const conflicting = await db.query.policyGrantsTable.findFirst({
-				where: and(
-					eq(policyGrantsTable.serverPeerId, serverPeerId),
-					eq(policyGrantsTable.srcKind, 'peer'),
-					eq(policyGrantsTable.srcPeerId, peer.id),
-					eq(policyGrantsTable.dstKind, 'internet'),
-					eq(policyGrantsTable.action, 'allow'),
-					eq(policyGrantsTable.enabled, true)
-				),
-			});
-			if (conflicting) {
-				return status(400, 'This peer has an "allow -> internet" grant (internet via the hub). Remove it before assigning an exit node.');
-			}
-		}
-	}
-
-	return null;
-}
-
-/**
- * Validates a peer's advertised subnet routes and returns the normalised column value to store
- * (applied by wg/exitRouting.ts). Like the exit-node invariants above this is the only place
- * these hold - and like them the reason is that wireguard and the kernel, not this codebase,
- * are what break: a prefix has exactly one owner both in cryptokey routing on an interface and
- * in the host's main routing table, so a second claim on an overlapping range would silently
- * steal the first one's traffic instead of failing visibly.
- *
- * That second scope is why the snapshot handed to resolveAdvertisedRoutes is host-wide rather
- * than per-server: every *other* peer's advertisements plus every *other* interface's own
- * `cidrRange`, whose connected route an `ip route replace` would overwrite.
- *
- * `undefined` in the body leaves the column alone; `null` or an empty string clears it.
- */
-// Return type is inferred rather than annotated: elysia's `status()` returns a code-literal
-// generic, and naming it here widens it to every http status, which no longer matches the
-// route handler's response type.
-async function resolveAdvertisedRoutesFor(server: ServerPeer, peer: Peer | null, body: { advertisedRoutes?: string | null }) {
-	if (body.advertisedRoutes === undefined) return { ok: true as const, value: peer?.advertisedRoutes ?? null };
-
-	const [allServers, allPeers] = await Promise.all([db.query.serverPeersTable.findMany(), db.query.peersTable.findMany()]);
-
-	const interfaceOf = new Map(allServers.map((s) => [s.id, s.interfaceName]));
-
-	const reserved = [
-		...allServers.filter((s) => s.id !== server.id).map((s) => ({ label: `interface ${s.interfaceName}`, routes: [s.cidrRange] })),
-		...allPeers
-			.filter((p) => p.id !== peer?.id)
-			.map((p) => ({ label: p.serverPeerId === server.id ? (p.friendlyName ?? p.wgAddress) : `${p.friendlyName ?? p.wgAddress} on ${interfaceOf.get(p.serverPeerId) ?? p.serverPeerId}`, routes: advertisedRoutesOf(p) }))
-			.filter((p) => p.routes.length > 0),
-	];
-
-	const resolved = resolveAdvertisedRoutes(body.advertisedRoutes, server.cidrRange, reserved);
-	if (!resolved.ok) return { ok: false as const, error: status(400, resolved.message) };
-
-	// Stored comma-separated and network-aligned, so wg/config.ts, wg/exitRouting.ts and
-	// wg/firewall.ts can all interpolate the entries verbatim. Null rather than '' for empty,
-	// so "advertises nothing" is one value in the db instead of two.
-	return { ok: true as const, value: resolved.routes.length ? resolved.routes.join(',') : null };
-}
+// Every column a peer write may set. One schema for both POST and PATCH - they used to carry
+// byte-identical copies, comments included. `undefined` leaves a field alone (so PATCH is a
+// genuine partial update), `null` clears the nullable ones.
+const PEER_WRITE_BODY = t.Object({
+	friendlyName: t.Optional(t.String()),
+	wgAddress: t.Optional(t.String()),
+	tagIds: t.Optional(t.Array(t.String())),
+	isExitNode: t.Optional(t.Boolean()),
+	exitPeerId: t.Optional(t.Nullable(t.String())),
+	exitDns: t.Optional(t.Nullable(t.String())),
+	// comma-separated ipv4 CIDR list of LANs behind this peer, e.g.
+	// "192.168.1.0/24,10.10.0.0/16". A plain string rather than an array so the wire shape
+	// matches the column and the peer row this endpoint returns; entries are validated,
+	// network-aligned and overlap-checked in wg/peerIntake.ts.
+	advertisedRoutes: t.Optional(t.Nullable(t.String())),
+});
 
 export const serversPeersRoute = new Elysia()
 	.use(auth)
 	.get(
 		'/wg/servers/:id/peers',
-		async ({ params }) => {
-			const graph = await loadPolicyGraph(params.id);
-
-			if (!graph) {
-				return status(404, 'Server not found');
-			}
-
+		async ({ wgServer }) => {
+			const graph = await policyGraphOf(wgServer);
 			const tagIds = tagIdsByPeer(graph);
 
 			const peersWithInfo: (Omit<Peer, 'wgLastRxBytes' | 'wgLastTxBytes' | 'wgLastSampledAt'> & {
@@ -197,66 +72,43 @@ export const serversPeersRoute = new Elysia()
 			params: t.Object({
 				id: t.String(),
 			}),
-			verifyAuth: { scope: 'server' },
+			serverScope: true,
 		}
 	)
 	.post(
 		'/wg/servers/:id/peers',
-		async ({ params, body }) => {
-			const server = await resolveServer(params.id);
-
-			if (!server) {
-				return status(404, 'Server not found');
-			}
+		async ({ wgServer: server, body }) => {
+			const resolved = await resolvePeerWrite(server, null, body);
+			if (!resolved.ok) return status(400, resolved.message);
+			const values = resolved.values;
 
 			const privateKey = await wgGenKey();
 			const publicKey = await wgDerivePublicKey(privateKey);
-
-			const existingPeers = await db.query.peersTable.findMany({
-				where: eq(peersTable.serverPeerId, server.id),
-				columns: { wgAddress: true },
-			});
-			const existingAddresses = new Set(existingPeers.map((p) => p.wgAddress));
-
-			const resolved = resolvePeerAddress(server.cidrRange, server.reservedIps, existingAddresses, { requested: body.wgAddress });
-			if (!resolved.ok) {
-				return status(400, resolved.message);
-			}
-			const ip = resolved.ip;
-
-			const tagError = await assertTagsBelongToServer(body.tagIds, server.id);
-			if (tagError) return tagError;
-
-			const exitError = await assertExitNodeInvariants(server.id, null, body);
-			if (exitError) return exitError;
-
-			const advertised = await resolveAdvertisedRoutesFor(server, null, body);
-			if (!advertised.ok) return advertised.error;
 
 			const peer = await db
 				.insert(peersTable)
 				.values({
 					serverPeerId: server.id,
-					friendlyName: body.friendlyName,
+					friendlyName: values.friendlyName,
 
 					wgPrivateKey: privateKey,
 					wgPublicKey: publicKey,
 					wgPresharedKey: await wgGenPsk(),
 
-					wgAddress: ip,
+					wgAddress: values.wgAddress,
 
-					isExitNode: body.isExitNode ?? false,
-					exitPeerId: body.exitPeerId ?? null,
-					exitDns: body.exitDns ?? null,
-					advertisedRoutes: advertised.value,
+					isExitNode: values.isExitNode,
+					exitPeerId: values.exitPeerId,
+					exitDns: values.exitDns,
+					advertisedRoutes: values.advertisedRoutes,
 
 					// the column default is a literal 0 (epoch) - see schema.ts's statsSince comment
 					statsSince: new Date(),
 				})
 				.returning();
 
-			if (body.tagIds?.length) {
-				await setPeerTags(peer[0].id, body.tagIds);
+			if (values.tagIds?.length) {
+				await setPeerTags(peer[0].id, values.tagIds);
 			}
 
 			log.info(`Created peer ${peer[0].id} on server ${server.id}`);
@@ -265,93 +117,39 @@ export const serversPeersRoute = new Elysia()
 				log.warn(`Peer ${peer[0].id} created but server ${server.id} failed to converge: ${convergeResult.reason}`);
 			}
 
-			return { ...peer[0], tagIds: body.tagIds ?? [] };
+			return { ...peer[0], tagIds: values.tagIds ?? [] };
 		},
 		{
-			body: t.Object({
-				friendlyName: t.Optional(t.String()),
-				wgAddress: t.Optional(t.String()),
-				tagIds: t.Optional(t.Array(t.String())),
-				isExitNode: t.Optional(t.Boolean()),
-				exitPeerId: t.Optional(t.Nullable(t.String())),
-				exitDns: t.Optional(t.Nullable(t.String())),
-				// comma-separated ipv4 CIDR list of LANs behind this peer, e.g.
-				// "192.168.1.0/24,10.10.0.0/16". A plain string rather than an array so the
-				// wire shape matches the column and the peer row this endpoint returns; entries
-				// are validated, network-aligned and overlap-checked in
-				// resolveAdvertisedRoutesFor. Omit to leave unchanged, null/"" to clear.
-				advertisedRoutes: t.Optional(t.Nullable(t.String())),
-			}),
+			body: PEER_WRITE_BODY,
 			params: t.Object({
 				id: t.String(),
 			}),
-			verifyAuth: { scope: 'server' },
+			serverScope: true,
 		}
 	)
 	.patch(
 		'/wg/servers/:id/peers/:peerId',
-		async ({ params, body }) => {
-			const server = await resolveServer(params.id);
-
-			if (!server) {
-				return status(404, 'Server not found');
-			}
-
-			const peer = await db.query.peersTable.findFirst({
-				where: and(eq(peersTable.id, params.peerId), eq(peersTable.serverPeerId, server.id)),
-			});
-
-			if (!peer) {
-				return status(404, 'Peer not found');
-			}
-
-			// only re-resolve an address when the request actually asks to change it - a PATCH
-			// that just renames a peer or edits its tags must not spuriously fail because the
-			// server's address range happens to be exhausted.
-			let ip = peer.wgAddress;
-			if (body.wgAddress) {
-				const existingPeers = await db.query.peersTable.findMany({
-					where: eq(peersTable.serverPeerId, server.id),
-					columns: { wgAddress: true },
-				});
-				const existingAddresses = new Set(existingPeers.map((p) => p.wgAddress).filter((address) => address !== peer.wgAddress));
-
-				const resolved = resolvePeerAddress(server.cidrRange, server.reservedIps, existingAddresses, { requested: body.wgAddress });
-				if (!resolved.ok) {
-					return status(400, resolved.message);
-				}
-				ip = resolved.ip;
-			}
-
-			// undefined = leave tags unchanged, [] = explicitly clear all tags (unrestrict)
-			if (body.tagIds !== undefined) {
-				const tagError = await assertTagsBelongToServer(body.tagIds, server.id);
-				if (tagError) return tagError;
-			}
-
-			const exitError = await assertExitNodeInvariants(server.id, peer, body);
-			if (exitError) return exitError;
-
-			const advertised = await resolveAdvertisedRoutesFor(server, peer, body);
-			if (!advertised.ok) return advertised.error;
+		async ({ wgServer: server, peer, params, body }) => {
+			const resolved = await resolvePeerWrite(server, peer, body);
+			if (!resolved.ok) return status(400, resolved.message);
+			const values = resolved.values;
 
 			const updatedPeer = await db
 				.update(peersTable)
 				.set({
-					friendlyName: body.friendlyName ?? peer.friendlyName,
-					wgAddress: body.wgAddress ?? peer.wgAddress,
-					isExitNode: body.isExitNode ?? peer.isExitNode,
-					// undefined = unchanged, null = explicitly clear (no exit node / no override)
-					exitPeerId: body.exitPeerId === undefined ? peer.exitPeerId : body.exitPeerId,
-					exitDns: body.exitDns === undefined ? peer.exitDns : body.exitDns,
-					// already resolved against undefined/null above
-					advertisedRoutes: advertised.value,
+					friendlyName: values.friendlyName,
+					wgAddress: values.wgAddress,
+					isExitNode: values.isExitNode,
+					exitPeerId: values.exitPeerId,
+					exitDns: values.exitDns,
+					advertisedRoutes: values.advertisedRoutes,
 				})
 				.where(and(eq(peersTable.id, params.peerId), eq(peersTable.serverPeerId, server.id)))
 				.returning();
 
-			if (body.tagIds !== undefined) {
-				await setPeerTags(peer.id, body.tagIds);
+			// undefined = leave tags unchanged, [] = explicitly clear all tags (unrestrict)
+			if (values.tagIds !== undefined) {
+				await setPeerTags(peer.id, values.tagIds);
 			}
 
 			log.info(`Updated peer ${peer.id} on server ${server.id}`);
@@ -363,43 +161,17 @@ export const serversPeersRoute = new Elysia()
 			return updatedPeer;
 		},
 		{
-			body: t.Object({
-				friendlyName: t.Optional(t.String()),
-				wgAddress: t.Optional(t.String()),
-				tagIds: t.Optional(t.Array(t.String())),
-				isExitNode: t.Optional(t.Boolean()),
-				exitPeerId: t.Optional(t.Nullable(t.String())),
-				exitDns: t.Optional(t.Nullable(t.String())),
-				// comma-separated ipv4 CIDR list of LANs behind this peer, e.g.
-				// "192.168.1.0/24,10.10.0.0/16". A plain string rather than an array so the
-				// wire shape matches the column and the peer row this endpoint returns; entries
-				// are validated, network-aligned and overlap-checked in
-				// resolveAdvertisedRoutesFor. Omit to leave unchanged, null/"" to clear.
-				advertisedRoutes: t.Optional(t.Nullable(t.String())),
-			}),
+			body: PEER_WRITE_BODY,
 			params: t.Object({
 				id: t.String(),
 				peerId: t.String(),
 			}),
-			verifyAuth: { scope: 'server' },
+			serverPeerScope: true,
 		}
 	)
 	.get(
 		'/wg/servers/:id/peers/:peerId/config',
-		async ({ params, query }) => {
-			const server = await resolveServer(params.id);
-			if (!server) {
-				return status(404, 'Server not found');
-			}
-
-			const peer = await db.query.peersTable.findFirst({
-				where: and(eq(peersTable.id, params.peerId), eq(peersTable.serverPeerId, server.id)),
-			});
-
-			if (!peer) {
-				return status(404, 'Peer not found');
-			}
-
+		async ({ peer, query }) => {
 			return generatePeerConfig(peer, { exit: query.exit, nat: query.nat });
 		},
 		{
@@ -408,31 +180,17 @@ export const serversPeersRoute = new Elysia()
 				peerId: t.String(),
 			}),
 			query: PEER_CONFIG_QUERY,
-			verifyAuth: { scope: 'server' },
+			serverPeerScope: true,
 		}
 	)
 	.delete(
 		'/wg/servers/:id/peers/:peerId',
-		async ({ params }) => {
-			const server = await resolveServer(params.id);
-
-			if (!server) {
-				return status(404, 'Server not found');
-			}
-
-			const peer = await db.query.peersTable.findFirst({
-				where: and(eq(peersTable.id, params.peerId), eq(peersTable.serverPeerId, server.id)),
-			});
-
-			if (!peer) {
-				return status(404, 'Peer not found');
-			}
-
+		async ({ wgServer: server, peer, params }) => {
 			// no db-level FK enforcement (sqlite foreign_keys pragma isn't turned on anywhere in
 			// this codebase), so cascade cleanup happens explicitly here - a peer-scoped grant
 			// naming this peer directly would otherwise dangle.
 			// Deleting an exit node outright is allowed (unlike merely unmarking it, which is
-			// rejected while dependents exist - see assertExitNodeInvariants): the peer is gone,
+			// rejected while dependents exist - see lib/peerInvariants.ts): the peer is gone,
 			// so there is nothing to reassign to. Its clients lose internet access rather than
 			// silently falling back to the hub's uplink, which would push their traffic out the
 			// exact interface an exit node exists to avoid. They're named in the response so the
@@ -459,6 +217,6 @@ export const serversPeersRoute = new Elysia()
 				id: t.String(),
 				peerId: t.String(),
 			}),
-			verifyAuth: { scope: 'server' },
+			serverPeerScope: true,
 		}
 	);

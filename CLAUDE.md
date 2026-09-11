@@ -54,9 +54,11 @@ The frontend never calls a generated client or a hand-maintained schema package.
   immediately**, with no build step in between.
 - The frontend also imports DB row types directly (`import type { Peer } from '@server/db/schema'`) instead of
   duplicating them.
-- There is no shared runtime validation - Elysia's `t.*` validates on the server; the app hand-rolls its own
-  matching client-side validation in each modal component (e.g. `ServerModal.vue`, `PeerModal.vue`). Keep both in
-  sync by hand when changing a field's constraints.
+- Field *shapes* are validated by Elysia's `t.*` on the server only. **Cross-row rules are shared**: the pure,
+  io-free modules under `src/lib/` (`validation.ts`, `peerInvariants.ts`, `exitTopology.ts`) are imported by both
+  the route handlers and the Vue modals, so a rule like "one exit node per interface" is stated once. Anything a
+  modal still checks by hand (e.g. `ServerModal.vue`'s field formats) has to be kept in sync by hand - prefer
+  moving a new cross-row rule into `src/lib/` over mirroring it.
 
 ### Server: Elysia plugin composition
 
@@ -66,15 +68,23 @@ static-file plugin serving `packages/app/dist` with an SPA fallback. Because `Ap
 must fully resolve every plugin's types to type-check anything that imports `App` - in practice this means the
 app's typecheck (`type-check` above) transitively validates most of the server too.
 
-**Auth** (`src/api/auth.ts`) is a single Elysia macro, `verifyAuth: { scope: 'admin' | 'server' | 'peer' }`, with
-no user table: a bearer token either equals `process.env.ADMIN_TOKEN` (god-mode) or matches the `authToken`
+**Auth** (`src/api/auth.ts`) is one `.macro({...})` call exposing four macros, with no user table.
+`verifyAuth: { scope: 'admin' | 'server' | 'peer' }` authorizes only, and is now used just for admin-scoped
+routes; `serverScope: true`, `serverPeerScope: true` and `peerScope: true` authorize **and resolve**, handing the
+row to the handler as `wgServer` / `peer` (named `wgServer` because elysia's context already carries a readonly
+`server`). A scoped route therefore starts at its own logic - no `resolveServer` + 404 preamble, and one db read
+per request instead of two. All four must stay in that single `.macro()` call, written in elysia's object form,
+or route `body`/`params` inference silently degrades to `any` across the whole `App` type - see the comment above
+the call. Authorization is decided before the 404, so a nonexistent id still 401s an unauthenticated caller.
+
+The credential model is unchanged: a bearer token either equals `process.env.ADMIN_TOKEN` (god-mode) or matches the `authToken`
 column on the row named by `params.id` for that scope (`serverPeers.authToken` or `peers.authToken` - each row
 carries its own credential, generated with `nanoid(32)`). A `server`-scoped token therefore authorizes every
 route parameterized by that server's id, including all of its peers, tags and grants.
 
 ### Persistence: Drizzle + SQLite, no shared-schema layer
 
-`src/db/schema.ts` defines six tables: `serverPeersTable` (one per WireGuard interface/server), `peersTable`
+`src/db/schema.ts` defines seven tables (`adminSessionsTable` besides these six): `serverPeersTable` (one per WireGuard interface/server), `peersTable`
 (clients, FK'd to a server), `peerTagsTable`, `peerTagAssignmentsTable` and `policyGrantsTable` (see "Restricted
 clients" below). `peersTable` also carries the exit-node columns (`isExitNode`, `exitPeerId`, `exitDns`,
 `advertisedRoutes`) and
@@ -85,6 +95,30 @@ API handler (see `DELETE /wg/servers/:id/tags/:tagId` in `src/api/policy.ts` for
 `db.transaction(...)` that unassigns members and deletes referencing grants before deleting the row itself).
 `bun:sqlite` is a synchronous driver, so `db.transaction()` callbacks are synchronous too (`.run()`, not
 `await`).
+
+### Converging: one seam, one fleet read
+
+`wg/converge.ts` is **the only sync a route handler calls**, whatever it changed:
+
+```ts
+await converge(server.id); // peers, servers, tags, grants, policy documents - all of them
+```
+
+It starts the wg interface if it isn't up and reloads it otherwise, then re-applies both host-wide artefacts (the
+nft ruleset and the host's policy routing) from a single **fleet snapshot** - `loadFleet()` in `db/fleet.ts`, one
+read of every server's `PolicyGraph`, in the stable order `buildRuleset`'s ordinal nft naming depends on.
+`syncFirewall`/`syncExitRouting` take that snapshot rather than loading their own; they used to issue the same
+N+1 query independently, twice per converge.
+
+This used to be a choice - `converge()` for peer/server config, `syncFirewall()` alone for pure policy changes -
+decided by hand at ten call sites against a rule that lived only in a comment, where picking wrong was a silent
+routing bug rather than a failing test. A policy-only mutation now also reloads the interface: that is a
+`wg syncconf` with identical content, and it puts every nft rebuild on converge's serialized chain instead of
+letting a policy handler race a concurrent converge. `convergeHost()` (no interface step) exists for exactly one
+caller, `wgManager` at boot, which has just started every interface itself.
+
+Failures are logged, not thrown: a `ConvergeResult` of `{ ok: false }` means the mutation was still applied and
+persisted. Handlers `log.warn` and return 200.
 
 ### The wg/ layer: real vs. shim, and three independent capability axes
 
@@ -128,8 +162,8 @@ real ids for new tags.
 **The client's own WireGuard config (`AllowedIPs`, in `src/wg/config.ts`) is a routing hint only, never the
 enforcement boundary** - a client owns that file and can edit it. The actual boundary is a single nftables
 `table inet wgmgr` generated by `src/wg/firewall.ts` and applied atomically (`table {}; delete table; table {...}`)
-across *all* servers at once on every relevant mutation (`syncFirewall()`, called from peer/server/tag/grant CRUD
-handlers and from `wgManager` start/stop). Read the top-of-file comments in `firewall.ts` before touching it -
+across *all* servers at once on every relevant mutation. **Route handlers never call it directly**: they call
+`converge(serverId)` (see "Converging" above), which is the single seam for "apply what I just changed". Read the top-of-file comments in `firewall.ts` before touching it -
 notable non-obvious invariants: nft object names are ordinal (`s{serverIdx}t{tagIdx}`), never derived from
 nanoid ids or `interfaceName`, because those don't satisfy nft's identifier charset; a tag can't reach its own
 members unless a grant explicitly names that tag as both `src` and `dst`; and enabling a server's `enableNat`
@@ -137,8 +171,9 @@ must not silently grant ungoverned peers internet access (there's an explicit fo
 the comment above `egressGuard` in `firewall.ts`).
 
 `src/wg/firewall.ts` splits into a pure `buildRuleset(servers: FirewallServer[])` (no db, no io - this is what
-`firewall.test.ts` drives directly with fixtures) and a thin `generateFirewallRuleset()`/`syncFirewall()` that
-load state from the db and apply it. Keep new test scenarios on the pure function - `bun:sqlite` under
+`firewall.test.ts` drives directly with fixtures) and a thin `generateFirewallRuleset(fleet)`/`syncFirewall(fleet)`
+that take the fleet snapshot (`loadFleet()` in `db/fleet.ts`) and apply it - they no longer read the db
+themselves, so the ruleset and the exit routing always derive from the same snapshot. Keep new test scenarios on the pure function - `bun:sqlite` under
 `NODE_ENV=test` is a single in-memory database shared across *all* test files in the same run, so anything
 reading "all servers" from the db in a test would pick up fixtures inserted by unrelated test files (this is why
 existing fixtures prefix ids per-file, e.g. `serversRouter-server`, `peersRouters-server`, `policyRouter-server`).
@@ -183,8 +218,8 @@ network-aligns each entry, since `ip route` and nft both reject a prefix with ho
 Like `firewall.ts`, `exitRouting.ts` splits into a pure `buildExitRouting(servers)` (what
 `exitRouting.test.ts` drives) and a thin `syncExitRouting()`; it runs at the *end* of
 `converge()` because `ip route ... dev <iface>` needs the device to exist. Anything touching
-`isExitNode`/`exitPeerId` changes the interface config too, so it must `converge()`, not just
-`syncFirewall()`.
+`isExitNode`/`exitPeerId` changes the interface config too - which `converge()` handles, since it always applies
+both the interface and the host-wide state.
 
 ### Frontend: no component library, one design system
 

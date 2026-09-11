@@ -2,7 +2,7 @@ import { db } from './index';
 import { peerTagAssignmentsTable, peerTagsTable, peersTable, policyGrantsTable, type Peer, type PeerTag, type PeerTagAssignment, type PolicyGrant, type ServerPeer } from './schema';
 import { asc, eq, inArray } from 'drizzle-orm';
 import { resolveServer } from './servers';
-import { advertisedRoutesOf } from '@server/wg/addressing';
+import { advertisedRoutesOf, exitTopologyOf } from '@server/lib/exitTopology';
 
 /**
  * One server's full policy graph: its tags, peers, peer<->tag assignments and grants
@@ -19,15 +19,17 @@ export type PolicyGraph = {
 	// assignments for this server's peers only
 	assignments: PeerTagAssignment[];
 	// every grant on this server, ordered by position ascending - enabled and disabled alike;
-	// projections that only care about active policy (e.g. wg/firewall.ts's loadFirewallState)
+	// projections that only care about active policy (e.g. wg/firewall.ts's toFirewallServer)
 	// filter themselves
 	grants: PolicyGrant[];
 };
 
-export async function loadPolicyGraph(idOrInterfaceName: string): Promise<PolicyGraph | undefined> {
-	const server = await resolveServer(idOrInterfaceName);
-	if (!server) return undefined;
-
+/**
+ * The graph for a server row the caller already holds - which, since the serverScope macro
+ * (api/auth.ts) resolves that row before the handler runs, is every route handler. Cannot
+ * fail, so callers get a `PolicyGraph` rather than a maybe.
+ */
+export async function policyGraphOf(server: ServerPeer): Promise<PolicyGraph> {
 	const [tags, peers, grants] = await Promise.all([
 		db.query.peerTagsTable.findMany({ where: eq(peerTagsTable.serverPeerId, server.id) }),
 		db.query.peersTable.findMany({ where: eq(peersTable.serverPeerId, server.id) }),
@@ -37,6 +39,14 @@ export async function loadPolicyGraph(idOrInterfaceName: string): Promise<Policy
 	const assignments = peers.length ? await db.query.peerTagAssignmentsTable.findMany({ where: inArray(peerTagAssignmentsTable.peerId, peers.map((p) => p.id)) }) : [];
 
 	return { server, tags, peers, assignments, grants };
+}
+
+/** Resolve a server by id or interfaceName first - for callers that only hold a url parameter. */
+export async function loadPolicyGraph(idOrInterfaceName: string): Promise<PolicyGraph | undefined> {
+	const server = await resolveServer(idOrInterfaceName);
+	if (!server) return undefined;
+
+	return policyGraphOf(server);
 }
 
 // --- projections -----------------------------------------------------------------------
@@ -52,6 +62,13 @@ export function tagIdsByPeer(graph: PolicyGraph): Map<string, string[]> {
 	}
 	return map;
 }
+
+/**
+ * Who the exit node is, who routes through it, and what LANs sit behind this interface's
+ * peers. The derivation itself is pure and lives in lib/exitTopology.ts so the frontend can
+ * share it; this is the projection over the graph the wg modules already hold.
+ */
+export const exitTopology = (graph: PolicyGraph) => exitTopologyOf(graph.peers);
 
 export function memberCountByTag(graph: PolicyGraph): Map<string, number> {
 	const map = new Map<string, number>();

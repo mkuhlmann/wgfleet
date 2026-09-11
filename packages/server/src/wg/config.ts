@@ -2,7 +2,7 @@ import { db } from '@server/db';
 import { peersTable, type Peer, type ServerPeer } from '@server/db/schema';
 import { eq } from 'drizzle-orm';
 import { allowedIpsForPeer, loadPolicyGraph } from '@server/db/policyGraph';
-import { advertisedRoutesOf } from './addressing';
+import { advertisedRoutesOf, exitTopologyOf } from '@server/lib/exitTopology';
 
 /**
  * The interface `Address` line's prefix. Historically this hardcoded /24 whenever wgAddress
@@ -21,22 +21,15 @@ const interfaceAddress = (server: ServerPeer): string => {
 	return `${server.wgAddress}/${prefix || '24'}`;
 };
 
-/**
- * The server's exit node, if it has one: the single peer whose traffic every exit client is
- * policy-routed into (see wg/exitRouting.ts). At most one per interface, because only one
- * peer can own `AllowedIPs = 0.0.0.0/0` on a wg interface - the api enforces that
- * (api/serversPeers.ts); this picks the first deterministically if a direct db write ever
- * broke the invariant, rather than emitting a config with two 0.0.0.0/0 peers.
- */
-const exitPeerFor = (peers: Peer[]): Peer | undefined => peers.filter((p) => p.isExitNode).sort((a, b) => a.id.localeCompare(b.id))[0];
-
 export const generateServerConfig = async (server: ServerPeer) => {
 	const peers = await db.query.peersTable.findMany({
 		where: eq(peersTable.serverPeerId, server.id),
 	});
 
-	const exitPeer = exitPeerFor(peers);
-	const advertises = peers.some((p) => advertisedRoutesOf(p).length > 0);
+	// Same derivation the nft ruleset and the host's policy routing use - see
+	// lib/exitTopology.ts for the one-exit-node-per-interface tie-break it encodes.
+	const { exitPeer, advertisedRoutes } = exitTopologyOf(peers);
+	const advertises = advertisedRoutes.length > 0;
 
 	let config = `[Interface]
 PrivateKey = ${server.wgPrivateKey}

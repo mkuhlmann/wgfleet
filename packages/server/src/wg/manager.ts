@@ -1,9 +1,8 @@
 import { db } from '@server/db';
 import { type ServerPeer } from '@server/db/schema';
 import { isInterfaceUp, resetFirewall, startServer, stopServer, wgShow } from './shell';
-import { syncFirewall } from './firewall';
-import { resetExitRouting, syncExitRouting } from './exitRouting';
-import { converge } from './converge';
+import { resetExitRouting } from './exitRouting';
+import { converge, convergeHost } from './converge';
 import { recordServerTraffic, rollupAndPrune, trafficStatsEnabled } from './traffic';
 import { createLog } from '@server/lib/log';
 
@@ -26,8 +25,8 @@ const constructWgManager = () => {
 			await startServer(server);
 		}
 
-		await syncFirewall();
-		await syncExitRouting();
+		// Interfaces are all up at this point, so only the host-wide state is left to apply.
+		await convergeHost();
 
 		loop();
 	};

@@ -1,10 +1,6 @@
-import { db } from '@server/db';
-import { serverPeersTable } from '@server/db/schema';
 import { createLog } from '@server/lib/log';
-import { asc } from 'drizzle-orm';
 import { applyFirewall } from './shell';
-import { loadPolicyGraph, type PolicyGraph } from '@server/db/policyGraph';
-import { advertisedRoutesOf } from './addressing';
+import { exitTopology, type PolicyGraph } from '@server/db/policyGraph';
 
 const log = createLog('wg:firewall');
 
@@ -37,7 +33,7 @@ export type FirewallServer = {
 	wgAddress: string;
 	enableNat: boolean;
 	tags: FirewallTag[];
-	// already in evaluation order (ascending `position`, enabled only) - see loadFirewallState
+	// already in evaluation order (ascending `position`, enabled only) - see toFirewallServer
 	grants: FirewallGrant[];
 	// ips of peers that must be default-denied once nothing in `grants` matches - see the
 	// "governed" note above. Anyone not in this set falls through to `return`, unrestricted.
@@ -250,17 +246,7 @@ export const buildRuleset = (servers: FirewallServer[]): string => {
 	// Peer-to-peer reachability (iif == oif, both managed wg interfaces) is untouched.
 	const egressGuard = allInterfaces.length && servers.some((s) => s.enableNat) ? [`\tiifname ${managedIfaceSet} oifname != ${managedIfaceSet} drop`] : [];
 
-	parts.push(
-		[
-			`chain forward {`,
-			`\ttype filter hook forward priority filter; policy accept;`,
-			`\tct state invalid drop`,
-			`\tct state established,related accept`,
-			...forwardLines,
-			...egressGuard,
-			`}`,
-		].join('\n')
-	);
+	parts.push([`chain forward {`, `\ttype filter hook forward priority filter; policy accept;`, `\tct state invalid drop`, `\tct state established,related accept`, ...forwardLines, ...egressGuard, `}`].join('\n'));
 
 	parts.push(...fwdChains);
 	parts.push(...srcChains);
@@ -366,9 +352,9 @@ const toFirewallServer = (graph: PolicyGraph): FirewallServer => {
 		firewallGrants.push({ action: grant.action, src, dst, protocol: grant.protocol, ports: grant.ports, comment: grant.comment });
 	}
 
-	// At most one exit node per server (only one peer can own AllowedIPs 0.0.0.0/0 on a wg
-	// interface) - api-enforced; pick deterministically if a direct db write broke that.
-	const exitPeer = graph.peers.filter((p) => p.isExitNode).sort((a, b) => a.id.localeCompare(b.id))[0];
+	// Same derivation the server config and the host's policy routing use - see
+	// lib/exitTopology.ts.
+	const exit = exitTopology(graph);
 
 	return {
 		interfaceName: graph.server.interfaceName,
@@ -378,35 +364,31 @@ const toFirewallServer = (graph: PolicyGraph): FirewallServer => {
 		tags: firewallTags,
 		grants: firewallGrants,
 		governedIps: [...governedPeerIds].map((id) => peerIp.get(id)).filter((ip): ip is string => Boolean(ip)),
-		exitClientIps: exitPeer ? graph.peers.filter((p) => p.exitPeerId === exitPeer.id && p.id !== exitPeer.id).map((p) => p.wgAddress) : [],
-		exitPeerIp: exitPeer?.wgAddress ?? null,
-		advertisedRoutes: graph.peers.flatMap(advertisedRoutesOf),
+		exitClientIps: exit.clientIps,
+		exitPeerIp: exit.exitPeerIp,
+		advertisedRoutes: exit.advertisedRoutes,
 	};
 };
 
-const loadFirewallState = async (): Promise<FirewallServer[]> => {
-	// buildRuleset's ordinal `s{i}`/`s{i}t{j}` naming (see its doc comment) depends on a
-	// stable server order - createdAt is a timestamp with second-ish resolution, so break
-	// ties by id to keep the order deterministic even for servers created in the same tick.
-	const servers = await db.query.serverPeersTable.findMany({ orderBy: [asc(serverPeersTable.createdAt), asc(serverPeersTable.id)] });
-
-	const graphs = await Promise.all(servers.map((s) => loadPolicyGraph(s.id)));
-
-	return graphs.filter((g): g is PolicyGraph => !!g).map(toFirewallServer);
-};
-
-export const generateFirewallRuleset = async () => buildRuleset(await loadFirewallState());
+/**
+ * The ruleset for a whole fleet snapshot (db/fleet.ts). Pure apart from the snapshot it is
+ * handed - the ordinal nft naming in buildRuleset depends on the snapshot's order, which
+ * loadFleet() is what guarantees.
+ */
+export const generateFirewallRuleset = (fleet: PolicyGraph[]) => buildRuleset(fleet.map(toFirewallServer));
 
 /**
  * Regenerates the whole ruleset (it is global across all servers) and applies it
  * atomically. A failed apply leaves the previous ruleset in place - log and move on
  * rather than tearing the table down, since a partial/failed state is worse than a
  * stale-but-consistent one.
+ *
+ * Takes the fleet snapshot rather than reading it, so that this and syncExitRouting apply the
+ * same one - see wg/converge.ts, the only caller.
  */
-export const syncFirewall = async () => {
+export const syncFirewall = async (fleet: PolicyGraph[]) => {
 	try {
-		const ruleset = await generateFirewallRuleset();
-		await applyFirewall(ruleset);
+		await applyFirewall(generateFirewallRuleset(fleet));
 	} catch (error) {
 		log.error(`Failed to sync firewall ruleset: ${error}`);
 	}

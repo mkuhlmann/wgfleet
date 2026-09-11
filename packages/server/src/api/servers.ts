@@ -5,7 +5,7 @@ import IPCIDR from 'ip-cidr';
 import { eq, and, ne } from 'drizzle-orm';
 import { wgDerivePublicKey, wgGenKey } from '../wg/shell';
 import { converge } from '../wg/converge';
-import { allocateRouteTableId, resolveServer } from '@server/db/servers';
+import { allocateRouteTableId } from '@server/db/servers';
 import { auth } from './auth';
 import { createLog } from '@server/lib/log';
 import { generateServerConfig } from '@server/wg/config';
@@ -106,29 +106,16 @@ export const serversRoutes = new Elysia()
 	)
 	.get(
 		'/wg/servers/:id',
-		async ({ params }) => {
-			const server = await resolveServer(params.id);
-
-			if (!server) {
-				return status(404, 'Server not found');
-			}
-
-			return server;
-		},
+		// `wgServer` is resolved and authorized by the serverScope macro (api/auth.ts)
+		async ({ wgServer }) => wgServer,
 		{
 			params: t.Object({ id: t.String() }),
-			verifyAuth: { scope: 'server' },
+			serverScope: true,
 		}
 	)
 	.patch(
 		'/wg/servers/:id',
-		async ({ params, body }) => {
-			const server = await resolveServer(params.id);
-
-			if (!server) {
-				return status(404, 'Server not found');
-			}
-
+		async ({ wgServer: server, body }) => {
 			if (body.wgListenPort && (await isPortInUse(body.wgListenPort, server.id))) {
 				return status(400, 'Port already in use by another server');
 			}
@@ -169,24 +156,12 @@ export const serversRoutes = new Elysia()
 			params: t.Object({
 				id: t.String(),
 			}),
-			verifyAuth: { scope: 'server' },
+			serverScope: true,
 		}
 	)
-	.get(
-		'/wg/servers/:id/config',
-		async ({ params }) => {
-			const server = await resolveServer(params.id);
-
-			if (!server) {
-				return status(404, 'Server not found');
-			}
-
-			return await generateServerConfig(server);
-		},
-		{
-			params: t.Object({
-				id: t.String(),
-			}),
-			verifyAuth: { scope: 'server' },
-		}
-	);
+	.get('/wg/servers/:id/config', async ({ wgServer }) => await generateServerConfig(wgServer), {
+		params: t.Object({
+			id: t.String(),
+		}),
+		serverScope: true,
+	});

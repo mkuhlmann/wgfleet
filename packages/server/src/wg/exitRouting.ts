@@ -1,11 +1,7 @@
-import { db } from '@server/db';
-import { serverPeersTable } from '@server/db/schema';
 import { EXIT_ROUTE_TABLE_MAX, EXIT_ROUTE_TABLE_MIN } from '@server/db/servers';
 import { createLog } from '@server/lib/log';
-import { asc } from 'drizzle-orm';
 import { applyExitRouting } from './shell';
-import { loadPolicyGraph, type PolicyGraph } from '@server/db/policyGraph';
-import { advertisedRoutesOf } from './addressing';
+import { exitTopology, type PolicyGraph } from '@server/db/policyGraph';
 
 const log = createLog('wg:exitRouting');
 
@@ -146,27 +142,20 @@ export const buildExitRouting = (servers: ExitRoutingServer[]): string[] => {
 export const buildExitRoutingTeardown = (tableIds: number[]): string[] => tableIds.filter((id) => id >= EXIT_ROUTE_TABLE_MIN && id <= EXIT_ROUTE_TABLE_MAX).flatMap((id) => [drainRules(id), flushRoutes(id)]);
 
 const toExitRoutingServer = (graph: PolicyGraph): ExitRoutingServer => {
-	const exitPeer = graph.peers.filter((p) => p.isExitNode).sort((a, b) => a.id.localeCompare(b.id))[0];
-
-	// Only clients pointing at *this* server's exit node count. exitPeerId is api-validated to
-	// name a peer on the same server, but a stale id must not silently route a client into a
-	// table whose default route belongs to a different interface.
-	const clientIps = exitPeer ? graph.peers.filter((p) => p.exitPeerId === exitPeer.id && p.id !== exitPeer.id).map((p) => p.wgAddress) : [];
+	// Same derivation the server config and the nft ruleset use - see lib/exitTopology.ts.
+	// Only clients pointing at *this* server's exit node count, which that projection already
+	// guarantees: exitPeerId is api-validated to name a peer on the same server, but a stale id
+	// must not silently route a client into a table whose default route belongs to a different
+	// interface.
+	const exit = exitTopology(graph);
 
 	return {
 		interfaceName: graph.server.interfaceName,
 		routeTableId: graph.server.routeTableId,
-		exitPeerIp: exitPeer?.wgAddress ?? null,
-		clientIps,
-		advertisedRoutes: graph.peers.flatMap(advertisedRoutesOf),
+		exitPeerIp: exit.exitPeerIp,
+		clientIps: exit.clientIps,
+		advertisedRoutes: exit.advertisedRoutes,
 	};
-};
-
-const loadExitRoutingState = async (): Promise<ExitRoutingServer[]> => {
-	const servers = await db.query.serverPeersTable.findMany({ orderBy: [asc(serverPeersTable.createdAt), asc(serverPeersTable.id)] });
-	const graphs = await Promise.all(servers.map((s) => loadPolicyGraph(s.id)));
-
-	return graphs.filter((g): g is PolicyGraph => !!g).map(toExitRoutingServer);
 };
 
 /**
@@ -193,16 +182,17 @@ const warnOnStrictReversePath = async (interfaceName: string, reason: string) =>
 	}
 };
 
-export const generateExitRouting = async () => buildExitRouting(await loadExitRoutingState());
-
 /**
  * Brings the host's policy routing in sync with the db. Never throws - a failure here leaves
  * exit clients without internet but must not fail the mutation that triggered it or take the
  * interface down with it, matching syncFirewall's contract.
+ *
+ * Takes the fleet snapshot (db/fleet.ts) rather than reading it, so that this and syncFirewall
+ * apply the same one - see wg/converge.ts, the only caller.
  */
-export const syncExitRouting = async () => {
+export const syncExitRouting = async (fleet: PolicyGraph[]) => {
 	try {
-		const servers = await loadExitRoutingState();
+		const servers = fleet.map(toExitRoutingServer);
 		await applyExitRouting(buildExitRouting(servers));
 
 		for (const server of servers) {

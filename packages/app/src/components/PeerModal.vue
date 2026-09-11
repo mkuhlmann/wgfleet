@@ -16,13 +16,7 @@
 				<label class="mb-1.5 text-sm text-muted block"><span class="text-accent-dim">&gt;</span> tags</label>
 				<div v-if="!tags || tags.length === 0" class="text-xs text-muted">no tags defined yet - add one from the server's policy page first</div>
 				<div v-else class="flex flex-wrap gap-x-4 gap-y-2">
-					<button
-						v-for="tag in tags"
-						:key="tag.id"
-						type="button"
-						class="flex items-center gap-2 text-sm text-text"
-						@click="toggleTag(tag.id)"
-					>
+					<button v-for="tag in tags" :key="tag.id" type="button" class="flex items-center gap-2 text-sm text-text" @click="toggleTag(tag.id)">
 						<span class="text-accent-dim">{{ form.tagIds.includes(tag.id) ? '[x]' : '[ ]' }}</span>
 						<span>{{ tag.friendlyName ?? tag.name }}</span>
 					</button>
@@ -93,8 +87,9 @@ import { useToast } from '@app/composables/useToast';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query';
 import type { Peer, ServerPeer } from '@server/db/schema';
 import { CIDR_REGEX, IPV4_ADDRESS_REGEX, parseCidrList } from '@server/lib/validation';
+import { checkPeerInvariants } from '@server/lib/peerInvariants';
 import { eden } from '@app/queries/edenClient';
-import { queryServerTags } from '@app/queries/queryPolicy';
+import { queryServerGrants, queryServerTags } from '@app/queries/queryPolicy';
 import { queryServerPeers } from '@app/queries/queryServers';
 import { invalidate } from '@app/queries/keys';
 import BaseButton from './BaseButton.vue';
@@ -116,6 +111,9 @@ const queryClient = useQueryClient();
 
 const { data: tags } = useQuery(queryServerTags(props.server.id));
 const { data: peers } = useQuery(queryServerPeers(props.server.id));
+// Only needed for the "already has an allow -> internet grant" invariant below - the one rule
+// in lib/peerInvariants.ts that reads something other than this server's peers.
+const { data: grants } = useQuery(queryServerGrants(props.server.id));
 
 const form = reactive<{
 	friendlyName?: string;
@@ -158,6 +156,14 @@ const errors = reactive({
 	advertisedRoutes: '',
 });
 
+// The per-server state lib/peerInvariants.ts decides against, assembled from what this form
+// already has in cache.
+const invariantSnapshot = computed(() => ({
+	peers: peers.value ?? [],
+	tagIds: (tags.value ?? []).map((t) => t.id),
+	internetGrantPeerIds: (grants.value ?? []).filter((g) => g.enabled && g.action === 'allow' && g.srcKind === 'peer' && g.dstKind === 'internet' && g.srcPeerId).map((g) => g.srcPeerId!),
+}));
+
 const validate = () => {
 	let isValid = true;
 	errors.wgAddress = '';
@@ -171,16 +177,16 @@ const validate = () => {
 		}
 	}
 
-	// Mirrors assertExitNodeInvariants in api/serversPeers.ts - there is no shared runtime
-	// validation in this codebase (see CLAUDE.md), so the two are kept in sync by hand.
-	if (form.isExitNode && exitNodes.value.length > 0) {
-		const other = exitNodes.value[0];
-		errors.isExitNode = `${other.friendlyName ?? other.wgAddress} is already this server's exit node. Only one peer per interface can be one.`;
-		isValid = false;
-	}
-
-	if (form.isExitNode && !isEditMode.value && form.exitPeerId) {
-		errors.isExitNode = 'A peer cannot be an exit node and use one at the same time.';
+	// The same function the api decides with (lib/peerInvariants.ts) - all six exit-node rules,
+	// not the two this form used to re-implement by hand. The other four used to reach the user
+	// only as a toast after a failed round trip.
+	const invariantError = checkPeerInvariants(invariantSnapshot.value, props.peer ?? null, {
+		tagIds: form.tagIds,
+		isExitNode: form.isExitNode,
+		exitPeerId: form.exitPeerId,
+	});
+	if (invariantError) {
+		errors.isExitNode = invariantError;
 		isValid = false;
 	}
 

@@ -4,9 +4,7 @@
 
 		<div class="flex flex-col gap-4" v-if="server">
 			<div class="flex items-center justify-between flex-wrap gap-3">
-				<h1 class="text-lg font-bold text-text">
-					<span class="text-accent-dim">///</span> {{ server.friendlyName ?? server.id }} <span class="text-muted">/ policy</span>
-				</h1>
+				<h1 class="text-lg font-bold text-text"><span class="text-accent-dim">///</span> {{ server.friendlyName ?? server.id }} <span class="text-muted">/ policy</span></h1>
 				<BaseButton :as="'router-link'" :to="{ name: 'servers-detail', params: { id: server.id } }" variant="ghost">&laquo; back to server</BaseButton>
 			</div>
 
@@ -147,7 +145,7 @@ import { ref, computed } from 'vue';
 import { eden } from '@app/queries/edenClient';
 import { invalidate } from '@app/queries/keys';
 import type { PeerTag } from '@server/db/schema';
-import { parseCidrList } from '@server/lib/validation';
+import { advertisedRoutesOf } from '@server/lib/exitTopology';
 import BaseButton from '@app/components/BaseButton.vue';
 import BaseCard from '@app/components/BaseCard.vue';
 import TagModal from '@app/components/TagModal.vue';
@@ -171,7 +169,7 @@ const clientsOf = (exitPeerId: string) => (peers.value ?? []).filter((p) => p.ex
 // Advertised subnet routes are the other half of the same story:
 // also a column on the peer, but destination-routed and permissioned by ordinary cidr grants
 // rather than by an assignment - hence its own section instead of a column here.
-const routesOf = (peer: { advertisedRoutes: string | null }) => parseCidrList(peer.advertisedRoutes);
+const routesOf = advertisedRoutesOf;
 const advertisers = computed(() => (peers.value ?? []).filter((p) => routesOf(p).length > 0));
 
 // A peer can advertise a prefix nothing grants access to, which looks configured and reaches

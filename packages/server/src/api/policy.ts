@@ -3,9 +3,9 @@ import { db } from '../db';
 import { peerTagAssignmentsTable, peerTagsTable, peersTable, policyGrantsTable } from '../db/schema';
 import { eq, and, ne, inArray, asc } from 'drizzle-orm';
 import { nanoid } from 'nanoid';
-import { isIpv4Cidr, syncFirewall } from '../wg/firewall';
-import { resolveServer as findServer } from '@server/db/servers';
-import { loadPolicyGraph, memberCountByTag, toPolicyDocument } from '@server/db/policyGraph';
+import { isIpv4Cidr } from '../wg/firewall';
+import { converge } from '../wg/converge';
+import { memberCountByTag, policyGraphOf, toPolicyDocument } from '@server/db/policyGraph';
 import { auth } from './auth';
 import { createLog } from '@server/lib/log';
 
@@ -19,9 +19,7 @@ const maxPortEntries = 32;
 
 async function isTagNameInUse(serverPeerId: string, name: string, excludeTagId?: string) {
 	const existing = await db.query.peerTagsTable.findFirst({
-		where: excludeTagId
-			? and(eq(peerTagsTable.serverPeerId, serverPeerId), eq(peerTagsTable.name, name), ne(peerTagsTable.id, excludeTagId))
-			: and(eq(peerTagsTable.serverPeerId, serverPeerId), eq(peerTagsTable.name, name)),
+		where: excludeTagId ? and(eq(peerTagsTable.serverPeerId, serverPeerId), eq(peerTagsTable.name, name), ne(peerTagsTable.id, excludeTagId)) : and(eq(peerTagsTable.serverPeerId, serverPeerId), eq(peerTagsTable.name, name)),
 	});
 	return !!existing;
 }
@@ -127,61 +125,42 @@ const policyDocBody = t.Object({
 	peerTags: t.Array(t.Object({ peerId: t.String(), friendlyName: t.Optional(t.String()), tags: t.Array(t.String()) })),
 });
 
-// Thin wrapper kept for a stable name at the three call sites below - the actual read and
-// projection live in db/policyGraph.ts, shared with GET /tags, serversPeers.ts's GET /peers,
-// and the firewall/config modules.
-async function buildPolicyDocument(serverPeerId: string) {
-	const graph = await loadPolicyGraph(serverPeerId);
-	// callers already checked the server exists before calling this
-	return toPolicyDocument(graph!);
-}
-
 export const policyRoutes = new Elysia()
 	.use(auth)
 	// --- tags -------------------------------------------------------------
 	.get(
 		'/wg/servers/:id/tags',
-		async ({ params }) => {
-			const graph = await loadPolicyGraph(params.id);
-			if (!graph) return status(404, 'Server not found');
+		async ({ wgServer: server, params }) => {
+			const graph = await policyGraphOf(server);
 
 			const counts = memberCountByTag(graph);
 			return graph.tags.map((tag) => ({ ...tag, memberCount: counts.get(tag.id) ?? 0 }));
 		},
-		{ params: t.Object({ id: t.String() }), verifyAuth: { scope: 'server' } }
+		{ params: t.Object({ id: t.String() }), serverScope: true }
 	)
 	.post(
 		'/wg/servers/:id/tags',
-		async ({ params, body }) => {
-			const server = await findServer(params.id);
-			if (!server) return status(404, 'Server not found');
-
+		async ({ wgServer: server, params, body }) => {
 			if (await isTagNameInUse(server.id, body.name)) {
 				return status(400, 'A tag with this name already exists on this server');
 			}
 
-			const tag = await db
-				.insert(peerTagsTable)
-				.values({ serverPeerId: server.id, name: body.name, friendlyName: body.friendlyName })
-				.returning();
+			const tag = await db.insert(peerTagsTable).values({ serverPeerId: server.id, name: body.name, friendlyName: body.friendlyName }).returning();
 
 			log.info(`Created tag ${tag[0].id} on server ${server.id}`);
-			await syncFirewall();
+			await converge(server.id);
 
 			return tag[0];
 		},
 		{
 			body: t.Object({ name: t.RegExp(nameRegex), friendlyName: t.Optional(t.String()) }),
 			params: t.Object({ id: t.String() }),
-			verifyAuth: { scope: 'server' },
+			serverScope: true,
 		}
 	)
 	.patch(
 		'/wg/servers/:id/tags/:tagId',
-		async ({ params, body }) => {
-			const server = await findServer(params.id);
-			if (!server) return status(404, 'Server not found');
-
+		async ({ wgServer: server, params, body }) => {
 			const tag = await db.query.peerTagsTable.findFirst({
 				where: and(eq(peerTagsTable.id, params.tagId), eq(peerTagsTable.serverPeerId, server.id)),
 			});
@@ -198,22 +177,19 @@ export const policyRoutes = new Elysia()
 				.returning();
 
 			log.info(`Updated tag ${tag.id} on server ${server.id}`);
-			await syncFirewall();
+			await converge(server.id);
 
 			return updated[0];
 		},
 		{
 			body: t.Object({ name: t.Optional(t.RegExp(nameRegex)), friendlyName: t.Optional(t.String()) }),
 			params: t.Object({ id: t.String(), tagId: t.String() }),
-			verifyAuth: { scope: 'server' },
+			serverScope: true,
 		}
 	)
 	.delete(
 		'/wg/servers/:id/tags/:tagId',
-		async ({ params }) => {
-			const server = await findServer(params.id);
-			if (!server) return status(404, 'Server not found');
-
+		async ({ wgServer: server, params }) => {
 			const tag = await db.query.peerTagsTable.findFirst({
 				where: and(eq(peerTagsTable.id, params.tagId), eq(peerTagsTable.serverPeerId, server.id)),
 			});
@@ -229,29 +205,23 @@ export const policyRoutes = new Elysia()
 			});
 
 			log.info(`Deleted tag ${tag.id} from server ${server.id}`);
-			await syncFirewall();
+			await converge(server.id);
 
 			return { success: true };
 		},
-		{ params: t.Object({ id: t.String(), tagId: t.String() }), verifyAuth: { scope: 'server' } }
+		{ params: t.Object({ id: t.String(), tagId: t.String() }), serverScope: true }
 	)
 	// --- grants (ordered, replace-all) ------------------------------------
 	.get(
 		'/wg/servers/:id/grants',
-		async ({ params }) => {
-			const server = await findServer(params.id);
-			if (!server) return status(404, 'Server not found');
-
+		async ({ wgServer: server, params }) => {
 			return db.query.policyGrantsTable.findMany({ where: eq(policyGrantsTable.serverPeerId, server.id), orderBy: asc(policyGrantsTable.position) });
 		},
-		{ params: t.Object({ id: t.String() }), verifyAuth: { scope: 'server' } }
+		{ params: t.Object({ id: t.String() }), serverScope: true }
 	)
 	.put(
 		'/wg/servers/:id/grants',
-		async ({ params, body }) => {
-			const server = await findServer(params.id);
-			if (!server) return status(404, 'Server not found');
-
+		async ({ wgServer: server, params, body }) => {
 			for (const g of body.grants) {
 				const error = await validateGrant(server.id, g);
 				if (error) return status(400, error);
@@ -283,33 +253,27 @@ export const policyRoutes = new Elysia()
 			});
 
 			log.info(`Replaced grants for server ${server.id}`);
-			await syncFirewall();
+			await converge(server.id);
 
 			return db.query.policyGrantsTable.findMany({ where: eq(policyGrantsTable.serverPeerId, server.id), orderBy: asc(policyGrantsTable.position) });
 		},
 		{
 			body: t.Object({ grants: t.Array(grantBody) }),
 			params: t.Object({ id: t.String() }),
-			verifyAuth: { scope: 'server' },
+			serverScope: true,
 		}
 	)
 	// --- whole-document policy (json import/export) ------------------------
 	.get(
 		'/wg/servers/:id/policy',
-		async ({ params }) => {
-			const server = await findServer(params.id);
-			if (!server) return status(404, 'Server not found');
-
-			return buildPolicyDocument(server.id);
+		async ({ wgServer: server, params }) => {
+			return toPolicyDocument(await policyGraphOf(server));
 		},
-		{ params: t.Object({ id: t.String() }), verifyAuth: { scope: 'server' } }
+		{ params: t.Object({ id: t.String() }), serverScope: true }
 	)
 	.put(
 		'/wg/servers/:id/policy',
-		async ({ params, body }) => {
-			const server = await findServer(params.id);
-			if (!server) return status(404, 'Server not found');
-
+		async ({ wgServer: server, params, body }) => {
 			const tagNames = new Set<string>();
 			for (const tag of body.tags) {
 				if (tagNames.has(tag.name)) return status(400, `Duplicate tag name in document: ${tag.name}`);
@@ -402,9 +366,9 @@ export const policyRoutes = new Elysia()
 			});
 
 			log.info(`Replaced policy document on server ${server.id}`);
-			await syncFirewall();
+			await converge(server.id);
 
-			return buildPolicyDocument(server.id);
+			return toPolicyDocument(await policyGraphOf(server));
 		},
-		{ body: policyDocBody, params: t.Object({ id: t.String() }), verifyAuth: { scope: 'server' } }
+		{ body: policyDocBody, params: t.Object({ id: t.String() }), serverScope: true }
 	);

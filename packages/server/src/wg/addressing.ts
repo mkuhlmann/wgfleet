@@ -55,14 +55,9 @@ export const normalizeCidr = (cidr: string): string => `${new IPCIDR(cidr).start
  */
 export const cidrsOverlap = (a: string, b: string): boolean => new IPCIDR(a).contains(new IPCIDR(b).start() as string) || new IPCIDR(b).contains(new IPCIDR(a).start() as string);
 
-/**
- * The subnet routes a peer advertises, decoded from its comma-separated column. The one place
- * that knows `peers.advertisedRoutes` is a list rather than a single value - config rendering,
- * hub routing, the firewall and the api all go through here instead of splitting the string
- * themselves. Entries are already validated and network-aligned on write
- * (resolveAdvertisedRoutes below), so callers can interpolate them straight into a command.
- */
-export const advertisedRoutesOf = (peer: { advertisedRoutes: string | null }): string[] => parseCidrList(peer.advertisedRoutes);
+// Defined in lib/exitTopology.ts (which has no db import, so the frontend can bundle it) and
+// re-exported here, where most of its callers already look for it.
+export { advertisedRoutesOf } from '@server/lib/exitTopology';
 
 export type ResolveAdvertisedRoutesResult = { ok: true; routes: string[] } | { ok: false; message: string };
 

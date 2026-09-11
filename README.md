@@ -21,7 +21,8 @@ identity-based access control — Tailscale, NetBird, Firezone — expect their 
 wgfleet's distinguishing feature is the **policy model in between**: peers carry tags, reachability is
 an ordered allow/deny list evaluated first-match-wins, an individual peer can override its tag's policy,
 and the whole thing compiles to one nftables ruleset applied atomically across every server you manage.
-Clients stay stock WireGuard and get no say in it.
+Clients stay stock WireGuard and get no say in it. The two Tailscale features people tend to miss most
+— exit nodes and advertised subnet routes — are here too, still without an agent.
 
 Honest pointers to the neighbours, because they may fit you better:
 
@@ -52,10 +53,17 @@ welcome.
 - **No config files to babysit.** Interfaces, keys and peers live in SQLite and are applied to the
   running system; nothing is hand-edited on disk.
 - **Client configs and QR codes**, so mobile clients can be enrolled by scanning.
+- **Exit nodes.** Any peer can lend its own internet uplink to the others — Tailscale's
+  `--advertise-exit-node`, without the client. The peer using it gets a second config file to switch
+  to; nothing changes server-side. See [Exit nodes and subnet routes](#exit-nodes-and-subnet-routes).
+- **Advertised subnet routes.** A peer can advertise a LAN behind it (`192.168.1.0/24`) so permitted
+  clients reach that network through the tunnel. Who may reach it is an ordinary CIDR grant.
 - **Traffic graphs and lifetime totals**, per server and per peer, rolled up at 1-minute (24h),
   1-hour (30d) and 1-day (400d) resolution.
 - **Per-server internet egress (NAT)**, off by default, and never implicitly granted — a peer needs an
   explicit `internet` grant even once NAT is on.
+- **DNS handed to clients** per server, with a per-exit-node override so a client on an exit node
+  resolves through that node's network instead of its local one.
 - **Scoped tokens.** Separate admin, per-server and per-peer bearer tokens.
 
 Planned: a desktop client, and possibly SSO (OpenID Connect).
@@ -119,10 +127,10 @@ Tailscale-style grants:
   first match wins.
 - A grant's **source** is a tag or an individual peer. Putting a peer-scoped grant *above* a tag-scoped
   one overrides policy for one specific client without inventing a tag for it.
-- A grant's **destination** is another tag, another peer, an arbitrary **CIDR** (a LAN behind a
-  site-to-site gateway), the **server** itself (its tunnel address — DNS, the management API), the
-  **internet**, or **any**. Grants can additionally match a protocol (`tcp`/`udp`/`icmp`) and a port
-  list or range.
+- A grant's **destination** is another tag, another peer, an arbitrary **CIDR** (typically a LAN a peer
+  advertises — see [Exit nodes and subnet routes](#exit-nodes-and-subnet-routes)), the **server**
+  itself (its tunnel address — DNS, the management API), the **internet**, or **any**. Grants can
+  additionally match a protocol (`tcp`/`udp`/`icmp`) and a port list or range.
 - A peer becomes **governed** the moment it carries a tag *or* is named as a grant's source: from then
   on its traffic is denied unless a grant allows it. A tag cannot even reach itself without a grant
   naming it as both source and destination.
@@ -135,6 +143,41 @@ wgfleet treats it as one.
 
 Manage tags and grants from the **policy** view on a server's page (which includes a JSON view of the
 whole policy document for review, export and import), or via the API.
+
+## Exit nodes and subnet routes
+
+Two ways to reach something that is not itself a peer. Both are configured on the peer that provides
+it, and both work with stock WireGuard clients.
+
+**An exit node** lends its own internet uplink to other clients. Mark a peer as the exit node — one per
+interface, because only one peer can own `AllowedIPs = 0.0.0.0/0` on a WireGuard interface — then point
+other peers at it. Each of those gets a *second* config rendering (`?exit=true` on either peer-config
+route) whose only difference is `AllowedIPs = 0.0.0.0/0, ::/0`. Same key, same address, same endpoint,
+so a client changes its exit path by switching config files and nothing changes on the server.
+
+Routing is the permission here, not a firewall rule: the hub installs a policy route only for peers
+that have been assigned an exit node, so a peer without one has no path to that uplink at all — editing
+its own `AllowedIPs` gets it nowhere.
+
+**An advertised subnet route** is the other half: a peer declaring a LAN behind it, e.g.
+`192.168.1.0/24`, so clients can reach that network through it. This one adds no new permission
+mechanism — the advertisement decides which peer owns the prefix, and an ordinary `allow → cidr` grant
+decides who may reach it. A prefix can have only one owner across the whole install, so overlapping
+advertisements are rejected rather than silently letting one peer steal another's traffic.
+
+A peer can be both. Assign exit nodes from the peer dialog; review them, and the advertised routes, on
+the server's **policy** view.
+
+Either role means that peer's own machine forwards traffic. Download its config with `?nat=true` for
+`PostUp`/`PostDown` lines that enable `ip_forward` and masquerade — onto its uplink for an exit node,
+onto the LAN for an advertiser. Those lines need `wg-quick` as root on that machine.
+
+> ⚠️ **`rp_filter` must be `0` or `2` (loose) on the host running wgfleet** for either feature. Replies
+> arrive on the WireGuard interface with a source address the host's own routing table sends elsewhere,
+> and strict reverse-path filtering (`1`) drops them — an otherwise-correct setup that simply does not
+> work. Most distributions default to loose; wgfleet logs a warning when it finds strict filtering on an
+> interface that has an exit node or an advertised route. Add
+> `--sysctl 'net.ipv4.conf.all.rp_filter=2'` to the container if yours does not.
 
 ## API
 
@@ -153,8 +196,8 @@ curl -H "Authorization: Bearer $ADMIN_TOKEN" http://localhost:3000/api/v1/wg/ser
 | `/wg/servers/:id/config`                          | `GET`                    |
 | `/wg/servers/:id/peers`                           | `GET` `POST`             |
 | `/wg/servers/:id/peers/:peerId`                   | `PATCH` `DELETE`         |
-| `/wg/servers/:id/peers/:peerId/config`            | `GET`                    |
-| `/wg/peers/:id/config`                            | `GET` (peer-scoped token)|
+| `/wg/servers/:id/peers/:peerId/config`            | `GET` (`?exit=true` for the via-exit-node rendering, `?nat=true` for the gateway one) |
+| `/wg/peers/:id/config`                            | `GET` (peer-scoped token, same query parameters) |
 | `/wg/servers/:id/tags`                            | `GET` `POST`             |
 | `/wg/servers/:id/tags/:tagId`                     | `PATCH` `DELETE`         |
 | `/wg/servers/:id/grants`                          | `GET` `PUT` (replaces all) |

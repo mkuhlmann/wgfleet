@@ -213,8 +213,10 @@ describe('advertised subnet routes', () => {
 			const response = await app.handle(new Request(`http://localhost/wg/servers/${SERVER}/peers/subnetRoutes-router/config?nat=true`, { headers: auth }));
 			const text = await response.text();
 
-			expect(text).toContain('-s 10.68.0.0/24 -o $(ip -4 route show 172.28.1.0/24');
-			expect(text).not.toContain('-o $(ip -4 route show default');
+			expect(text).toContain(
+				'-s 10.68.0.0/24 -o $(r=$(ip -4 route show 172.28.1.0/24); [[ $r =~ dev[[:space:]]+([^[:space:]]+) ]] && echo ${BASH_REMATCH[1]})',
+			);
+			expect(text).not.toContain('ip -4 route show default');
 		});
 	});
 });

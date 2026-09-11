@@ -171,7 +171,7 @@ describe('wg config generation', () => {
 			// exit node that looks configured and silently NATs nothing.
 			const withNat = await generatePeerConfig(await peer('configTest-exit'), { nat: true });
 
-			expect(withNat).toContain('$(ip -4 route show default');
+			expect(withNat).toContain('$(r=$(ip -4 route show default); [[ $r =~ dev[[:space:]]+([^[:space:]]+) ]] && echo ${BASH_REMATCH[1]})');
 		});
 	});
 
@@ -214,17 +214,25 @@ describe('wg config generation', () => {
 			const withNat = await generatePeerConfig(await peer('configTest-advertiser'), { nat: true });
 
 			expect(withNat).toContain('net.ipv4.ip_forward=1');
-			expect(withNat).toContain('PostUp = iptables -t nat -A POSTROUTING -s 10.46.46.0/24 -o $(ip -4 route show 192.168.1.0/24 | awk ');
-			expect(withNat).toContain('PostDown = iptables -t nat -D POSTROUTING -s 10.46.46.0/24 -o $(ip -4 route show 10.10.0.0/16 | awk ');
+			expect(withNat).toContain(
+				'PostUp = iptables -t nat -A POSTROUTING -s 10.46.46.0/24 -o $(r=$(ip -4 route show 192.168.1.0/24); [[ $r =~ dev[[:space:]]+([^[:space:]]+) ]] && echo ${BASH_REMATCH[1]}) -j MASQUERADE',
+			);
+			expect(withNat).toContain(
+				'PostDown = iptables -t nat -D POSTROUTING -s 10.46.46.0/24 -o $(r=$(ip -4 route show 10.10.0.0/16); [[ $r =~ dev[[:space:]]+([^[:space:]]+) ]] && echo ${BASH_REMATCH[1]}) -j MASQUERADE',
+			);
 			// not the exit node's blanket rule
-			expect(withNat).not.toContain('-o $(ip -4 route show default');
+			expect(withNat).not.toContain('-o $(r=$(ip -4 route show default');
 		});
 
 		it('gives a peer that is both roles both masquerade rules', async () => {
 			const withNat = await generatePeerConfig(await peer('configTest-both'), { nat: true });
 
-			expect(withNat).toContain('-o $(ip -4 route show default | awk ');
-			expect(withNat).toContain('-s 10.47.47.0/24 -o $(ip -4 route show 192.168.7.0/24 | awk ');
+			expect(withNat).toContain(
+				'-o $(r=$(ip -4 route show default); [[ $r =~ dev[[:space:]]+([^[:space:]]+) ]] && echo ${BASH_REMATCH[1]}) -j MASQUERADE',
+			);
+			expect(withNat).toContain(
+				'-s 10.47.47.0/24 -o $(r=$(ip -4 route show 192.168.7.0/24); [[ $r =~ dev[[:space:]]+([^[:space:]]+) ]] && echo ${BASH_REMATCH[1]}) -j MASQUERADE',
+			);
 		});
 	});
 });

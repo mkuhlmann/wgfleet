@@ -100,12 +100,19 @@ export type PeerConfigOptions = {
 // Resolved on the gateway machine at bring-up rather than guessed here - the manager has no way
 // to know that machine's interface names, and a wrong guess produces an exit node/advertiser
 // that looks configured and silently NATs nothing.
-const UPLINK = `$(ip -4 route show default | awk '{print $5; exit}')`;
+//
+// Resolved using pure bash regex matching rather than external tools like awk: wg-quick runs under
+// an AppArmor profile on modern Linux (e.g. Ubuntu 24.04+) that whitelists ip and iptables but
+// blocks /usr/bin/awk with "Permission denied".
+const interfaceForRoute = (route: string) =>
+	`$(r=$(ip -4 route show ${route}); [[ $r =~ dev[[:space:]]+([^[:space:]]+) ]] && echo \${BASH_REMATCH[1]})`;
+
+const UPLINK = interfaceForRoute('default');
 
 // The interface the advertised LAN is reachable on, scanned out of that machine's own route
-// table. Not $5 like UPLINK above: a connected route prints `<cidr> dev <iface> proto kernel
-// scope link src <ip>`, so `dev` is at a different offset than in a default route.
-const lanInterface = (cidr: string) => `$(ip -4 route show ${cidr} | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit }}')`;
+// table. dev[[:space:]]+ captures the device name whether the route has a `via <gw>` or is a
+// direct/connected route.
+const lanInterface = (cidr: string) => interfaceForRoute(cidr);
 
 /**
  * The gateway PostUp/PostDown block for a peer that forwards for others. Two different

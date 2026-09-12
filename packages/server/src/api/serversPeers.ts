@@ -3,13 +3,15 @@ import { db } from '../db';
 import { peerTagAssignmentsTable, peerTagsTable, peersTable, policyGrantsTable, type Peer, type ServerPeer } from '../db/schema';
 import { eq, and, inArray } from 'drizzle-orm';
 import { wgDerivePublicKey, wgGenKey, wgGenPsk } from '../wg/shell';
-import { converge } from '../wg/converge';
+import { converge, tearDownExitLink } from '../wg/converge';
 import { wgManager } from '../wg/manager';
 import { resolvePeerWrite } from '../wg/peerIntake';
 import { policyGraphOf, tagIdsByPeer } from '@server/db/policyGraph';
 import { auth } from './auth';
 import { createLog } from '@server/lib/log';
 import { generatePeerConfig } from '@server/wg/config';
+import { exitLinkOf } from '@server/lib/exitTopology';
+import { WG_LISTEN_PORT_MAX, WG_LISTEN_PORT_MIN } from '@server/lib/validation';
 
 const log = createLog('http');
 
@@ -45,6 +47,10 @@ const PEER_WRITE_BODY = t.Object({
 	// matches the column and the peer row this endpoint returns; entries are validated,
 	// network-aligned and overlap-checked in wg/peerIntake.ts.
 	advertisedRoutes: t.Optional(t.Nullable(t.String())),
+	// udp port for this exit node's own interface on the hub (see wg/exitLinks.ts). Only
+	// meaningful together with isExitNode; null hands the choice back to the allocator. The
+	// operator has to publish whatever ends up here, which is why it is settable at all.
+	exitListenPort: t.Optional(t.Nullable(t.Integer({ minimum: WG_LISTEN_PORT_MIN, maximum: WG_LISTEN_PORT_MAX }))),
 });
 
 export const serversPeersRoute = new Elysia()
@@ -73,7 +79,7 @@ export const serversPeersRoute = new Elysia()
 				id: t.String(),
 			}),
 			serverScope: true,
-		}
+		},
 	)
 	.post(
 		'/wg/servers/:id/peers',
@@ -101,6 +107,7 @@ export const serversPeersRoute = new Elysia()
 					exitPeerId: values.exitPeerId,
 					exitDns: values.exitDns,
 					advertisedRoutes: values.advertisedRoutes,
+					exitListenPort: values.exitListenPort,
 
 					// the column default is a literal 0 (epoch) - see schema.ts's statsSince comment
 					statsSince: new Date(),
@@ -125,7 +132,7 @@ export const serversPeersRoute = new Elysia()
 				id: t.String(),
 			}),
 			serverScope: true,
-		}
+		},
 	)
 	.patch(
 		'/wg/servers/:id/peers/:peerId',
@@ -143,6 +150,7 @@ export const serversPeersRoute = new Elysia()
 					exitPeerId: values.exitPeerId,
 					exitDns: values.exitDns,
 					advertisedRoutes: values.advertisedRoutes,
+					exitListenPort: values.exitListenPort,
 				})
 				.where(and(eq(peersTable.id, params.peerId), eq(peersTable.serverPeerId, server.id)))
 				.returning();
@@ -167,7 +175,7 @@ export const serversPeersRoute = new Elysia()
 				peerId: t.String(),
 			}),
 			serverPeerScope: true,
-		}
+		},
 	)
 	.get(
 		'/wg/servers/:id/peers/:peerId/config',
@@ -181,7 +189,7 @@ export const serversPeersRoute = new Elysia()
 			}),
 			query: PEER_CONFIG_QUERY,
 			serverPeerScope: true,
-		}
+		},
 	)
 	.delete(
 		'/wg/servers/:id/peers/:peerId',
@@ -196,6 +204,13 @@ export const serversPeersRoute = new Elysia()
 			// exact interface an exit node exists to avoid. They're named in the response so the
 			// ui can say so.
 			const dependents = peer.isExitNode ? await db.query.peersTable.findMany({ where: eq(peersTable.exitPeerId, peer.id) }) : [];
+
+			// Its interface has to come down *here*: converge reconciles exit links from the peer
+			// rows, and this row is about to stop existing, so nothing downstream could infer that
+			// wgxN belongs to nobody. (converge's orphan sweep would catch it on a later pass, but
+			// only after leaving a live interface owning 0.0.0.0/0 in the meantime.)
+			const link = exitLinkOf(peer);
+			if (link) await tearDownExitLink(link);
 
 			db.transaction((tx) => {
 				tx.delete(peerTagAssignmentsTable).where(eq(peerTagAssignmentsTable.peerId, peer.id)).run();
@@ -218,5 +233,5 @@ export const serversPeersRoute = new Elysia()
 				peerId: t.String(),
 			}),
 			serverPeerScope: true,
-		}
+		},
 	);

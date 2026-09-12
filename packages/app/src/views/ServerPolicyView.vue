@@ -57,31 +57,52 @@
 			<div class="flex flex-col gap-4">
 				<h2 class="text-base font-bold text-text"><span class="text-accent-dim">///</span> exit nodes</h2>
 				<p class="text-xs text-muted">
-					an exit node routes another client's internet traffic through its own uplink. this is not a grant - it lives on the peer, because it decides
-					<span class="text-text">routing</span>, not permission. a client with no exit node has no route to one at all, so it cannot use one by editing its own config. only one exit node per interface.
+					an exit node routes another client's internet traffic through its own uplink - the only way out to the internet here, since the hub does not masquerade. this is not a grant: it lives on the peer, because it decides
+					<span class="text-text">routing</span>, not permission. a client with no exit node has no route to one at all, so it cannot use one by editing its own config.
+				</p>
+				<p class="text-xs text-muted">
+					<span class="text-text">as many exit nodes as you like</span>, and every client picks its own. each one gets a wg interface of its own on this host, listening on its own udp port - wireguard picks the peer to send a packet to by destination
+					address alone, so only one peer per interface can own <span class="text-text">0.0.0.0/0</span>, and an interface each is what removes the collision instead of rationing it.
+				</p>
+				<p class="text-xs text-down">
+					each exit node's udp port below must be reachable from that machine - publish it on the container and open it in the host firewall. and marking a peer here does not change that machine's own config: install it from the peer list (<span
+						class="text-text"
+						>cfg + nat</span
+					>) and restart its tunnel, or that exit node's clients time out while everything on this page still looks correct.
 				</p>
 
-				<div v-if="exitNodes.length === 0" class="text-center py-8 text-muted text-sm">no exit node on this server - mark a peer as one from the peers list</div>
+				<div v-if="exitNodes.length === 0" class="text-center py-8 text-muted text-sm">no exit node on this server - mark a peer as one from the peers list. until then no client here can reach the internet through the tunnel</div>
 
 				<div v-else class="grid gap-4 grid-cols-[repeat(auto-fill,minmax(min(100%,360px),1fr))]">
-					<BaseCard v-for="node in exitNodes" :key="node.id" :title="node.friendlyName ?? node.wgAddress" class="h-full flex flex-col">
+					<BaseCard v-for="node in exitNodes" :key="node.peer.id" :title="node.peer.friendlyName ?? node.peer.wgAddress" class="h-full flex flex-col">
 						<div class="flex flex-col gap-3">
 							<div class="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 text-sm text-muted">
 								<span class="whitespace-nowrap">address</span>
-								<span class="text-text text-right break-all">{{ node.wgAddress }}</span>
+								<span class="text-text text-right break-all">{{ node.ip }}</span>
 
-								<span class="whitespace-nowrap">exit dns</span>
-								<span class="text-text text-right break-all">{{ node.exitDns ?? server.dns ?? '-' }}</span>
+								<span class="whitespace-nowrap">udp port</span>
+								<span class="text-right break-all" :class="node.link ? 'text-accent' : 'text-down'">{{ node.link ? node.link.listenPort : 'not provisioned' }}</span>
+
+								<span class="whitespace-nowrap">interface</span>
+								<span class="text-text text-right break-all">{{ node.link?.interfaceName ?? '-' }}</span>
 
 								<span class="whitespace-nowrap">route table</span>
-								<span class="text-text text-right">{{ server.routeTableId }}</span>
+								<span class="text-text text-right">{{ node.link?.routeTableId ?? '-' }}</span>
+
+								<span class="whitespace-nowrap">exit dns</span>
+								<span class="text-text text-right break-all">{{ node.peer.exitDns ?? server.dns ?? '-' }}</span>
 							</div>
+
+							<div v-if="node.link" class="text-xs text-muted">
+								publish <span class="text-text">{{ node.link.listenPort }}/udp</span> to this container, or this exit node can never connect
+							</div>
+							<div v-else class="text-xs text-down">no interface allocated yet - check the server log</div>
 
 							<div>
 								<div class="text-sm text-muted mb-1.5">clients</div>
-								<div v-if="clientsOf(node.id).length === 0" class="text-xs text-muted">none assigned yet</div>
+								<div v-if="node.clients.length === 0" class="text-xs text-muted">none assigned yet</div>
 								<div v-else class="flex flex-wrap gap-x-3 gap-y-1 text-xs">
-									<span v-for="client in clientsOf(node.id)" :key="client.id" class="text-accent-dim">
+									<span v-for="client in node.clients" :key="client.id" class="text-accent-dim">
 										{{ client.friendlyName ?? client.wgAddress }}
 									</span>
 								</div>
@@ -145,7 +166,7 @@ import { ref, computed } from 'vue';
 import { eden } from '@app/queries/edenClient';
 import { invalidate } from '@app/queries/keys';
 import type { PeerTag } from '@server/db/schema';
-import { advertisedRoutesOf } from '@server/lib/exitTopology';
+import { advertisedRoutesOf, exitTopologyOf } from '@server/lib/exitTopology';
 import BaseButton from '@app/components/BaseButton.vue';
 import BaseCard from '@app/components/BaseCard.vue';
 import TagModal from '@app/components/TagModal.vue';
@@ -161,10 +182,10 @@ const { data: peers } = useQuery(queryServerPeers(route.params.id as string));
 // same query key GrantsTable below uses, so this is the cached read, not a second request
 const { data: grants } = useQuery(queryServerGrants(route.params.id as string));
 
-// Exit assignment isn't a grant (it's peers.exitPeerId, see wg/exitRouting.ts), so
+// Same projection the configs, the ruleset and the host's routing use - see
+// lib/exitTopology.ts. Exit assignment isn't a grant (it's peers.exitPeerId), so
 // it gets its own panel rather than a row in GrantsTable.
-const exitNodes = computed(() => (peers.value ?? []).filter((p) => p.isExitNode));
-const clientsOf = (exitPeerId: string) => (peers.value ?? []).filter((p) => p.exitPeerId === exitPeerId);
+const exitNodes = computed(() => exitTopologyOf(peers.value ?? []).exitNodes);
 
 // Advertised subnet routes are the other half of the same story:
 // also a column on the peer, but destination-routed and permissioned by ordinary cidr grants

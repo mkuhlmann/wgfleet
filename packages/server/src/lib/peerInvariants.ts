@@ -28,13 +28,6 @@ export type PeerInvariantSnapshot = {
 	peers: InvariantPeer[];
 	/** tag ids defined on this server */
 	tagIds: string[];
-	/**
-	 * ids of peers carrying an enabled `allow -> internet` grant that names them directly.
-	 * Only a directly-named grant is checkable: a tag-derived one depends on the whole policy
-	 * graph, so adding a tag later can still produce that state. Routing wins and the grant is
-	 * inert - a misleading policy row, no security consequence.
-	 */
-	internetGrantPeerIds: string[];
 };
 
 /** The subset of a peer write these rules care about. `undefined` means "leave unchanged". */
@@ -65,16 +58,6 @@ export function checkPeerInvariants(snapshot: PeerInvariantSnapshot, current: In
 		return 'A peer cannot be an exit node and use an exit node at the same time';
 	}
 
-	if (request.isExitNode === true) {
-		// Only one peer per wg interface can own AllowedIPs 0.0.0.0/0 - a second exit node
-		// needs a second interface. This is a wireguard cryptokey-routing constraint, not a
-		// policy choice, so it's rejected rather than silently resolved.
-		const other = snapshot.peers.find((p) => p.isExitNode && p.id !== current?.id);
-		if (other) {
-			return `This server already has an exit node (${label(other)}). Only one peer per interface can be an exit node.`;
-		}
-	}
-
 	if (current && request.isExitNode === false && current.isExitNode) {
 		// Fail closed and loudly: silently unassigning the dependents would leave them with no
 		// internet at all, with nothing in the UI explaining why.
@@ -95,16 +78,13 @@ export function checkPeerInvariants(snapshot: PeerInvariantSnapshot, current: In
 			return 'Exit node not found on this server';
 		}
 
+		// Any exit node on this server will do - each one owns 0.0.0.0/0 on an interface of its
+		// own (wg/exitLinks.ts), so there is nothing for them to compete over and a client picks
+		// freely. The rule this replaced ("a server has at most one exit node") was the direct
+		// consequence of them all sharing the server's interface.
+
 		if (!target.isExitNode) {
 			return 'That peer is not marked as an exit node';
-		}
-
-		// Routing wins over an `internet` grant: with an exitPeerId set, the ip rule sends this
-		// peer's traffic to the exit node and it never reaches the hub's own uplink, so the
-		// grant would be silently inert. Rejecting keeps the db out of a state the UI's
-		// three-way internet selector can't display.
-		if (current && snapshot.internetGrantPeerIds.includes(current.id)) {
-			return 'This peer has an "allow -> internet" grant (internet via the hub). Remove it before assigning an exit node.';
 		}
 	}
 

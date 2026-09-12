@@ -56,7 +56,7 @@ The frontend never calls a generated client or a hand-maintained schema package.
   duplicating them.
 - Field *shapes* are validated by Elysia's `t.*` on the server only. **Cross-row rules are shared**: the pure,
   io-free modules under `src/lib/` (`validation.ts`, `peerInvariants.ts`, `exitTopology.ts`) are imported by both
-  the route handlers and the Vue modals, so a rule like "one exit node per interface" is stated once. Anything a
+  the route handlers and the Vue modals, so a rule like "a peer cannot be an exit node and use one" is stated once. Anything a
   modal still checks by hand (e.g. `ServerModal.vue`'s field formats) has to be kept in sync by hand - prefer
   moving a new cross-row rule into `src/lib/` over mirroring it.
 
@@ -87,9 +87,9 @@ route parameterized by that server's id, including all of its peers, tags and gr
 `src/db/schema.ts` defines seven tables (`adminSessionsTable` besides these six): `serverPeersTable` (one per WireGuard interface/server), `peersTable`
 (clients, FK'd to a server), `peerTagsTable`, `peerTagAssignmentsTable` and `policyGrantsTable` (see "Restricted
 clients" below). `peersTable` also carries the exit-node columns (`isExitNode`, `exitPeerId`, `exitDns`,
-`advertisedRoutes`) and
-`serverPeersTable` the interface's `dns` and its allocated policy-routing table (`routeTableId`) - see "Exit
-nodes" below. **SQLite foreign-key enforcement is never turned on** (no `PRAGMA foreign_keys = ON` anywhere) -
+`advertisedRoutes`) and, for a peer that *is* an exit node, the five columns describing the wg interface it gets
+to itself (`exitInterfaceName`, `exitPrivateKey`, `exitPublicKey`, `exitListenPort`, `exitRouteTableId`);
+`serverPeersTable` carries the interface's `dns` - see "Exit nodes" below. **SQLite foreign-key enforcement is never turned on** (no `PRAGMA foreign_keys = ON` anywhere) -
 `onDelete` clauses in the schema are declarative intent only; cascade/cleanup on delete is done by hand in the
 API handler (see `DELETE /wg/servers/:id/tags/:tagId` in `src/api/policy.ts` for the pattern: an explicit
 `db.transaction(...)` that unassigns members and deletes referencing grants before deleting the row itself).
@@ -104,18 +104,21 @@ API handler (see `DELETE /wg/servers/:id/tags/:tagId` in `src/api/policy.ts` for
 await converge(server.id); // peers, servers, tags, grants, policy documents - all of them
 ```
 
-It starts the wg interface if it isn't up and reloads it otherwise, then re-applies both host-wide artefacts (the
-nft ruleset and the host's policy routing) from a single **fleet snapshot** - `loadFleet()` in `db/fleet.ts`, one
-read of every server's `PolicyGraph`, in the stable order `buildRuleset`'s ordinal nft naming depends on.
-`syncFirewall`/`syncExitRouting` take that snapshot rather than loading their own; they used to issue the same
-N+1 query independently, twice per converge.
+It reconciles the server's **exit links** first (`reconcileExitLinks`, see "Exit nodes" below - a server owns
+its own interface plus one per exit node, and which ones should exist has to be settled before any config is
+rendered), starts each of those interfaces if it isn't up and reloads it otherwise, then re-applies both
+host-wide artefacts (the nft ruleset and the host's policy routing) from a single **fleet snapshot** -
+`loadFleet()` in `db/fleet.ts`, one read of every server's `PolicyGraph`, in the stable order `buildRuleset`'s
+ordinal nft naming depends on. `syncFirewall`/`syncExitRouting` take that snapshot rather than loading their own;
+they used to issue the same N+1 query independently, twice per converge.
 
 This used to be a choice - `converge()` for peer/server config, `syncFirewall()` alone for pure policy changes -
 decided by hand at ten call sites against a rule that lived only in a comment, where picking wrong was a silent
 routing bug rather than a failing test. A policy-only mutation now also reloads the interface: that is a
 `wg syncconf` with identical content, and it puts every nft rebuild on converge's serialized chain instead of
-letting a policy handler race a concurrent converge. `convergeHost()` (no interface step) exists for exactly one
-caller, `wgManager` at boot, which has just started every interface itself.
+letting a policy handler race a concurrent converge. `convergeHost()` (no interface step) applies the host-wide
+half alone; `tearDownExitLink()` is the one escape hatch, for the peer-delete handler, which has to take an
+interface down whose describing row is about to disappear.
 
 Failures are logged, not thrown: a `ConvergeResult` of `{ ok: false }` means the mutation was still applied and
 persisted. Handlers `log.warn` and return 200.
@@ -147,8 +150,8 @@ outside a privileged container) exercises the full app against the shim.
 
 Peers carry a many-to-many set of **tags** (`peerTagAssignmentsTable`; no tags is **fully unrestricted**, same
 escape hatch the old single-`groupId` model had). Reachability is `policyGrantsTable`: an explicit, per-server
-**ordered list** (`position`, ascending) of `(action: allow|deny, src: tag|peer, dst: tag|peer|cidr|server|
-internet|any, protocol, ports)` rows, evaluated first-match-wins - see the type comment atop `wg/firewall.ts` for
+**ordered list** (`position`, ascending) of `(action: allow|deny, src: tag|peer, dst: tag|peer|cidr|server|any,
+protocol, ports)` rows, evaluated first-match-wins - see the type comment atop `wg/firewall.ts` for
 the full evaluation semantics. A peer becomes "governed" (denied by default absent a matching grant) the moment
 it carries a tag *or* is named directly as a grant's `src` - this is what lets a peer-scoped grant placed above a
 tag-scoped one express "override this tag's policy for one specific client", the feature this model replaced
@@ -165,10 +168,17 @@ enforcement boundary** - a client owns that file and can edit it. The actual bou
 across *all* servers at once on every relevant mutation. **Route handlers never call it directly**: they call
 `converge(serverId)` (see "Converging" above), which is the single seam for "apply what I just changed". Read the top-of-file comments in `firewall.ts` before touching it -
 notable non-obvious invariants: nft object names are ordinal (`s{serverIdx}t{tagIdx}`), never derived from
-nanoid ids or `interfaceName`, because those don't satisfy nft's identifier charset; a tag can't reach its own
-members unless a grant explicitly names that tag as both `src` and `dst`; and enabling a server's `enableNat`
-must not silently grant ungoverned peers internet access (there's an explicit forward-chain guard for this - see
-the comment above `egressGuard` in `firewall.ts`).
+nanoid ids or `interfaceName`, because those don't satisfy nft's identifier charset; and a tag can't reach its own
+members unless a grant explicitly names that tag as both `src` and `dst`.
+
+**The hub is not an internet gateway.** `drizzle/0008_drop_hub_egress.sql` removed `serverPeers.enableNat` and
+the `internet` grant destination: the ruleset has no nat hook, no masquerade and no `oifname`-based rule at all,
+so a wg packet routed out a non-wg interface leaves with its vpn source address and nothing routes the reply
+back. There is consequently no hub-side egress to permit, deny or guard - the only path to the internet is an
+exit node peer (routing, `peers.exitPeerId`), whose traffic never leaves the wg interface on this host. The same
+reason is why `allowedIpsForPeer` (`db/policyGraph.ts`) never widens to `0.0.0.0/0`: it used to for an
+`internet`/`any` grant, and that hint would now route a client's internet traffic into a tunnel that drops it.
+`?exit=true` is the one rendering that legitimately carries `/0`.
 
 `src/wg/firewall.ts` splits into a pure `buildRuleset(servers: FirewallServer[])` (no db, no io - this is what
 `firewall.test.ts` drives directly with fixtures) and a thin `generateFirewallRuleset(fleet)`/`syncFirewall(fleet)`
@@ -178,29 +188,54 @@ themselves, so the ruleset and the exit routing always derive from the same snap
 reading "all servers" from the db in a test would pick up fixtures inserted by unrelated test files (this is why
 existing fixtures prefix ids per-file, e.g. `serversRouter-server`, `peersRouters-server`, `policyRouter-server`).
 
-### Exit nodes: the peer as internet gateway, and routing as the permission
+### Exit nodes: one wg interface each, and routing as the permission
 
 A peer marked `peers.isExitNode` lends its own uplink to other clients: a peer with
 `peers.exitPeerId` pointing at it gets a **second config rendering** (`?exit=true` on either
 peer-config route) whose only difference is `AllowedIPs = 0.0.0.0/0, ::/0` - same key, same
 address, same endpoint - so the client switches exit path by switching config file, with no
-server-side state change. The full traffic path and the rejected alternatives are in the
-top-of-file comment on `wg/exitRouting.ts`. The three things most likely to surprise:
+server-side state change, and repointing it at a *different* exit node changes nothing on the
+client at all. The full traffic path and the rejected alternatives are in the top-of-file
+comments on `wg/exitLinks.ts` (why an interface each) and `wg/exitRouting.ts` (how a client is
+steered into one). The things most likely to surprise:
 
+- **A server is several interfaces.** Its own, carrying every ordinary peer, plus one **exit
+  link** per exit node - `wgx{n}`, allocated by `reconcileExitLinks` (`wg/exitLinks.ts`) and
+  stored on the peer (`exitInterfaceName`/`exitPrivateKey`/`exitPublicKey`/`exitListenPort`/
+  `exitRouteTableId`). An exit node is therefore *not* a peer of its server's interface, which
+  is what `exitTopologyOf`'s `exitNodes`/`plainPeers` split exists to make impossible to
+  forget. The reason is that wireguard picks the destination peer from the packet's
+  destination address alone, so `0.0.0.0/0` has exactly one owner per interface - and writing
+  it to a second peer silently *takes it away from the first* rather than failing.
+- **Allocation is reconciled, never done in a write handler.** `converge()` calls
+  `reconcileExitLinks` first, so a row that became an exit node by any path - the api, a policy
+  import, a direct db write, or `drizzle/0009_exit_links.sql` landing on an install that
+  already had one - gets provisioned on the next converge. Releasing works the same way, and
+  `converge` additionally sweeps `wgx`-shaped interfaces no peer claims (a peer deleted while
+  the process was down).
 - **The `ip rule` is the permission, not the nft rule.** `wg/exitRouting.ts` installs
-  `ip rule from <client>/32 table <server.routeTableId>` + `default dev <iface>` only for peers
-  with an `exitPeerId`. A peer without one has no route to the exit node at all, so it can't
-  reach that uplink by hand-editing its own `AllowedIPs`. The nft accept in `fwd_s{i}` exists
-  only so a *governed* exit client isn't dropped by its default-deny first, and is emitted
-  **after** every explicit grant so an admin `deny` still wins.
-- **An exit-bearing interface's server config emits `Table = off`.** The exit peer owns
-  `AllowedIPs = 0.0.0.0/0` server-side, and `wg-quick` would turn that into a default route on
-  the *manager's own host*. With `Table = off` the connected route from `Address` is what makes
-  peers routable, which is why `generateServerConfig` derives that prefix from `cidrRange`
-  rather than assuming `/24`.
-- **One exit node per interface**, api-enforced (`assertExitNodeInvariants` in
-  `api/serversPeers.ts`) - only one peer can own `0.0.0.0/0` on a wg interface. That's a
-  wireguard constraint, not a policy choice.
+  `ip rule from <client>/32 table <that exit node's exitRouteTableId>` only for peers with an
+  `exitPeerId`. Two clients of one server landing in two different tables, each with
+  `default dev <that node's link>`, is the whole of "any peer can pick any exit node". Each
+  table is a **complete** routing table, not just a default route: the client's rule captures
+  *all* of its traffic, so the vpn subnet, every exit node's `/32` and every advertised prefix
+  go in it too, or assigning an exit node would silently cut the client off from its peers.
+- **An exit link is address-less and always `Table = off`.** Its peer owns `0.0.0.0/0`, which
+  wg-quick would turn into a default route on the manager's own host. The exit node's `/32` is
+  installed explicitly by `wg/exitRouting.ts` instead - its server's connected route no longer
+  covers it - and an address here could only duplicate the server's (which the kernel refuses)
+  or invent a link subnet.
+- **Each exit link needs its own published UDP port**, since the exit node dials in. Allocated
+  from 51900-51999 or pinned per peer (`exitListenPort`). This is the one operational cost of
+  the design and the ui says so at every point where an exit node is configured.
+- **Everything server-side can be correct and the client still times out**, because the two
+  halves that are not in this codebase's control are the exit node's own machine
+  (`ip_forward` + a masquerade rule, emitted only by the `?nat=true` rendering - and marking a
+  peer as an exit node does *not* change its own config, though it *does* change which port and
+  hub key that config must use, so the machine has to be re-provisioned by hand) and two host
+  sysctls (`net.ipv4.ip_forward`, and `max(conf.all.rp_filter, conf.<iface>.rp_filter)` which
+  must not be 1). `wg/exitRouting.ts` warns about both sysctls on every sync; nothing can
+  detect the first.
 
 The same peer column set carries Tailscale's *other* half, **advertised subnet routes**
 (`peers.advertisedRoutes`, a comma-separated ipv4 CIDR list of LANs behind that peer). It shares the `Table = off`

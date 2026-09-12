@@ -53,15 +53,15 @@ welcome.
 - **No config files to babysit.** Interfaces, keys and peers live in SQLite and are applied to the
   running system; nothing is hand-edited on disk.
 - **Client configs and QR codes**, so mobile clients can be enrolled by scanning.
-- **Exit nodes.** Any peer can lend its own internet uplink to the others — Tailscale's
-  `--advertise-exit-node`, without the client. The peer using it gets a second config file to switch
-  to; nothing changes server-side. See [Exit nodes and subnet routes](#exit-nodes-and-subnet-routes).
+- **Exit nodes, as many as you like.** Any peer can lend its own internet uplink to the others —
+  Tailscale's `--advertise-exit-node`, without the client — and every client picks which one it uses.
+  The client gets a second config file to switch to; switching exit nodes later changes nothing on it.
+  This is the *only* internet path wgfleet offers: the hub itself never masquerades.
+  See [Exit nodes and subnet routes](#exit-nodes-and-subnet-routes).
 - **Advertised subnet routes.** A peer can advertise a LAN behind it (`192.168.1.0/24`) so permitted
   clients reach that network through the tunnel. Who may reach it is an ordinary CIDR grant.
 - **Traffic graphs and lifetime totals**, per server and per peer, rolled up at 1-minute (24h),
   1-hour (30d) and 1-day (400d) resolution.
-- **Per-server internet egress (NAT)**, off by default, and never implicitly granted — a peer needs an
-  explicit `internet` grant even once NAT is on.
 - **DNS handed to clients** per server, with a per-exit-node override so a client on an exit node
   resolves through that node's network instead of its local one.
 - **Scoped tokens.** Separate admin, per-server and per-peer bearer tokens.
@@ -104,7 +104,9 @@ Then open <http://localhost:3000> and log in with your `ADMIN_TOKEN`.
 > printed to the log. Generate a durable one with `openssl rand -base64 32`.
 
 For production, put a reverse proxy (Traefik, Caddy, nginx) in front for TLS termination. Publish one
-UDP port per WireGuard server you intend to run.
+UDP port per WireGuard server you intend to run, **plus one per exit node** — each exit node connects
+to a dedicated interface on its own port, allocated from `51900-51999` (see
+[Exit nodes and subnet routes](#exit-nodes-and-subnet-routes)).
 
 ### Configuration
 
@@ -129,13 +131,13 @@ Tailscale-style grants:
   one overrides policy for one specific client without inventing a tag for it.
 - A grant's **destination** is another tag, another peer, an arbitrary **CIDR** (typically a LAN a peer
   advertises — see [Exit nodes and subnet routes](#exit-nodes-and-subnet-routes)), the **server**
-  itself (its tunnel address — DNS, the management API), the **internet**, or **any**. Grants can
+  itself (its tunnel address — DNS, the management API), or **any**. Grants can
   additionally match a protocol (`tcp`/`udp`/`icmp`) and a port list or range.
 - A peer becomes **governed** the moment it carries a tag *or* is named as a grant's source: from then
   on its traffic is denied unless a grant allows it. A tag cannot even reach itself without a grant
   naming it as both source and destination.
-- The **internet** destination additionally requires `enableNat` on that server, since egress is
-  masqueraded. Turning NAT on grants nobody internet access by itself.
+- There is no **internet** destination. The hub does not masquerade, so there is no hub-side egress
+  path to permit or deny — reaching the internet is an exit node, which is routing rather than policy.
 
 Because this compiles to an nftables ruleset applied atomically across all servers, a client cannot
 opt out of it by editing its own config — `AllowedIPs` in a client config is a routing hint, and
@@ -149,15 +151,47 @@ whole policy document for review, export and import), or via the API.
 Two ways to reach something that is not itself a peer. Both are configured on the peer that provides
 it, and both work with stock WireGuard clients.
 
-**An exit node** lends its own internet uplink to other clients. Mark a peer as the exit node — one per
-interface, because only one peer can own `AllowedIPs = 0.0.0.0/0` on a WireGuard interface — then point
-other peers at it. Each of those gets a *second* config rendering (`?exit=true` on either peer-config
-route) whose only difference is `AllowedIPs = 0.0.0.0/0, ::/0`. Same key, same address, same endpoint,
-so a client changes its exit path by switching config files and nothing changes on the server.
+**An exit node** lends its own internet uplink to other clients, and is the only way a client reaches
+the internet through wgfleet — the hub never masquerades. Mark any number of peers as exit nodes, then
+point other peers at whichever one they should use. Each client gets a *second* config rendering
+(`?exit=true` on either peer-config route) whose only difference is `AllowedIPs = 0.0.0.0/0, ::/0`.
+Same key, same address, same endpoint, so a client changes its exit path by switching config files —
+and switching it to a *different* exit node later changes nothing on the client at all.
 
 Routing is the permission here, not a firewall rule: the hub installs a policy route only for peers
-that have been assigned an exit node, so a peer without one has no path to that uplink at all — editing
+that have been assigned an exit node, so a peer without one has no path to any uplink at all — editing
 its own `AllowedIPs` gets it nowhere.
+
+### How several exit nodes share one network
+
+WireGuard picks which peer to encrypt a packet to from the packet's **destination address alone**, and
+every exit client wants the same destination: the whole internet, `0.0.0.0/0`. That prefix has exactly
+one owner per interface, and assigning it to a second peer does not fail — it silently takes it away
+from the first.
+
+So each exit node gets **a WireGuard interface of its own on the hub** (`wgx0`, `wgx1`, …), with
+exactly one peer on it. Nothing competes for `0.0.0.0/0`, and "which exit node does this client use"
+becomes an ordinary routing question — a source rule per client, pointing at that exit node's table:
+
+```
+ip rule add from 10.0.0.12/32 table 52000     # → default dev wgx0 → exit node A
+ip rule add from 10.0.0.13/32 table 52001     # → default dev wgx1 → exit node B
+```
+
+Your clients are untouched by this: they all stay on the server's own interface, keep their keys,
+addresses and endpoint, and still reach every peer — including exit nodes — exactly as before.
+
+> ⚠️ **Each exit node needs its own UDP port published.** The exit node dials the hub, so the hub has
+> to be reachable on that port. wgfleet allocates one from `51900-51999` (or you pin one in the peer
+> dialog) and shows it on the server's **policy** view — publish it on the container
+> (`-p 51900:51900/udp`) and open it in the host firewall. This is the one real cost of an extra exit
+> node; everything else is internal.
+
+> ⚠️ **Marking a peer as an exit node does not change that peer's own config by itself.** You have to
+> reinstall it: it now connects to that dedicated interface, so its `Endpoint` port and the hub public
+> key both change, and it needs the gateway lines below. Until you do and restart its tunnel, its
+> clients time out while the UI, the handshake and the ruleset all look correct. This is the single
+> most common reason a new exit node appears not to work.
 
 **An advertised subnet route** is the other half: a peer declaring a LAN behind it, e.g.
 `192.168.1.0/24`, so clients can reach that network through it. This one adds no new permission
@@ -172,12 +206,22 @@ Either role means that peer's own machine forwards traffic. Download its config 
 `PostUp`/`PostDown` lines that enable `ip_forward` and masquerade — onto its uplink for an exit node,
 onto the LAN for an advertiser. Those lines need `wg-quick` as root on that machine.
 
-> ⚠️ **`rp_filter` must be `0` or `2` (loose) on the host running wgfleet** for either feature. Replies
-> arrive on the WireGuard interface with a source address the host's own routing table sends elsewhere,
-> and strict reverse-path filtering (`1`) drops them — an otherwise-correct setup that simply does not
-> work. Most distributions default to loose; wgfleet logs a warning when it finds strict filtering on an
-> interface that has an exit node or an advertised route. Add
-> `--sysctl 'net.ipv4.conf.all.rp_filter=2'` to the container if yours does not.
+> ⚠️ **Two host sysctls decide whether either feature works at all**, and both fail as a plain timeout
+> with everything else looking healthy. wgfleet warns about each in its log rather than changing them
+> underneath you.
+>
+> - `net.ipv4.ip_forward` must be `1` on the host running wgfleet. Both features *are* forwarding: a
+>   packet arrives on a WireGuard interface addressed elsewhere and has to go back out. The `docker
+>   run` and Compose examples above set it; a deployment that drops those `--sysctl` flags silently
+>   forwards nothing.
+> - `net.ipv4.conf.all.rp_filter` and the per-interface value must be `0` or `2` (loose) — the kernel
+>   uses whichever is *higher*. Replies arrive on the WireGuard interface with a source address the
+>   host's own routing table sends elsewhere, and strict reverse-path filtering (`1`) drops them. Most
+>   distributions default to loose; add `--sysctl 'net.ipv4.conf.all.rp_filter=2'` if yours does not.
+>
+> The exit node's own machine needs `ip_forward=1` too — the `?nat=true` config sets it, falling back
+> to reading the value where `/proc/sys` is read-only (a container or unprivileged LXC), since
+> `wg-quick` aborts the whole interface if a `PostUp` line fails.
 
 ## API
 

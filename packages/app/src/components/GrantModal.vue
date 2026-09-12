@@ -30,11 +30,7 @@
 						<option value="tag">tag</option>
 						<option value="peer">peer</option>
 					</select>
-					<select
-						v-if="form.srcKind === 'tag'"
-						v-model="form.srcTagId"
-						class="flex-1 rounded-sm border border-border bg-bg text-text px-3 py-2 text-sm focus:outline-none focus:border-accent"
-					>
+					<select v-if="form.srcKind === 'tag'" v-model="form.srcTagId" class="flex-1 rounded-sm border border-border bg-bg text-text px-3 py-2 text-sm focus:outline-none focus:border-accent">
 						<option value="" disabled>select a tag</option>
 						<option v-for="tag in tags" :key="tag.id" :value="tag.id">{{ tag.friendlyName ?? tag.name }}</option>
 					</select>
@@ -54,22 +50,13 @@
 						<option value="peer">peer</option>
 						<option value="cidr">cidr</option>
 						<option value="server">server</option>
-						<option value="internet">internet</option>
 						<option value="any">any</option>
 					</select>
-					<select
-						v-if="form.dstKind === 'tag'"
-						v-model="form.dstTagId"
-						class="flex-1 rounded-sm border border-border bg-bg text-text px-3 py-2 text-sm focus:outline-none focus:border-accent"
-					>
+					<select v-if="form.dstKind === 'tag'" v-model="form.dstTagId" class="flex-1 rounded-sm border border-border bg-bg text-text px-3 py-2 text-sm focus:outline-none focus:border-accent">
 						<option value="" disabled>select a tag</option>
 						<option v-for="tag in tags" :key="tag.id" :value="tag.id">{{ tag.friendlyName ?? tag.name }}</option>
 					</select>
-					<select
-						v-else-if="form.dstKind === 'peer'"
-						v-model="form.dstPeerId"
-						class="flex-1 rounded-sm border border-border bg-bg text-text px-3 py-2 text-sm focus:outline-none focus:border-accent"
-					>
+					<select v-else-if="form.dstKind === 'peer'" v-model="form.dstPeerId" class="flex-1 rounded-sm border border-border bg-bg text-text px-3 py-2 text-sm focus:outline-none focus:border-accent">
 						<option value="" disabled>select a peer</option>
 						<option v-for="peer in peers" :key="peer.id" :value="peer.id">{{ peer.friendlyName ?? peer.id }}</option>
 					</select>
@@ -90,12 +77,7 @@
 						<option value="udp">udp</option>
 						<option value="icmp">icmp</option>
 					</select>
-					<BaseInput
-						v-if="form.protocol === 'tcp' || form.protocol === 'udp'"
-						v-model="form.ports"
-						class="flex-1"
-						placeholder="e.g. 22, 8000-8100 (leave empty for all ports)"
-					/>
+					<BaseInput v-if="form.protocol === 'tcp' || form.protocol === 'udp'" v-model="form.ports" class="flex-1" placeholder="e.g. 22, 8000-8100 (leave empty for all ports)" />
 				</div>
 				<span v-if="errors.ports" class="text-down text-xs block mt-1">{{ errors.ports }}</span>
 			</div>
@@ -128,7 +110,7 @@ export type GrantDraft = {
 	srcKind: 'tag' | 'peer';
 	srcTagId?: string;
 	srcPeerId?: string;
-	dstKind: 'tag' | 'peer' | 'cidr' | 'server' | 'internet' | 'any';
+	dstKind: 'tag' | 'peer' | 'cidr' | 'server' | 'any';
 	dstTagId?: string;
 	dstPeerId?: string;
 	dstCidr?: string;
@@ -168,8 +150,7 @@ const errors = reactive({ dstCidr: '', ports: '' });
 
 const dstKindHint: Record<string, string> = {
 	server: "the gateway's own tunnel address (dns, management api)",
-	internet: 'egress to the internet (also requires "enable nat" on the server)',
-	any: 'matches every destination',
+	any: 'matches every destination on this interface. the internet is not one of them - that is an exit node, not a grant',
 };
 
 const dstKindHintText = computed(() => dstKindHint[form.dstKind] ?? '');
@@ -232,7 +213,7 @@ watch(
 		errors.dstCidr = '';
 		errors.ports = '';
 	},
-	{ immediate: true }
+	{ immediate: true },
 );
 
 const handleSubmit = () => {

@@ -1,5 +1,3 @@
-import type { ServerPeer } from '@server/db/schema';
-
 // Test-only third adapter at the wg/shell seam (alongside shell.real.ts and shell.shim.ts -
 // see shell.ts's capability-detection dispatcher). Behaves like the shim (no real network/nft
 // changes, no filesystem writes) but additionally keeps a call log and the last-applied
@@ -9,9 +7,9 @@ import type { ServerPeer } from '@server/db/schema';
 // CLAUDE.md's note on the wg/shell layer for why a function missing from an adapter here is
 // `undefined` in every test.
 export type RecordedCall =
-	| { fn: 'startServer'; interfaceName: string }
-	| { fn: 'reloadServer'; interfaceName: string }
-	| { fn: 'stopServer'; interfaceName: string }
+	| { fn: 'startInterface'; interfaceName: string }
+	| { fn: 'reloadInterface'; interfaceName: string }
+	| { fn: 'stopInterface'; interfaceName: string }
 	| { fn: 'applyFirewall'; ruleset: string }
 	| { fn: 'resetFirewall' }
 	| { fn: 'applyExitRouting'; commands: string[] };
@@ -27,6 +25,8 @@ export const shellCallLog = {
 	lastAppliedRuleset: () => lastAppliedRuleset,
 	lastAppliedExitRouting: () => lastAppliedExitRouting,
 	isUp: (interfaceName: string) => upInterfaces.has(interfaceName),
+	configFor: (interfaceName: string) => configs.get(interfaceName) ?? null,
+	upInterfaces: () => [...upInterfaces].sort(),
 	// Tests share one process (see tests/setup.ts) - call this in beforeEach/afterEach to stop
 	// one test's recorded calls leaking into the next.
 	reset: () => {
@@ -34,6 +34,7 @@ export const shellCallLog = {
 		lastAppliedRuleset = null;
 		lastAppliedExitRouting = null;
 		upInterfaces.clear();
+		configs.clear();
 	},
 };
 
@@ -48,20 +49,30 @@ export const wgShow = async (_interfaceName: string) => ({
 	peers: [] as never[],
 });
 
+export const listInterfaces = async (): Promise<string[]> => [...upInterfaces];
+
 export const isInterfaceUp = async (interfaceName: string) => upInterfaces.has(interfaceName);
 
-export const startServer = async (server: ServerPeer) => {
-	upInterfaces.add(server.interfaceName);
-	calls.push({ fn: 'startServer', interfaceName: server.interfaceName });
+// The rendered config is recorded too - it is how tests assert what actually went onto an
+// interface (which peers a server's config carries, and that an exit link carries 0.0.0.0/0)
+// without a real wg to read it back from.
+const configs = new Map<string, string>();
+
+export const startInterface = async (interfaceName: string, config: string) => {
+	upInterfaces.add(interfaceName);
+	configs.set(interfaceName, config);
+	calls.push({ fn: 'startInterface', interfaceName });
 };
 
-export const reloadServer = async (server: ServerPeer) => {
-	calls.push({ fn: 'reloadServer', interfaceName: server.interfaceName });
+export const reloadInterface = async (interfaceName: string, config: string) => {
+	configs.set(interfaceName, config);
+	calls.push({ fn: 'reloadInterface', interfaceName });
 };
 
-export const stopServer = async (server: ServerPeer) => {
-	upInterfaces.delete(server.interfaceName);
-	calls.push({ fn: 'stopServer', interfaceName: server.interfaceName });
+export const stopInterface = async (interfaceName: string) => {
+	upInterfaces.delete(interfaceName);
+	configs.delete(interfaceName);
+	calls.push({ fn: 'stopInterface', interfaceName });
 };
 
 export const applyFirewall = async (ruleset: string) => {

@@ -1,13 +1,5 @@
 import { db } from '../packages/server/src/db';
-import {
-	serverPeersTable,
-	peerTagsTable,
-	peerTagAssignmentsTable,
-	peersTable,
-	policyGrantsTable,
-	trafficBucketsTable,
-	adminSessionsTable,
-} from '../packages/server/src/db/schema';
+import { serverPeersTable, peerTagsTable, peerTagAssignmentsTable, peersTable, policyGrantsTable, trafficBucketsTable, adminSessionsTable } from '../packages/server/src/db/schema';
 import { migrateDb } from '../packages/server/src/db';
 import { nanoid } from 'nanoid';
 
@@ -44,7 +36,6 @@ async function seed() {
 			wgPrivateKey: 'eO2+c84g2Y8o9mE3c+9jF2w1h0v3t8s7q6p5o4n3m2l1=',
 			wgPublicKey: 'FRApubKey+x8y7z6w5v4u3t2s1r0q9p8o7n6m5l4k3j2i1=',
 			authToken: 'srv_token_frankfurt_000000000000',
-			enableNat: true,
 			lifetimeRxBytes: 15420000000,
 			lifetimeTxBytes: 31200000000,
 			statsSince: thirtyDaysAgo,
@@ -61,7 +52,6 @@ async function seed() {
 			wgPrivateKey: 'aB3+d95h3Z9p0nF4d+0kG3x2i1w4u9t8r7q6p5o4n3m2k3=',
 			wgPublicKey: 'IADpubKey+y9z8a7b6c5d4e3f2g1h0i9j8k7l6m5n4o3p2=',
 			authToken: 'srv_token_virginia_0000000000000',
-			enableNat: false,
 			lifetimeRxBytes: 6890000000,
 			lifetimeTxBytes: 9450000000,
 			statsSince: thirtyDaysAgo,
@@ -236,9 +226,9 @@ async function seed() {
 			action: 'allow',
 			srcKind: 'tag',
 			srcTagId: tagDevId,
-			dstKind: 'internet',
+			dstKind: 'any',
 			protocol: 'any',
-			comment: 'Engineers allowed full internet egress via gateway NAT',
+			comment: 'Engineers can reach everything on this interface',
 		},
 		{
 			id: 'grant_4',

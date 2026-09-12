@@ -1,10 +1,8 @@
 import { $ } from 'bun';
-import type { ServerPeer } from '../db/schema';
 import { createLog } from '@server/lib/log';
 
 import { exec } from 'child_process';
 import { promisify } from 'util';
-import { generateServerConfig } from './config';
 
 const log = createLog('wg');
 
@@ -74,22 +72,36 @@ export const wgShow = async (interfaceName: string) => {
 	}
 };
 
+// Every wireguard interface on the host, whoever created it - the input to converge's
+// orphaned-exit-link sweep. `wg show interfaces` lists only wg devices, so an unrelated
+// interface can never appear here.
+export const listInterfaces = async (): Promise<string[]> => {
+	try {
+		return ((await $`wg show interfaces`.text()) ?? '').trim().split(/\s+/).filter(Boolean);
+	} catch (error) {
+		log.error(error);
+		return [];
+	}
+};
+
 export const isInterfaceUp = async (interfaceName: string) => {
 	const output = (await $`ip a`.text()) ?? '';
 	return output.includes(interfaceName);
 };
 
-export const startServer = async (server: ServerPeer) => {
-	console.log(`starting server`);
-	await Bun.write('/tmp/' + server.interfaceName + '.conf', await generateServerConfig(server), { mode: 0o600 });
-	await cmd(`wg-quick up /tmp/${server.interfaceName}.conf`);
+// Takes the rendered config rather than a db row: this layer brings up *an interface*, and
+// since exit nodes got interfaces of their own (wg/exitLinks.ts) there are two kinds of config
+// to render. Deciding which is wg/converge.ts's job, not this adapter's.
+export const startInterface = async (interfaceName: string, config: string) => {
+	await Bun.write(`/tmp/${interfaceName}.conf`, config, { mode: 0o600 });
+	await cmd(`wg-quick up /tmp/${interfaceName}.conf`);
 };
 
-export const reloadServer = async (server: ServerPeer) => {
-	const conf = `/tmp/${server.interfaceName}.conf`;
-	const stripped = `/tmp/${server.interfaceName}.stripped.conf`;
+export const reloadInterface = async (interfaceName: string, config: string) => {
+	const conf = `/tmp/${interfaceName}.conf`;
+	const stripped = `/tmp/${interfaceName}.stripped.conf`;
 
-	await Bun.write(conf, await generateServerConfig(server), { mode: 0o600 });
+	await Bun.write(conf, config, { mode: 0o600 });
 
 	// `wg-quick strip` needs no privileges; run it directly instead of via `cmd()`'s
 	// bash/ash shell so this doesn't depend on bash process substitution (`<(...)`),
@@ -97,11 +109,11 @@ export const reloadServer = async (server: ServerPeer) => {
 	const strippedConfig = (await $`wg-quick strip ${conf}`.text()).trim();
 	await Bun.write(stripped, strippedConfig, { mode: 0o600 });
 
-	await cmd(`wg syncconf ${server.interfaceName} ${stripped}`);
+	await cmd(`wg syncconf ${interfaceName} ${stripped}`);
 };
 
-export const stopServer = async (server: ServerPeer) => {
-	await cmd(`ip link delete dev ${server.interfaceName}`);
+export const stopInterface = async (interfaceName: string) => {
+	await cmd(`ip link delete dev ${interfaceName}`);
 };
 
 // Exit-node policy routing (see wg/exitRouting.ts). Takes an already-built command list

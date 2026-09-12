@@ -2,7 +2,11 @@ import { beforeAll, describe, expect, it } from 'bun:test';
 import { db } from '@server/db';
 import { peersTable, serverPeersTable, type Peer } from '@server/db/schema';
 import { eq } from 'drizzle-orm';
-import { generatePeerConfig, generateServerConfig } from './config';
+import { generateExitLinkConfig, generatePeerConfig, generateServerConfig } from './config';
+import { exitTopologyOf } from '@server/lib/exitTopology';
+
+/** The ExitNode projection for one peer - what generateExitLinkConfig takes. */
+const exitNodeOf = (peers: Peer[], id: string) => exitTopologyOf(peers).exitNodes.find((node) => node.peer.id === id)!;
 
 // Fixture ids are prefixed per-file: the test run shares one in-memory database across every
 // test file (see tests/setup.ts and CLAUDE.md), so unprefixed ids would collide.
@@ -30,7 +34,6 @@ describe('wg config generation', () => {
 					wgEndpoint: 'cfghost:51944',
 					wgPrivateKey: 'serverPrivateKey',
 					wgPublicKey: 'serverPublicKey',
-					routeTableId: 52900,
 					dns: '10.44.0.1',
 				},
 				{
@@ -43,7 +46,6 @@ describe('wg config generation', () => {
 					wgEndpoint: 'cfghost:51945',
 					wgPrivateKey: 'serverPrivateKey',
 					wgPublicKey: 'serverPublicKey',
-					routeTableId: 52901,
 				},
 				{
 					id: ADV,
@@ -55,7 +57,6 @@ describe('wg config generation', () => {
 					wgEndpoint: 'cfghost:51946',
 					wgPrivateKey: 'serverPrivateKey',
 					wgPublicKey: 'serverPublicKey',
-					routeTableId: 52902,
 				},
 				{
 					id: BOTH,
@@ -67,7 +68,6 @@ describe('wg config generation', () => {
 					wgEndpoint: 'cfghost:51947',
 					wgPrivateKey: 'serverPrivateKey',
 					wgPublicKey: 'serverPublicKey',
-					routeTableId: 52903,
 				},
 			])
 			.execute();
@@ -75,29 +75,60 @@ describe('wg config generation', () => {
 		await db
 			.insert(peersTable)
 			.values([
-				{ id: 'configTest-exit', serverPeerId: SERVER, wgAddress: '10.44.0.2', wgPrivateKey: 'exitPriv', wgPublicKey: 'exitPub', isExitNode: true, exitDns: '9.9.9.9' },
+				{
+					id: 'configTest-exit',
+					serverPeerId: SERVER,
+					wgAddress: '10.44.0.2',
+					wgPrivateKey: 'exitPriv',
+					wgPublicKey: 'exitPub',
+					isExitNode: true,
+					exitDns: '9.9.9.9',
+					exitInterfaceName: 'wgx0',
+					exitPrivateKey: 'exitLinkPriv',
+					exitPublicKey: 'exitLinkPub',
+					exitListenPort: 51900,
+					exitRouteTableId: 52000,
+				},
 				{ id: 'configTest-client', serverPeerId: SERVER, wgAddress: '10.44.0.3', wgPrivateKey: 'clientPriv', wgPublicKey: 'clientPub', exitPeerId: 'configTest-exit' },
 				{ id: 'configTest-plainPeer', serverPeerId: PLAIN, wgAddress: '10.45.45.2', wgPrivateKey: 'plainPriv', wgPublicKey: 'plainPub' },
 				{ id: 'configTest-advertiser', serverPeerId: ADV, wgAddress: '10.46.46.2', wgPrivateKey: 'advPriv', wgPublicKey: 'advPub', advertisedRoutes: '192.168.1.0/24,10.10.0.0/16' },
 				{ id: 'configTest-advPeer', serverPeerId: ADV, wgAddress: '10.46.46.3', wgPrivateKey: 'advPeerPriv', wgPublicKey: 'advPeerPub' },
-				{ id: 'configTest-both', serverPeerId: BOTH, wgAddress: '10.47.47.2', wgPrivateKey: 'bothPriv', wgPublicKey: 'bothPub', isExitNode: true, advertisedRoutes: '192.168.7.0/24' },
+				{
+					id: 'configTest-both',
+					serverPeerId: BOTH,
+					wgAddress: '10.47.47.2',
+					wgPrivateKey: 'bothPriv',
+					wgPublicKey: 'bothPub',
+					isExitNode: true,
+					advertisedRoutes: '192.168.7.0/24',
+					exitInterfaceName: 'wgx1',
+					exitPrivateKey: 'bothLinkPriv',
+					exitPublicKey: 'bothLinkPub',
+					exitListenPort: 51901,
+					exitRouteTableId: 52001,
+				},
 			])
 			.execute();
 	});
 
 	describe('generateServerConfig', () => {
-		it('gives the exit node 0.0.0.0/0 while every other peer keeps its /32', async () => {
+		it("leaves the exit node off its server's interface entirely - it lives on its own link", async () => {
+			// This is what makes more than one exit node per server possible: nothing on this
+			// interface owns 0.0.0.0/0, so there is nothing for two of them to fight over.
 			const server = (await db.query.serverPeersTable.findFirst({ where: eq(serverPeersTable.id, SERVER) }))!;
 			const config = await generateServerConfig(server);
 
-			expect(config).toContain('AllowedIPs = 0.0.0.0/0, 10.44.0.2/32');
+			expect(config).not.toContain('0.0.0.0/0');
+			expect(config).not.toContain('exitPub');
 			expect(config).toContain('AllowedIPs = 10.44.0.3');
 		});
 
-		it('sets Table = off on an interface with an exit node, so wg-quick cannot hijack the host default route', async () => {
+		it('needs no Table = off once the exit node is gone from the interface', async () => {
+			// `Table = off` exists to stop wg-quick routing a peer's AllowedIPs. With no /0 and
+			// nothing advertised here there is nothing outside cidrRange left to route.
 			const server = (await db.query.serverPeersTable.findFirst({ where: eq(serverPeersTable.id, SERVER) }))!;
 
-			expect(await generateServerConfig(server)).toContain('Table = off');
+			expect(await generateServerConfig(server)).not.toContain('Table = off');
 		});
 
 		it('leaves an interface without an exit node byte-identical to before (no Table line)', async () => {
@@ -166,12 +197,83 @@ describe('wg config generation', () => {
 			expect(withNat).toContain('PostDown = iptables -t nat -D POSTROUTING');
 		});
 
+		it('tolerates a read-only /proc on the gateway rather than aborting its bring-up', async () => {
+			// wg-quick runs PostUp under `set -e` and rolls the interface back on a non-zero
+			// exit, so a bare `sysctl -w` means a container/LXC gateway - where the value is
+			// already 1 but /proc/sys is mounted read-only - never gets a tunnel at all.
+			const withNat = await generatePeerConfig(await peer('configTest-exit'), { nat: true });
+
+			expect(withNat).toContain('PostUp = sysctl -q -w net.ipv4.ip_forward=1 || test "$(cat /proc/sys/net/ipv4/ip_forward)" = 1');
+		});
+
 		it('resolves the uplink interface on the exit node rather than guessing it here', async () => {
 			// The manager cannot see that machine's interfaces, and a wrong guess produces an
 			// exit node that looks configured and silently NATs nothing.
 			const withNat = await generatePeerConfig(await peer('configTest-exit'), { nat: true });
 
 			expect(withNat).toContain('$(r=$(ip -4 route show default); [[ $r =~ dev[[:space:]]+([^[:space:]]+) ]] && echo ${BASH_REMATCH[1]})');
+		});
+	});
+
+	describe('generateExitLinkConfig', () => {
+		it('gives the exit node an interface of its own, with 0.0.0.0/0 and nothing else on it', async () => {
+			const config = generateExitLinkConfig(exitNodeOf([await peer('configTest-exit')], 'configTest-exit'));
+
+			expect(config).toContain('PrivateKey = exitLinkPriv');
+			expect(config).toContain('ListenPort = 51900');
+			expect(config).toContain('AllowedIPs = 0.0.0.0/0, 10.44.0.2');
+			// exactly one peer - that is the whole point, see wg/exitLinks.ts
+			expect(config.match(/\[Peer\]/g)).toHaveLength(1);
+		});
+
+		it('carries no Address, so it adds no connected route of its own', async () => {
+			// The exit node's /32 is installed explicitly by wg/exitRouting.ts instead; an
+			// address here would have to duplicate the server's (which the kernel refuses on a
+			// second interface) or invent a link subnet.
+			expect(generateExitLinkConfig(exitNodeOf([await peer('configTest-exit')], 'configTest-exit'))).not.toContain('Address');
+		});
+
+		it('always sets Table = off - this peer owns the default route', async () => {
+			expect(generateExitLinkConfig(exitNodeOf([await peer('configTest-exit')], 'configTest-exit'))).toContain('Table = off');
+		});
+
+		it('refuses to render a link that was never provisioned rather than emitting a broken one', async () => {
+			const unprovisioned = { ...(await peer('configTest-exit')), exitInterfaceName: null, exitListenPort: null, exitRouteTableId: null };
+
+			expect(() => generateExitLinkConfig(exitTopologyOf([unprovisioned]).exitNodes[0])).toThrow();
+		});
+	});
+
+	describe('multiple exit nodes on one server', () => {
+		it('renders one independent link per exit node, each owning 0.0.0.0/0', async () => {
+			// The thing a shared interface cannot do: two peers both owning /0, because they are
+			// on different devices and so never compete for the prefix.
+			const peers = [await peer('configTest-exit'), await peer('configTest-both')];
+			const first = generateExitLinkConfig(exitNodeOf(peers, 'configTest-exit'));
+			const second = generateExitLinkConfig(exitNodeOf(peers, 'configTest-both'));
+
+			expect(first).toContain('AllowedIPs = 0.0.0.0/0');
+			expect(second).toContain('AllowedIPs = 0.0.0.0/0');
+			expect(first).toContain('ListenPort = 51900');
+			expect(second).toContain('ListenPort = 51901');
+			expect(first).not.toBe(second);
+		});
+
+		it("points each exit node's own client config at its own link, on the server's host", async () => {
+			// Same host as the server (an exit link listens beside it), different port, and the
+			// link's hub key rather than the server's.
+			const config = await generatePeerConfig(await peer('configTest-exit'));
+
+			expect(config).toContain('Endpoint = cfghost:51900');
+			expect(config).toContain('PublicKey = exitLinkPub');
+			expect(config).not.toContain('PublicKey = serverPublicKey');
+		});
+
+		it('leaves an ordinary peer pointed at the server itself', async () => {
+			const config = await generatePeerConfig(await peer('configTest-client'));
+
+			expect(config).toContain('Endpoint = cfghost:51944');
+			expect(config).toContain('PublicKey = serverPublicKey');
 		});
 	});
 
@@ -193,12 +295,15 @@ describe('wg config generation', () => {
 			expect(await generateServerConfig(await serverRow(ADV))).toContain('Table = off');
 		});
 
-		it('composes with the exit node on a peer that is both', async () => {
-			const config = await generateServerConfig(await serverRow(BOTH));
+		it('puts a peer that is both exit node and advertiser wholly on its own link', async () => {
+			// One peer, one interface: the LAN it advertises moves with it, so the server's own
+			// interface is left with neither the /0 nor the advertisement.
+			expect(await generateServerConfig(await serverRow(BOTH))).not.toContain('192.168.7.0/24');
 
+			const link = generateExitLinkConfig(exitNodeOf([await peer('configTest-both')], 'configTest-both'));
 			// the /0 already covers the LAN - the explicit entry is what makes `wg show` name
 			// the owner of that prefix
-			expect(config).toContain('AllowedIPs = 0.0.0.0/0, 10.47.47.2/32, 192.168.7.0/24');
+			expect(link).toContain('AllowedIPs = 0.0.0.0/0, 10.47.47.2, 192.168.7.0/24');
 		});
 
 		it("leaves the advertiser's own client config unchanged - it is the gateway, not a client of it", async () => {
@@ -214,12 +319,8 @@ describe('wg config generation', () => {
 			const withNat = await generatePeerConfig(await peer('configTest-advertiser'), { nat: true });
 
 			expect(withNat).toContain('net.ipv4.ip_forward=1');
-			expect(withNat).toContain(
-				'PostUp = iptables -t nat -A POSTROUTING -s 10.46.46.0/24 -o $(r=$(ip -4 route show 192.168.1.0/24); [[ $r =~ dev[[:space:]]+([^[:space:]]+) ]] && echo ${BASH_REMATCH[1]}) -j MASQUERADE',
-			);
-			expect(withNat).toContain(
-				'PostDown = iptables -t nat -D POSTROUTING -s 10.46.46.0/24 -o $(r=$(ip -4 route show 10.10.0.0/16); [[ $r =~ dev[[:space:]]+([^[:space:]]+) ]] && echo ${BASH_REMATCH[1]}) -j MASQUERADE',
-			);
+			expect(withNat).toContain('PostUp = iptables -t nat -A POSTROUTING -s 10.46.46.0/24 -o $(r=$(ip -4 route show 192.168.1.0/24); [[ $r =~ dev[[:space:]]+([^[:space:]]+) ]] && echo ${BASH_REMATCH[1]}) -j MASQUERADE');
+			expect(withNat).toContain('PostDown = iptables -t nat -D POSTROUTING -s 10.46.46.0/24 -o $(r=$(ip -4 route show 10.10.0.0/16); [[ $r =~ dev[[:space:]]+([^[:space:]]+) ]] && echo ${BASH_REMATCH[1]}) -j MASQUERADE');
 			// not the exit node's blanket rule
 			expect(withNat).not.toContain('-o $(r=$(ip -4 route show default');
 		});
@@ -227,12 +328,8 @@ describe('wg config generation', () => {
 		it('gives a peer that is both roles both masquerade rules', async () => {
 			const withNat = await generatePeerConfig(await peer('configTest-both'), { nat: true });
 
-			expect(withNat).toContain(
-				'-o $(r=$(ip -4 route show default); [[ $r =~ dev[[:space:]]+([^[:space:]]+) ]] && echo ${BASH_REMATCH[1]}) -j MASQUERADE',
-			);
-			expect(withNat).toContain(
-				'-s 10.47.47.0/24 -o $(r=$(ip -4 route show 192.168.7.0/24); [[ $r =~ dev[[:space:]]+([^[:space:]]+) ]] && echo ${BASH_REMATCH[1]}) -j MASQUERADE',
-			);
+			expect(withNat).toContain('-o $(r=$(ip -4 route show default); [[ $r =~ dev[[:space:]]+([^[:space:]]+) ]] && echo ${BASH_REMATCH[1]}) -j MASQUERADE');
+			expect(withNat).toContain('-s 10.47.47.0/24 -o $(r=$(ip -4 route show 192.168.7.0/24); [[ $r =~ dev[[:space:]]+([^[:space:]]+) ]] && echo ${BASH_REMATCH[1]}) -j MASQUERADE');
 		});
 	});
 });

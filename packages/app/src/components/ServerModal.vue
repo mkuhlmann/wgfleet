@@ -45,13 +45,6 @@
 				<BaseInput id="dns" v-model="form.dns" class="w-full" placeholder="leave empty to omit" />
 				<small class="text-muted text-xs">resolver handed to clients as <span class="text-text">DNS =</span> in their config. an exit node can override it for its own clients</small>
 			</div>
-			<div class="field">
-				<button type="button" class="flex items-center gap-2 text-sm text-text" @click="form.enableNat = !form.enableNat">
-					<span class="text-accent-dim">{{ form.enableNat ? '[x]' : '[ ]' }}</span>
-					<span><span class="text-accent-dim">&gt;</span> enable nat</span>
-				</button>
-				<small class="text-muted text-xs block mt-1">masquerade traffic leaving this subnet to the internet. required for any policy group's "internet" grant to actually work</small>
-			</div>
 			<div class="flex justify-end gap-2 mt-2">
 				<BaseButton @click="visible = false" variant="ghost" type="button">cancel</BaseButton>
 				<BaseButton type="submit" variant="primary">
@@ -93,7 +86,6 @@ const form = reactive({
 	wgListenPort: 51820,
 	cidrRange: '10.0.0.0/24',
 	reservedIps: 50,
-	enableNat: false,
 	dns: '',
 });
 
@@ -149,7 +141,6 @@ watch(
 			form.wgListenPort = server.wgListenPort;
 			form.cidrRange = server.cidrRange ?? '10.0.0.0/24';
 			form.reservedIps = server.reservedIps ?? 50;
-			form.enableNat = server.enableNat ?? false;
 			form.dns = server.dns ?? '';
 			isEditMode.value = true;
 		} else {
@@ -162,7 +153,6 @@ watch(
 			form.wgListenPort = 51820;
 			form.cidrRange = '10.0.0.0/24';
 			form.reservedIps = 50;
-			form.enableNat = false;
 			form.dns = '';
 		}
 		// Clear errors when opening/changing server
@@ -171,7 +161,7 @@ watch(
 		errors.wgListenPort = '';
 		errors.cidrRange = '';
 	},
-	{ immediate: true }
+	{ immediate: true },
 );
 
 // dns is the one clearable field, and create/patch differ on how: the create schema takes

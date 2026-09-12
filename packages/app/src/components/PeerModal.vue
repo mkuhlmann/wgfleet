@@ -31,31 +31,58 @@
 					<span class="text-accent-dim">{{ form.isExitNode ? '[x]' : '[ ]' }}</span>
 					<span><span class="text-accent-dim">&gt;</span> exit node</span>
 				</button>
-				<small class="text-muted text-xs block mt-1">route other clients' internet traffic through this peer's own uplink. only one peer per interface can be an exit node, and it stays an ordinary reachable peer</small>
+				<small class="text-muted text-xs block mt-1">
+					route other clients' internet traffic through this peer's own uplink. it stays an ordinary reachable peer. a server can have
+					<span class="text-text">as many exit nodes as you like</span> - each gets a wg interface of its own here, so they never compete for <span class="text-text">0.0.0.0/0</span>.
+				</small>
 				<span v-if="errors.isExitNode" class="text-down text-xs block mt-1">{{ errors.isExitNode }}</span>
 			</div>
 
-			<div class="field" v-if="form.isExitNode">
-				<label for="exitDns" class="mb-1.5 text-sm text-muted block"><span class="text-accent-dim">&gt;</span> exit dns</label>
-				<BaseInput id="exitDns" v-model="form.exitDns" class="w-full" placeholder="leave empty to use the server's dns" />
-				<small class="text-muted text-xs">resolver handed to clients using this exit node. without one, their lookups go to whatever their local network provides</small>
-			</div>
+			<template v-if="form.isExitNode">
+				<div class="field">
+					<label for="exitListenPort" class="mb-1.5 text-sm text-muted block"><span class="text-accent-dim">&gt;</span> exit link udp port</label>
+					<BaseInput id="exitListenPort" v-model="exitListenPortInput" type="number" class="w-full" :placeholder="currentLink ? String(currentLink.listenPort) : 'auto (51900-51999)'" />
+					<small class="text-muted text-xs block mt-1"> this exit node connects to a <span class="text-text">separate wg interface</span> on this host, on its own port. leave empty to allocate one automatically. </small>
+					<small class="text-down text-xs block mt-1">
+						you must make this port reachable from the exit node's machine - publish it on the wgfleet container (<span class="text-text">-p {{ currentLink?.listenPort ?? '&lt;port&gt;' }}:{{ currentLink?.listenPort ?? '&lt;port&gt;' }}/udp</span>)
+						and open it in the host firewall. nothing else about your clients changes.
+					</small>
+					<div v-if="currentLink" class="text-xs text-muted mt-1">
+						currently <span class="text-text">{{ currentLink.interfaceName }}</span> on udp <span class="text-text">{{ currentLink.listenPort }}</span>
+					</div>
+					<span v-if="errors.exitListenPort" class="text-down text-xs block mt-1">{{ errors.exitListenPort }}</span>
+				</div>
+
+				<div class="field">
+					<label for="exitDns" class="mb-1.5 text-sm text-muted block"><span class="text-accent-dim">&gt;</span> exit dns</label>
+					<BaseInput id="exitDns" v-model="form.exitDns" class="w-full" placeholder="leave empty to use the server's dns" />
+					<small class="text-muted text-xs">resolver handed to clients using this exit node. without one, their lookups go to whatever their local network provides</small>
+				</div>
+
+				<div class="field">
+					<small class="text-down text-xs block">
+						this machine has to forward and masquerade for others, and ticking the box above does not change its config by itself - reinstall its own config from the peer list (<span class="text-text">cfg + nat</span>) and restart its tunnel, or this
+						exit node's clients will simply time out. its endpoint port changes too.
+					</small>
+				</div>
+			</template>
 
 			<div class="field" v-else>
 				<label class="mb-1.5 text-sm text-muted block"><span class="text-accent-dim">&gt;</span> internet access</label>
 				<div class="flex flex-col gap-2">
 					<button type="button" class="flex items-center gap-2 text-sm text-text text-left" @click="form.exitPeerId = null">
 						<span class="text-accent-dim">{{ form.exitPeerId === null ? '(x)' : '( )' }}</span>
-						<span>none / via hub</span>
+						<span>none</span>
 					</button>
-					<button v-for="node in exitNodes" :key="node.id" type="button" class="flex items-center gap-2 text-sm text-text text-left" @click="form.exitPeerId = node.id">
-						<span class="text-accent-dim">{{ form.exitPeerId === node.id ? '(x)' : '( )' }}</span>
-						<span>via exit node {{ node.friendlyName ?? node.wgAddress }}</span>
+					<button v-for="node in exitNodes" :key="node.peer.id" type="button" class="flex items-center gap-2 text-sm text-text text-left" @click="form.exitPeerId = node.peer.id">
+						<span class="text-accent-dim">{{ form.exitPeerId === node.peer.id ? '(x)' : '( )' }}</span>
+						<span>via exit node {{ node.peer.friendlyName ?? node.peer.wgAddress }}</span>
+						<span v-if="!node.link" class="text-down text-xs">(no interface yet)</span>
 					</button>
 				</div>
 				<small class="text-muted text-xs block mt-1">
-					<span v-if="exitNodes.length === 0">no exit node on this server yet - mark a peer as one first</span>
-					<span v-else>picking an exit node gives this peer a second config file to switch to. without one it has no route to any exit node at all</span>
+					<span v-if="exitNodes.length === 0">no exit node on this server yet - mark a peer as one first. the hub itself does not route clients to the internet</span>
+					<span v-else>picking an exit node gives this peer a second config file to switch to. any exit node on this server will do, and switching later changes nothing else. without one it has no route to any exit node at all</span>
 				</small>
 			</div>
 
@@ -86,10 +113,11 @@ import { ref, reactive, watch, computed } from 'vue';
 import { useToast } from '@app/composables/useToast';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query';
 import type { Peer, ServerPeer } from '@server/db/schema';
-import { CIDR_REGEX, IPV4_ADDRESS_REGEX, parseCidrList } from '@server/lib/validation';
+import { CIDR_REGEX, IPV4_ADDRESS_REGEX, WG_LISTEN_PORT_MAX, WG_LISTEN_PORT_MIN, parseCidrList } from '@server/lib/validation';
 import { checkPeerInvariants } from '@server/lib/peerInvariants';
+import { exitLinkOf, exitTopologyOf } from '@server/lib/exitTopology';
 import { eden } from '@app/queries/edenClient';
-import { queryServerGrants, queryServerTags } from '@app/queries/queryPolicy';
+import { queryServerTags } from '@app/queries/queryPolicy';
 import { queryServerPeers } from '@app/queries/queryServers';
 import { invalidate } from '@app/queries/keys';
 import BaseButton from './BaseButton.vue';
@@ -111,9 +139,6 @@ const queryClient = useQueryClient();
 
 const { data: tags } = useQuery(queryServerTags(props.server.id));
 const { data: peers } = useQuery(queryServerPeers(props.server.id));
-// Only needed for the "already has an allow -> internet grant" invariant below - the one rule
-// in lib/peerInvariants.ts that reads something other than this server's peers.
-const { data: grants } = useQuery(queryServerGrants(props.server.id));
 
 const form = reactive<{
 	friendlyName?: string;
@@ -133,17 +158,27 @@ const form = reactive<{
 	advertisedRoutes: '',
 });
 
-// Every *other* peer on this server that is marked as an exit node - the server allows only
-// one, so this is 0 or 1 entries in practice, but rendering the list keeps the ui honest if a
-// direct db write ever produced more.
-const exitNodes = computed(() => (peers.value ?? []).filter((p) => p.isExitNode && p.id !== props.peer?.id));
+// Every *other* exit node on this server - any number of them, and this peer may point at any
+// one. Same projection the configs, the ruleset and the host's routing use
+// (lib/exitTopology.ts), so the ui can show whether each one's interface is provisioned yet.
+const exitNodes = computed(() => exitTopologyOf(peers.value ?? []).exitNodes.filter((node) => node.peer.id !== props.peer?.id));
+
+/** This peer's own exit link, once converge has allocated it - drives the port hint below. */
+const currentLink = computed(() => (props.peer ? exitLinkOf(props.peer) : null));
+
+// Empty string = "allocate one for me". Kept as a string so clearing the input is expressible
+// at all; the api takes null for the same meaning.
+const exitListenPortInput = ref('');
 
 // Being an exit node and using one are mutually exclusive (the api rejects both) - it would
 // be a routing loop, and the two roles need different AllowedIPs.
 const toggleExitNode = () => {
 	form.isExitNode = !form.isExitNode;
 	if (form.isExitNode) form.exitPeerId = null;
-	else form.exitDns = '';
+	else {
+		form.exitDns = '';
+		exitListenPortInput.value = '';
+	}
 };
 
 const toggleTag = (tagId: string) => {
@@ -154,6 +189,7 @@ const errors = reactive({
 	wgAddress: '',
 	isExitNode: '',
 	advertisedRoutes: '',
+	exitListenPort: '',
 });
 
 // The per-server state lib/peerInvariants.ts decides against, assembled from what this form
@@ -161,7 +197,6 @@ const errors = reactive({
 const invariantSnapshot = computed(() => ({
 	peers: peers.value ?? [],
 	tagIds: (tags.value ?? []).map((t) => t.id),
-	internetGrantPeerIds: (grants.value ?? []).filter((g) => g.enabled && g.action === 'allow' && g.srcKind === 'peer' && g.dstKind === 'internet' && g.srcPeerId).map((g) => g.srcPeerId!),
 }));
 
 const validate = () => {
@@ -169,6 +204,17 @@ const validate = () => {
 	errors.wgAddress = '';
 	errors.isExitNode = '';
 	errors.advertisedRoutes = '';
+	errors.exitListenPort = '';
+
+	// Range only - whether the port is free depends on every other interface on the host, so
+	// that check stays server-side (resolveExitListenPort in wg/peerIntake.ts).
+	if (form.isExitNode && exitListenPortInput.value.trim()) {
+		const port = Number(exitListenPortInput.value);
+		if (!Number.isInteger(port) || port < WG_LISTEN_PORT_MIN || port > WG_LISTEN_PORT_MAX) {
+			errors.exitListenPort = `Port must be between ${WG_LISTEN_PORT_MIN} and ${WG_LISTEN_PORT_MAX}, or empty to allocate one.`;
+			isValid = false;
+		}
+	}
 
 	if (form.wgAddress) {
 		if (!IPV4_ADDRESS_REGEX.test(form.wgAddress)) {
@@ -217,6 +263,7 @@ watch(
 			form.exitPeerId = peer.exitPeerId ?? null;
 			form.exitDns = peer.exitDns ?? '';
 			form.advertisedRoutes = peer.advertisedRoutes ?? '';
+			exitListenPortInput.value = peer.exitListenPort === null ? '' : String(peer.exitListenPort);
 			isEditMode.value = true;
 		} else {
 			isEditMode.value = false;
@@ -227,17 +274,19 @@ watch(
 			form.exitPeerId = null;
 			form.exitDns = '';
 			form.advertisedRoutes = '';
+			exitListenPortInput.value = '';
 		}
 		errors.wgAddress = '';
 		errors.isExitNode = '';
 		errors.advertisedRoutes = '';
+		errors.exitListenPort = '';
 	},
-	{ immediate: true }
+	{ immediate: true },
 );
 
 // exitDns and advertisedRoutes are clearable: '' from the input becomes null (clear), which
-// `typeof form`'s `string` doesn't allow.
-type PeerPayload = Omit<typeof form, 'exitDns' | 'advertisedRoutes'> & { exitDns: string | null; advertisedRoutes: string | null };
+// `typeof form`'s `string` doesn't allow. exitListenPort is the same idea with a number.
+type PeerPayload = Omit<typeof form, 'exitDns' | 'advertisedRoutes'> & { exitDns: string | null; advertisedRoutes: string | null; exitListenPort: number | null };
 
 const createPeer = useMutation({
 	mutationFn: async (data: PeerPayload) => {
@@ -282,7 +331,13 @@ const handleSubmit = () => {
 	if (!validate()) {
 		return;
 	}
-	const data = { ...form, exitDns: form.exitDns || null, advertisedRoutes: form.advertisedRoutes || null };
+	const data = {
+		...form,
+		exitDns: form.exitDns || null,
+		advertisedRoutes: form.advertisedRoutes || null,
+		// only meaningful for an exit node, and empty means "allocate one"
+		exitListenPort: form.isExitNode && exitListenPortInput.value.trim() ? Number(exitListenPortInput.value) : null,
+	};
 	if (data.wgAddress === '') {
 		data.wgAddress = undefined;
 	}

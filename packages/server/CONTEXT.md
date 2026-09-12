@@ -9,15 +9,19 @@ Deciding the wgAddress a peer gets - either validating a caller-requested addres
 _Avoid_: IP allocation (too generic - this is always scoped to one server's peers)
 
 **Exit Node**:
-A peer that lends its own internet uplink to other clients on the same interface (`peers.isExitNode`). It stays an entirely ordinary peer - reachable, and reaching others - and owns `AllowedIPs = 0.0.0.0/0` only in the *server-side* config, where longest-prefix matching keeps every other peer's `/32` winning. At most one per interface, because only one peer can own `0.0.0.0/0` on a wg interface.
-_Avoid_: gateway (ambiguous - the hub is also a gateway when `enableNat` is on), relay (implies it forwards vpn traffic, which is the hub's job)
+A peer that lends its own internet uplink to the other clients of its server (`peers.isExitNode`). It stays an entirely ordinary peer as far as anything else is concerned - reachable, and reaching others - but it does not live on its server's wg interface: it is the single peer of an **exit link** of its own, where it owns `AllowedIPs = 0.0.0.0/0` uncontested. Any number per server.
+_Avoid_: gateway (ambiguous - it is the gateway for its own clients, but so is the hub for peer-to-peer traffic), relay (implies it forwards vpn traffic, which is the hub's job)
 
 **Exit Client**:
 A peer whose `exitPeerId` names an exit node, meaning its internet-bound traffic is policy-routed into that node's tunnel. The column is both the permission and the routing instruction: without it no `ip rule` exists, so the peer has no route to any exit node and cannot reach one by editing its own config.
-_Avoid_: "peer with internet access" (that's the `enableNat` + `internet`-grant path, which goes out the hub's uplink instead)
+_Avoid_: "peer with internet access" (there is no other kind - hub egress was removed in `drizzle/0008_drop_hub_egress.sql`, so an exit client is the only peer that reaches the internet at all)
+
+**Exit Link**:
+The wg interface a single exit node has to itself on the hub (`peers.exitInterfaceName`, `wgx0`/`wgx1`/…), with its own keypair, UDP port and policy-routing table. Exists because wireguard picks the destination peer from the packet's destination address alone, so `0.0.0.0/0` has one owner per interface - an interface each removes the collision instead of rationing it. Allocated and released by `reconcileExitLinks` on converge, never by a write handler.
+_Avoid_: "exit interface" (reads as the uplink on the exit node's own machine, which is the opposite end), "tunnel" (every wg interface here is one)
 
 **Exit Route Table**:
-The per-interface policy-routing table (`serverPeers.routeTableId`, allocated from 52000-52999) holding the `default dev <iface>` route that exit clients' `ip rule`s point at. Per-interface rather than per-peer so unmarking and re-marking an exit node never churns the number under live traffic.
+The policy-routing table belonging to one exit link (`peers.exitRouteTableId`, allocated from 52000-52999) that its clients' `ip rule`s point at. Per exit node, not per server - the table's `default dev <link>` names one exit link, which is exactly what makes "any client picks any exit node" expressible. It holds a complete route set, not just that default: an exit client's rule captures all of its traffic, so the vpn subnet, every exit node's `/32` and every advertised prefix are in there too.
 _Avoid_: routing table (unqualified - the main table matters here too, and confusing the two is the `Table = off` bug)
 
 **Advertised Subnet Route**:

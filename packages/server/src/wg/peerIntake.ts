@@ -1,9 +1,11 @@
 import { db } from '@server/db';
-import { peersTable, policyGrantsTable, peerTagsTable, type Peer, type ServerPeer } from '@server/db/schema';
-import { and, eq } from 'drizzle-orm';
+import { peersTable, peerTagsTable, type Peer, type ServerPeer } from '@server/db/schema';
+import { eq } from 'drizzle-orm';
 import { checkPeerInvariants } from '@server/lib/peerInvariants';
 import { advertisedRoutesOf } from '@server/lib/exitTopology';
 import { resolveAdvertisedRoutes, resolvePeerAddress } from './addressing';
+import { loadExitLinkTaken } from './exitLinks';
+import { WG_LISTEN_PORT_MAX, WG_LISTEN_PORT_MIN } from '@server/lib/validation';
 
 /**
  * Everything a peer write can set. `undefined` means "leave unchanged" on update and "use the
@@ -17,6 +19,8 @@ export type PeerWriteRequest = {
 	exitPeerId?: string | null;
 	exitDns?: string | null;
 	advertisedRoutes?: string | null;
+	/** operator-pinned udp port for this exit node's link; null/undefined = allocate one */
+	exitListenPort?: number | null;
 };
 
 /** The column values to write, already defaulted, validated and normalised. */
@@ -27,6 +31,7 @@ export type ResolvedPeerWrite = {
 	exitPeerId: string | null;
 	exitDns: string | null;
 	advertisedRoutes: string | null;
+	exitListenPort: number | null;
 	/** undefined = leave assignments alone, [] = clear them all (unrestrict) */
 	tagIds: string[] | undefined;
 };
@@ -55,17 +60,28 @@ export async function resolvePeerWrite(server: ServerPeer, current: Peer | null,
 		const peers = await db.query.peersTable.findMany({ where: eq(peersTable.serverPeerId, server.id), columns: { wgAddress: true } });
 		const taken = new Set(peers.map((p) => p.wgAddress).filter((address) => address !== current?.wgAddress));
 
+		// The interface's own address is as taken as any peer's. `reservedIps` usually hides
+		// this - the default 50 puts the whole allocation window above a hub sitting on .1 - but
+		// it's a convention, not a constraint: lower it, or give the server a high address in
+		// its own range, and auto-allocation hands a peer the hub's ip. wireguard then has two
+		// owners for one address and neither that peer nor anything relying on the hub's own
+		// address works.
+		taken.add(server.wgAddress);
+
 		const resolved = resolvePeerAddress(server.cidrRange, server.reservedIps, taken, { requested: request.wgAddress });
 		if (!resolved.ok) return { ok: false, message: resolved.message };
 
 		wgAddress = resolved.ip;
 	}
 
-	const invariantError = checkPeerInvariants(await loadInvariantSnapshot(server, current), current, request);
+	const invariantError = checkPeerInvariants(await loadInvariantSnapshot(server), current, request);
 	if (invariantError) return { ok: false, message: invariantError };
 
 	const advertised = await resolveAdvertisedRoutesFor(server, current, request);
 	if (!advertised.ok) return advertised;
+
+	const exitListenPort = await resolveExitListenPort(current, request);
+	if (!exitListenPort.ok) return exitListenPort;
 
 	return {
 		ok: true,
@@ -76,39 +92,42 @@ export async function resolvePeerWrite(server: ServerPeer, current: Peer | null,
 			exitPeerId: request.exitPeerId === undefined ? (current?.exitPeerId ?? null) : request.exitPeerId,
 			exitDns: request.exitDns === undefined ? (current?.exitDns ?? null) : request.exitDns,
 			advertisedRoutes: advertised.value,
+			exitListenPort: exitListenPort.value,
 			tagIds: request.tagIds,
 		},
 	};
 }
 
 /**
- * The per-server state lib/peerInvariants.ts decides against. Only the directly-named internet
- * grants are loaded - see that module for why a tag-derived one isn't checkable here.
+ * The udp port this peer's exit link should listen on. Validated here rather than left to
+ * reconcileExitLinks so a bad port is a 400 on the request that asked for it, instead of a
+ * warning in the log an hour later - the operator has to publish this port, so silently
+ * getting a different one is worse than being refused.
+ *
+ * Changing it on a live exit node is deliberately allowed: the link is re-provisioned on the
+ * next converge, which is exactly what an operator moving the port in their firewall wants.
+ * Clearing it (null) hands the choice back to the allocator.
  */
-async function loadInvariantSnapshot(server: ServerPeer, current: Peer | null) {
-	const [peers, tags, internetGrants] = await Promise.all([
-		db.query.peersTable.findMany({ where: eq(peersTable.serverPeerId, server.id) }),
-		db.query.peerTagsTable.findMany({ where: eq(peerTagsTable.serverPeerId, server.id), columns: { id: true } }),
-		current
-			? db.query.policyGrantsTable.findMany({
-					where: and(
-						eq(policyGrantsTable.serverPeerId, server.id),
-						eq(policyGrantsTable.srcKind, 'peer'),
-						eq(policyGrantsTable.srcPeerId, current.id),
-						eq(policyGrantsTable.dstKind, 'internet'),
-						eq(policyGrantsTable.action, 'allow'),
-						eq(policyGrantsTable.enabled, true)
-					),
-					columns: { srcPeerId: true },
-				})
-			: Promise.resolve([]),
-	]);
+async function resolveExitListenPort(current: Peer | null, request: PeerWriteRequest): Promise<{ ok: true; value: number | null } | { ok: false; message: string }> {
+	if (request.exitListenPort === undefined) return { ok: true, value: current?.exitListenPort ?? null };
+	if (request.exitListenPort === null) return { ok: true, value: null };
 
-	return {
-		peers,
-		tagIds: tags.map((t) => t.id),
-		internetGrantPeerIds: internetGrants.map((g) => g.srcPeerId).filter((id): id is string => !!id),
-	};
+	const port = request.exitListenPort;
+	if (!Number.isInteger(port) || port < WG_LISTEN_PORT_MIN || port > WG_LISTEN_PORT_MAX) {
+		return { ok: false, message: `exitListenPort must be between ${WG_LISTEN_PORT_MIN} and ${WG_LISTEN_PORT_MAX}` };
+	}
+
+	const taken = await loadExitLinkTaken(current?.id);
+	if (taken.listenPorts.has(port)) return { ok: false, message: `Port ${port} is already in use by another interface` };
+
+	return { ok: true, value: port };
+}
+
+/** The per-server state lib/peerInvariants.ts decides against. */
+async function loadInvariantSnapshot(server: ServerPeer) {
+	const [peers, tags] = await Promise.all([db.query.peersTable.findMany({ where: eq(peersTable.serverPeerId, server.id) }), db.query.peerTagsTable.findMany({ where: eq(peerTagsTable.serverPeerId, server.id), columns: { id: true } })]);
+
+	return { peers, tagIds: tags.map((t) => t.id) };
 }
 
 /**

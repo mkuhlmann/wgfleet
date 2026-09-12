@@ -1,4 +1,4 @@
-import { EXIT_ROUTE_TABLE_MAX, EXIT_ROUTE_TABLE_MIN } from '@server/db/servers';
+import { EXIT_ROUTE_TABLE_MAX, EXIT_ROUTE_TABLE_MIN } from './exitLinks';
 import { createLog } from '@server/lib/log';
 import { applyExitRouting } from './shell';
 import { exitTopology, type PolicyGraph } from '@server/db/policyGraph';
@@ -6,20 +6,28 @@ import { exitTopology, type PolicyGraph } from '@server/db/policyGraph';
 const log = createLog('wg:exitRouting');
 
 /**
- * Exit-node routing. A peer marked `isExitNode` owns `AllowedIPs = 0.0.0.0/0` on the server
- * side (see wg/config.ts), which is what lets wireguard *encrypt* internet-bound traffic to
- * it - but the kernel still has to *route* that traffic to the wg interface in the first
- * place, and the main table sends it out the host's own uplink instead. So for every peer
- * whose `exitPeerId` names the exit node we install a source-based policy route:
+ * Exit-node routing: which wg interface a packet leaves through, and which clients get to use
+ * it. Each exit node has an interface of its own (an exit link, wg/exitLinks.ts) whose single
+ * peer owns `AllowedIPs = 0.0.0.0/0` - so once a packet is *on* that device wireguard knows
+ * where to send it. Getting it onto the right device is this module's job, and it is a
+ * source-based policy route per client:
  *
- *   ip -4 route replace default dev wg0 table 52000     (once per interface)
- *   ip -4 rule add from 10.0.0.3/32 table 52000         (once per exit client)
+ *   ip -4 route replace default dev wgx0 table 52000     (once per exit link)
+ *   ip -4 rule add from 10.0.0.3/32 table 52000          (once per client of that exit node)
+ *   ip -4 rule add from 10.0.0.4/32 table 52001          (a client of a *different* exit node)
  *
- * That `ip rule` is the whole enforcement story for this feature. A peer without an
- * exitPeerId has no rule, so its internet-bound packets fall through to the main table,
- * leave via a non-wg interface and are dropped by the egress guard in wg/firewall.ts. It
- * cannot reach the exit node's uplink by hand-editing its own AllowedIPs, which is why
- * `exitPeerId` can be both the permission and the routing instruction.
+ * Two clients on the same server landing in different tables is the whole of "any peer can
+ * pick any exit node" - and it only works because the tables name different interfaces. A
+ * single shared interface could not express it no matter what the routing said, since the peer
+ * within an interface is chosen by destination address alone and every exit client has the
+ * same destination.
+ *
+ * That `ip rule` is also the whole enforcement story. A peer without an exitPeerId has no rule,
+ * so its internet-bound packets fall through to the main table and leave via a non-wg interface
+ * with their vpn source address, which nothing masquerades and nothing can route a reply back
+ * to (the hub is not a gateway - see wg/firewall.ts). It cannot reach any exit node's uplink by
+ * hand-editing its own AllowedIPs, which is why `exitPeerId` can be both the permission and the
+ * routing instruction.
  *
  * Rejected alternative: marking exit clients in nftables (`meta mark set`) and matching
  * `ip rule fwmark`, which would move all per-client churn into the atomically-replaced
@@ -36,23 +44,44 @@ const log = createLog('wg:exitRouting');
  * permission for reaching an advertised LAN is an ordinary `dstKind: 'cidr'` grant in the
  * firewall, not the route. Both halves live here because both exist for the same reason
  * (`Table = off` means wg-quick installs no routes, so this manager installs them) and both
- * have to be applied after the device is up.
+ * have to be applied after the device is up. An exit link's own `/32` route rides along for a
+ * third variation on the same reason: its peer left the server's interface, so the connected
+ * route that used to make it reachable no longer covers it.
  *
  * Like wg/firewall.ts this splits into a pure builder (buildExitRouting - no db, no io, what
  * exitRouting.test.ts drives) and a thin loader/applier.
  */
+/**
+ * One server's routing, as a set of interfaces. A server owns its own wg interface plus one
+ * **exit link** per exit node (wg/exitLinks.ts), and each needs main-table routes; each link
+ * additionally owns a policy table that its clients are steered into.
+ */
 export type ExitRoutingServer = {
+	/** the server's own wg interface - where every non-exit peer lives */
 	interfaceName: string;
+	/** the vpn subnet, reachable through the interface above */
+	cidrRange: string;
+	/**
+	 * Main-table destinations this interface carries, all `proto static`: the subnets advertised
+	 * by its ordinary peers. Already network-aligned and overlap-checked (wg/addressing.ts's
+	 * resolveAdvertisedRoutes).
+	 */
+	staticRoutes: string[];
+	exitLinks: ExitRoutingLink[];
+};
+
+export type ExitRoutingLink = {
+	interfaceName: string;
+	/**
+	 * The exit node's own `/32` - without it nothing on the host can reach that peer, since it
+	 * left the server's interface and is no longer covered by its connected route - plus any
+	 * subnet it advertises.
+	 */
+	staticRoutes: string[];
+	/** the policy table whose default route points at this link */
 	routeTableId: number;
-	// null when this server has no exit node - the table is then drained and left empty
-	exitPeerIp: string | null;
-	// ips of the peers whose exitPeerId names that exit node
+	/** ips of the peers assigned to this exit node */
 	clientIps: string[];
-	// every subnet route advertised by any peer on this interface, already network-aligned
-	// and overlap-checked (see wg/addressing.ts's resolveAdvertisedRoutes). Which peer
-	// advertises which prefix doesn't matter here - the hub only has to get the packet onto
-	// the interface, and wireguard's own cryptokey routing picks the owner from there.
-	advertisedRoutes: string[];
 };
 
 // `ip rule` has no upsert and no "delete every rule for table N", so draining is a bounded
@@ -65,18 +94,22 @@ const drainRules = (tableId: number) => `i=0; while [ $i -lt 512 ] && ip -4 rule
 const flushRoutes = (tableId: number) => `ip -4 route flush table ${tableId} 2>/dev/null || true`;
 
 /**
- * Advertised subnet routes go in the **main** table, which cannot be flushed wholesale - so
- * they are tagged `proto static` and only that proto is drained. Nothing else on a wg
- * interface carries it: the connected route from the interface's `Address` is `proto kernel`,
- * and anything `ip route add`ed without an explicit proto (including wg-quick's own routes,
- * which `Table = off` suppresses anyway) is `proto boot`. The tag is therefore this manager's
- * marker for "a route I put here", which is what lets the same full-reconcile-every-sync
- * philosophy as the exit tables above apply to a table it doesn't own: everything it added is
- * removable without a record of what it added.
+ * Routes in the **main** table cannot be flushed wholesale - so everything this manager puts
+ * there is tagged `proto static` and only that proto is drained. Nothing else on a wg interface
+ * carries it: the connected route from an interface's `Address` is `proto kernel`, and anything
+ * `ip route add`ed without an explicit proto (including wg-quick's own routes, which
+ * `Table = off` suppresses anyway) is `proto boot`. The tag is therefore this manager's marker
+ * for "a route I put here", which is what lets the same full-reconcile-every-sync philosophy as
+ * the exit tables below apply to a table it doesn't own: everything it added is removable
+ * without a record of what it added.
+ *
+ * The per-exit-node tables need no such marker - they are ours entirely and get flushed whole.
  */
 const STATIC_ROUTE_PROTO = 'static';
 
-const flushAdvertisedRoutes = (interfaceName: string) => `ip -4 route flush dev ${interfaceName} proto ${STATIC_ROUTE_PROTO} 2>/dev/null || true`;
+const flushStaticRoutes = (interfaceName: string) => `ip -4 route flush dev ${interfaceName} proto ${STATIC_ROUTE_PROTO} 2>/dev/null || true`;
+
+const inBand = (tableId: number) => tableId >= EXIT_ROUTE_TABLE_MIN && tableId <= EXIT_ROUTE_TABLE_MAX;
 
 /**
  * Pure command builder - no db, no io. Full reconcile rather than incremental add/delete,
@@ -84,49 +117,67 @@ const flushAdvertisedRoutes = (interfaceName: string) => `ip -4 route flush dev 
  * drained before it is repopulated, so the applied state is a function of the db alone and
  * can't drift no matter which mutation path got us here.
  *
- * Callers must pass every server that has a routing table allocated, including ones with no
- * exit node - that is how a table gets emptied after its exit node is unmarked.
+ * Callers must pass every server, including ones with no exit nodes and nothing advertised -
+ * that is how a table gets emptied after its exit node loses its last client, and how a route
+ * left over from a withdrawn advertisement goes away.
  */
 export const buildExitRouting = (servers: ExitRoutingServer[]): string[] => {
 	const commands: string[] = [];
 
 	for (const server of servers) {
-		// Advertised routes first, because they don't involve a routing table at all and so
-		// must survive the band check below. Drained unconditionally - a server with no
-		// advertisers is exactly the case where a route left over from a removed advertisement
-		// has to go, and that is not distinguishable from "never had one" without keeping
-		// state. Harmless where the feature was never used (nothing carries proto static).
-		commands.push(flushAdvertisedRoutes(server.interfaceName));
+		const interfaces = [{ interfaceName: server.interfaceName, staticRoutes: server.staticRoutes }, ...server.exitLinks];
 
-		for (const cidr of [...new Set(server.advertisedRoutes)].sort()) {
-			// `replace` for the same reason as the default route below, and because two
-			// interfaces are api-prevented from advertising the same prefix but a changed
-			// interfaceName still has to retarget the existing route rather than error.
-			commands.push(`ip -4 route replace ${cidr} dev ${server.interfaceName} proto ${STATIC_ROUTE_PROTO}`);
+		// Main table first. Drained unconditionally - an interface with nothing on it is exactly
+		// the case where a route left over from a removed advertisement has to go, and that is
+		// not distinguishable from "never had one" without keeping state. Harmless where the
+		// feature was never used (nothing carries proto static).
+		for (const iface of interfaces) {
+			commands.push(flushStaticRoutes(iface.interfaceName));
+
+			for (const cidr of [...new Set(iface.staticRoutes)].sort()) {
+				// `replace` rather than `add` because a changed interfaceName has to retarget the
+				// existing route rather than error on a duplicate.
+				commands.push(`ip -4 route replace ${cidr} dev ${iface.interfaceName} proto ${STATIC_ROUTE_PROTO}`);
+			}
 		}
 
-		// Defensive: a routeTableId outside the allocated band means the row predates the
-		// column's backfill or was written directly. Touching an arbitrary table number could
-		// clobber routing this manager doesn't own, so skip the exit-node half entirely - the
-		// advertised routes above need no table and are unaffected.
-		if (server.routeTableId < EXIT_ROUTE_TABLE_MIN || server.routeTableId > EXIT_ROUTE_TABLE_MAX) continue;
+		for (const link of server.exitLinks) {
+			// Defensive: a routeTableId outside the allocated band means the row was written
+			// directly or predates the band. Touching an arbitrary table number could clobber
+			// routing this manager doesn't own, so skip the table entirely - the main-table
+			// routes above need no table and are unaffected.
+			if (!inBand(link.routeTableId)) continue;
 
-		commands.push(drainRules(server.routeTableId));
+			commands.push(drainRules(link.routeTableId));
 
-		const clientIps = [...new Set(server.clientIps)].sort();
+			const clientIps = [...new Set(link.clientIps)].sort();
 
-		if (!server.exitPeerIp || clientIps.length === 0) {
-			commands.push(flushRoutes(server.routeTableId));
-			continue;
-		}
+			if (clientIps.length === 0) {
+				commands.push(flushRoutes(link.routeTableId));
+				continue;
+			}
 
-		// `replace` rather than `add` so a changed interfaceName overwrites the old default
-		// route instead of erroring on a duplicate. Requires the device to exist, which is why
-		// syncExitRouting runs at the end of converge(), after the interface is up.
-		commands.push(`ip -4 route replace default dev ${server.interfaceName} table ${server.routeTableId}`);
+			// An exit client's rule captures *all* of its traffic, so this table has to be a
+			// complete routing table and not just a default route - otherwise a client would
+			// reach the internet but lose every one of its peers, its hub and every advertised
+			// LAN, all of which live on interfaces this link is not. Cheap to state fully, and
+			// it keeps the table a pure function of the snapshot rather than something that
+			// leans on the main table falling through.
+			commands.push(`ip -4 route replace ${server.cidrRange} dev ${server.interfaceName} table ${link.routeTableId}`);
 
-		for (const ip of clientIps) {
-			commands.push(`ip -4 rule add from ${ip}/32 table ${server.routeTableId}`);
+			for (const iface of interfaces) {
+				for (const cidr of [...new Set(iface.staticRoutes)].sort()) {
+					commands.push(`ip -4 route replace ${cidr} dev ${iface.interfaceName} table ${link.routeTableId}`);
+				}
+			}
+
+			// Last and least specific. Requires the device to exist, which is why
+			// syncExitRouting runs at the end of converge(), after every interface is up.
+			commands.push(`ip -4 route replace default dev ${link.interfaceName} table ${link.routeTableId}`);
+
+			for (const ip of clientIps) {
+				commands.push(`ip -4 rule add from ${ip}/32 table ${link.routeTableId}`);
+			}
 		}
 	}
 
@@ -141,21 +192,52 @@ export const buildExitRouting = (servers: ExitRoutingServer[]): string[] => {
  */
 export const buildExitRoutingTeardown = (tableIds: number[]): string[] => tableIds.filter((id) => id >= EXIT_ROUTE_TABLE_MIN && id <= EXIT_ROUTE_TABLE_MAX).flatMap((id) => [drainRules(id), flushRoutes(id)]);
 
+/**
+ * One server's interfaces, flattened: its own plus one per provisioned exit node. Same
+ * derivation the configs and the nft ruleset use - see lib/exitTopology.ts - so all three
+ * always agree on which peer lives on which interface.
+ *
+ * Only clients pointing at an exit node *of this server* count, which that projection already
+ * guarantees: exitPeerId is api-validated to name a peer on the same server, but a stale id
+ * must not silently route a client into a table whose default route belongs to somebody else's
+ * uplink.
+ */
 const toExitRoutingServer = (graph: PolicyGraph): ExitRoutingServer => {
-	// Same derivation the server config and the nft ruleset use - see lib/exitTopology.ts.
-	// Only clients pointing at *this* server's exit node count, which that projection already
-	// guarantees: exitPeerId is api-validated to name a peer on the same server, but a stale id
-	// must not silently route a client into a table whose default route belongs to a different
-	// interface.
-	const exit = exitTopology(graph);
+	const topology = exitTopology(graph);
 
 	return {
 		interfaceName: graph.server.interfaceName,
-		routeTableId: graph.server.routeTableId,
-		exitPeerIp: exit.exitPeerIp,
-		clientIps: exit.clientIps,
-		advertisedRoutes: exit.advertisedRoutes,
+		cidrRange: graph.server.cidrRange,
+		staticRoutes: topology.interfaceAdvertisedRoutes,
+		exitLinks: topology.exitNodes.flatMap((node) =>
+			node.link
+				? [
+						{
+							interfaceName: node.link.interfaceName,
+							// The exit node's own /32 first: its server's connected route no longer covers
+							// it (it is not a peer of that interface any more), so without this nothing on
+							// the host - and therefore no other peer - can reach it at all.
+							staticRoutes: [`${node.ip}/32`, ...node.advertisedRoutes],
+							routeTableId: node.link.routeTableId,
+							clientIps: node.clientIps,
+						},
+					]
+				: [],
+		),
 	};
+};
+
+/** A /proc/sys integer, or null where /proc isn't readable (container, non-linux). */
+const readSysctl = async (path: string): Promise<number | null> => {
+	try {
+		const file = Bun.file(`/proc/sys/${path}`);
+		if (!(await file.exists())) return null;
+
+		const value = Number.parseInt((await file.text()).trim(), 10);
+		return Number.isNaN(value) ? null : value;
+	} catch {
+		return null;
+	}
 };
 
 /**
@@ -165,21 +247,43 @@ const toExitRoutingServer = (graph: PolicyGraph): ExitRoutingServer => {
  * Loose (2) or off (0) is required. Advertised subnet routes have exactly the same problem
  * for exactly the same reason - a reply from 192.168.1.x arrives on wg0 while the host's own
  * table may route that source elsewhere - so an advertisement-only interface needs the same
- * warning. This is the single most likely reason a correct setup looks broken, and it isn't
- * something this manager should silently change on the host's behalf - so warn loudly and
- * leave it to the operator.
+ * warning. This isn't something this manager should silently change on the host's behalf - so
+ * warn loudly and leave it to the operator.
+ *
+ * The effective setting is `max(conf.all.rp_filter, conf.<iface>.rp_filter)`, not the
+ * per-interface value alone - a host with `all = 1` filters strictly no matter what wg0 says,
+ * which is exactly the configuration this check used to declare healthy.
  */
 const warnOnStrictReversePath = async (interfaceName: string, reason: string) => {
-	try {
-		const file = Bun.file(`/proc/sys/net/ipv4/conf/${interfaceName}/rp_filter`);
-		if (!(await file.exists())) return;
+	const [all, iface] = await Promise.all([readSysctl('net/ipv4/conf/all/rp_filter'), readSysctl(`net/ipv4/conf/${interfaceName}/rp_filter`)]);
+	if (all === null && iface === null) return;
 
-		if ((await file.text()).trim() === '1') {
-			log.warn(`net.ipv4.conf.${interfaceName}.rp_filter is 1 (strict) and this interface ${reason} - the replies will be dropped. Set it to 2 (loose) or 0.`);
-		}
-	} catch {
-		// unreadable /proc (container, non-linux) - nothing to warn about we can be sure of
+	if (Math.max(all ?? 0, iface ?? 0) === 1) {
+		log.warn(
+			`Reverse-path filtering is strict for ${interfaceName} (net.ipv4.conf.all.rp_filter=${all ?? '?'}, net.ipv4.conf.${interfaceName}.rp_filter=${iface ?? '?'}) and this interface ${reason} - the replies will be dropped. Set both to 2 (loose) or 0.`,
+		);
 	}
+};
+
+/**
+ * Both features in this module are *forwarding*: a packet arrives on a wg interface addressed
+ * to somewhere else - the exit node, or a LAN behind an advertiser - and the host has to put
+ * it back out. With `net.ipv4.ip_forward = 0` the kernel drops it silently, and every visible
+ * symptom looks healthy: the handshake is live, `ip rule`/`ip route` are exactly right, the
+ * nft ruleset accepts. The only signal is that the client times out.
+ *
+ * Checked host-wide (the sysctl is), and only once something actually needs forwarding, so a
+ * plain hub-only deployment - where nothing is forwarded and the setting is irrelevant - stays
+ * silent. Like rp_filter above this is the operator's to set, not ours to change underneath
+ * them: the container needs `--sysctl net.ipv4.ip_forward=1`, a bare host a sysctl.d drop-in.
+ */
+const warnOnForwardingDisabled = async (reasons: string[]) => {
+	if (reasons.length === 0) return;
+
+	const value = await readSysctl('net/ipv4/ip_forward');
+	if (value === null || value !== 0) return;
+
+	log.warn(`net.ipv4.ip_forward is 0 on this host, but ${reasons.join(' and ')} - nothing will be forwarded and those clients will simply time out. Set it to 1 (container: --sysctl net.ipv4.ip_forward=1).`);
 };
 
 /**
@@ -195,10 +299,30 @@ export const syncExitRouting = async (fleet: PolicyGraph[]) => {
 		const servers = fleet.map(toExitRoutingServer);
 		await applyExitRouting(buildExitRouting(servers));
 
+		const forwardingReasons: string[] = [];
+
 		for (const server of servers) {
-			if (server.exitPeerIp) await warnOnStrictReversePath(server.interfaceName, 'has an exit node');
-			else if (server.advertisedRoutes.length) await warnOnStrictReversePath(server.interfaceName, 'has a peer advertising subnet routes');
+			if (server.staticRoutes.length) {
+				await warnOnStrictReversePath(server.interfaceName, 'has a peer advertising subnet routes');
+				forwardingReasons.push(`${server.interfaceName} has advertised subnet routes`);
+			}
+
+			for (const link of server.exitLinks) {
+				// its own /32 is always there, so anything beyond one entry is a real advertisement
+				const advertises = link.staticRoutes.length > 1;
+
+				if (link.clientIps.length) {
+					await warnOnStrictReversePath(link.interfaceName, 'is an exit node link');
+					forwardingReasons.push(`${link.interfaceName} routes ${link.clientIps.length} client(s) through an exit node`);
+				} else if (advertises) {
+					await warnOnStrictReversePath(link.interfaceName, 'has a peer advertising subnet routes');
+				}
+
+				if (advertises) forwardingReasons.push(`${link.interfaceName} has advertised subnet routes`);
+			}
 		}
+
+		await warnOnForwardingDisabled(forwardingReasons);
 	} catch (error) {
 		log.error(`Failed to apply exit routing: ${error}`);
 	}

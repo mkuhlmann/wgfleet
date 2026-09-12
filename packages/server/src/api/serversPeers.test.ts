@@ -22,10 +22,7 @@ describe('serversPeersRoute', () => {
 			})
 			.execute();
 
-		await db
-			.insert(peerTagsTable)
-			.values({ id: 'serversPeersRoute-tag', serverPeerId: 'serversPeersRoute-server', name: 'office' })
-			.execute();
+		await db.insert(peerTagsTable).values({ id: 'serversPeersRoute-tag', serverPeerId: 'serversPeersRoute-server', name: 'office' }).execute();
 	});
 
 	const app = serversPeersRoute;
@@ -39,7 +36,7 @@ describe('serversPeersRoute', () => {
 					method: 'POST',
 					headers: { ...auth, 'content-type': 'application/json' },
 					body: JSON.stringify({ friendlyName: 'laptop', tagIds: ['serversPeersRoute-tag'] }),
-				})
+				}),
 			);
 			expect(response.status).toBe(200);
 			const peer = await response.json();
@@ -60,7 +57,7 @@ describe('serversPeersRoute', () => {
 					method: 'POST',
 					headers: { ...auth, 'content-type': 'application/json' },
 					body: JSON.stringify({ tagIds: ['does-not-exist'] }),
-				})
+				}),
 			);
 			expect(response.status).toBe(400);
 		});
@@ -71,7 +68,7 @@ describe('serversPeersRoute', () => {
 					method: 'POST',
 					headers: { authorization: 'Bearer adminToken', 'content-type': 'application/json' },
 					body: JSON.stringify({}),
-				})
+				}),
 			);
 			expect(response.status).toBe(404);
 		});
@@ -96,7 +93,7 @@ describe('serversPeersRoute', () => {
 					method: 'PATCH',
 					headers: { ...auth, 'content-type': 'application/json' },
 					body: JSON.stringify({ friendlyName: 'renamed' }),
-				})
+				}),
 			);
 			expect(response.status).toBe(200);
 			const [updated] = await response.json();
@@ -127,7 +124,7 @@ describe('serversPeersRoute', () => {
 					method: 'PATCH',
 					headers: { authorization: 'Bearer serversPeersRoute-otherToken', 'content-type': 'application/json' },
 					body: JSON.stringify({ friendlyName: 'should not apply' }),
-				})
+				}),
 			);
 			expect(response.status).toBe(404);
 		});
@@ -140,6 +137,55 @@ describe('serversPeersRoute', () => {
 			const response = await app.handle(new Request(`http://localhost/wg/servers/wg7/peers/${peer.id}/config`, { headers: auth }));
 			expect(response.status).toBe(200);
 			expect(await response.text()).toContain('[Interface]');
+		});
+	});
+
+	describe('address allocation', () => {
+		// The interface's own address is not a peer, so nothing in the peers table reserves it
+		// - and reservedIps is a convention, not a constraint. Both peers below would otherwise
+		// be handed 10.79.79.1, the hub's own ip.
+		const narrowAuth = { authorization: 'Bearer serversPeersRoute-narrowToken', 'content-type': 'application/json' };
+
+		beforeAll(async () => {
+			await db
+				.insert(serverPeersTable)
+				.values({
+					id: 'serversPeersRoute-narrowServer',
+					interfaceName: 'wg7c',
+					cidrRange: '10.79.79.0/24',
+					reservedIps: 1,
+					wgAddress: '10.79.79.1',
+					wgListenPort: 51879,
+					wgEndpoint: 'testhost:51879',
+					wgPrivateKey: 'privateKey',
+					wgPublicKey: 'publicKey',
+					authToken: 'serversPeersRoute-narrowToken',
+				})
+				.execute();
+		});
+
+		it("skips the server's own address when auto-allocating", async () => {
+			const response = await app.handle(
+				new Request('http://localhost/wg/servers/serversPeersRoute-narrowServer/peers', {
+					method: 'POST',
+					headers: narrowAuth,
+					body: JSON.stringify({ friendlyName: 'first' }),
+				}),
+			);
+			expect(response.status).toBe(200);
+			expect((await response.json()).wgAddress).toBe('10.79.79.2');
+		});
+
+		it("rejects a peer that explicitly asks for the server's own address", async () => {
+			const response = await app.handle(
+				new Request('http://localhost/wg/servers/serversPeersRoute-narrowServer/peers', {
+					method: 'POST',
+					headers: narrowAuth,
+					body: JSON.stringify({ friendlyName: 'greedy', wgAddress: '10.79.79.1' }),
+				}),
+			);
+			expect(response.status).toBe(400);
+			expect(await response.text()).toContain('IP already in use');
 		});
 	});
 

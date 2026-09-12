@@ -21,34 +21,47 @@ export type FirewallTag = {
 export type FirewallGrant = {
 	action: 'allow' | 'deny';
 	src: { kind: 'tag'; tagId: string } | { kind: 'peer'; ip: string };
-	dst: { kind: 'tag'; tagId: string } | { kind: 'peer'; ip: string } | { kind: 'cidr'; cidr: string } | { kind: 'server' } | { kind: 'internet' } | { kind: 'any' };
+	dst: { kind: 'tag'; tagId: string } | { kind: 'peer'; ip: string } | { kind: 'cidr'; cidr: string } | { kind: 'server' } | { kind: 'any' };
 	protocol: 'any' | 'tcp' | 'udp' | 'icmp';
 	ports: string | null;
 	comment: string | null;
+};
+
+/**
+ * One exit node, from the ruleset's point of view: the interface its traffic leaves through and
+ * the clients allowed down it. One per exit node rather than one per server, because that is
+ * how many interfaces there are - see wg/exitLinks.ts.
+ */
+export type FirewallExitNode = {
+	/** the exit link's interface name - the `oifname` exit traffic leaves through */
+	interfaceName: string;
+	/** the exit node's own ip. Traffic *to* it is ordinary peer traffic, governed by grants. */
+	ip: string;
+	/**
+	 * ips of the peers whose `exitPeerId` names this exit node. Their internet-bound traffic
+	 * leaves via this exit link, so no destination a grant can name matches it - `any` and
+	 * `server` are about the hub itself, and everything else is a prefix inside the vpn. It
+	 * needs the explicit accept emitted at the bottom of `fwd_s{i}`. Deliberately *not* folded
+	 * into governedIps: assigning an exit node must not change whether a peer is governed.
+	 */
+	clientIps: string[];
 };
 
 export type FirewallServer = {
 	interfaceName: string;
 	cidrRange: string;
 	wgAddress: string;
-	enableNat: boolean;
 	tags: FirewallTag[];
 	// already in evaluation order (ascending `position`, enabled only) - see toFirewallServer
 	grants: FirewallGrant[];
 	// ips of peers that must be default-denied once nothing in `grants` matches - see the
 	// "governed" note above. Anyone not in this set falls through to `return`, unrestricted.
 	governedIps: string[];
-	// ips of peers whose `exitPeerId` names this server's exit node (wg/exitRouting.ts).
-	// Their internet-bound traffic leaves *via* this wg interface (to the exit node) rather
-	// than via a non-wg one, so it matches neither an `internet`-dst grant (compiled to
-	// `oifname != <managed>`) nor the base chain's egress guard - it needs the explicit
-	// accept emitted at the bottom of `fwd_s{i}` below. Deliberately *not* folded into
-	// governedIps: assigning an exit node must not change whether a peer is governed.
-	exitClientIps: string[];
-	// the exit node's own ip, or null - the accept below has to exclude traffic aimed at the
-	// tunnel itself, which is ordinary peer-to-peer traffic and governed by grants as usual
-	exitPeerIp: string | null;
-	// every subnet route advertised by a peer on this interface (`peers.advertisedRoutes`).
+	// this server's exit nodes, in the order lib/exitTopology.ts produces (the nft set names
+	// below are ordinal). Any number of them - each has its own interface.
+	exitNodes: FirewallExitNode[];
+	// every subnet route advertised by a peer on this server (`peers.advertisedRoutes`),
+	// wherever that peer lives.
 	// Advertising needs no rule of its own - a `dstKind: 'cidr'` grant already compiles to
 	// `ip daddr <cidr> accept`, and replies from the LAN are `ct state established,related`.
 	// It appears here only to be *excluded* from the exit-clients accept below: an advertised
@@ -92,9 +105,6 @@ const renderExcluded = (cidrs: string[]): string | undefined => {
  * stable order) and returns the full `table inet wgmgr` nft script as text.
  */
 export const buildRuleset = (servers: FirewallServer[]): string => {
-	const allInterfaces = [...new Set(servers.map((s) => s.interfaceName))];
-	const managedIfaceSet = allInterfaces.length ? `{ ${allInterfaces.map(quote).join(', ')} }` : '{}';
-
 	// resolve a tag's db id -> its ordinal `s{i}t{j}` name, across all servers (grants are
 	// api-validated to never cross servers, but this stays robust to a stale cross-server id)
 	const tagSetName = new Map<string, string>();
@@ -125,8 +135,6 @@ export const buildRuleset = (servers: FirewallServer[]): string => {
 				return dst.ip ? `ip daddr ${dst.ip}` : undefined;
 			case 'cidr':
 				return isIpv4Cidr(dst.cidr) ? `ip daddr ${dst.cidr}` : undefined;
-			case 'internet':
-				return `oifname != ${managedIfaceSet}`;
 			case 'server':
 			case 'any':
 				return null;
@@ -165,29 +173,36 @@ export const buildRuleset = (servers: FirewallServer[]): string => {
 	const fwdChains: string[] = [];
 	const srcChains: string[] = [];
 	const inChains: string[] = [];
-	const natLines: string[] = [];
 
 	servers.forEach((server, i) => {
+		const withClients = server.exitNodes.filter((node) => node.clientIps.length > 0);
+
 		// Nothing to enforce: no policy at all and no exit clients to allow through. Emitting
 		// no chain for this server is what keeps a deployment that never touched either
 		// feature byte-identical to before.
-		if (server.tags.length === 0 && server.grants.length === 0 && server.exitClientIps.length === 0) return;
+		if (server.tags.length === 0 && server.grants.length === 0 && withClients.length === 0) return;
 
 		const governedName = `s${i}_governed`;
 		const fwdName = `fwd_s${i}`;
 		const inName = `in_s${i}`;
 
 		sets.push(renderSet(governedName, server.governedIps));
-		const exitClientsName = `s${i}_exitclients`;
-		if (server.exitClientIps.length) {
-			sets.push(renderSet(exitClientsName, server.exitClientIps, 'exit node clients'));
-		}
+		withClients.forEach((node, k) => {
+			sets.push(renderSet(`s${i}e${k}`, node.clientIps, `clients of exit node ${node.ip}`));
+		});
 		server.tags.forEach((tag, j) => {
 			sets.push(renderSet(`s${i}t${j}`, tag.memberIps, tag.name));
 		});
 
-		forwardLines.push(`\tiifname ${quote(server.interfaceName)} jump ${fwdName}`);
-		inputLines.push(`\tiifname ${quote(server.interfaceName)} ip saddr @${governedName} jump ${inName}`);
+		// Every interface this server owns jumps into the same chain: its own, plus one per exit
+		// node. An exit node is a peer of this server that happens to live on an interface of its
+		// own, so its traffic has to face exactly the same policy - without these lines a tagged
+		// exit node would silently become unrestricted the moment it got its own link.
+		const ifaces = [server.interfaceName, ...server.exitNodes.map((node) => node.interfaceName)];
+		for (const iface of ifaces) {
+			forwardLines.push(`\tiifname ${quote(iface)} jump ${fwdName}`);
+			inputLines.push(`\tiifname ${quote(iface)} ip saddr @${governedName} jump ${inName}`);
+		}
 
 		// ipv4-only feature (matches the rest of the codebase - the cidrRange
 		// regex is ipv4-only and peers have no v6 address) - drop v6 explicitly
@@ -202,13 +217,21 @@ export const buildRuleset = (servers: FirewallServer[]): string => {
 		}
 		// Deliberately *after* every explicit grant: an admin's `deny` placed above still wins,
 		// so the ordered grants list keeps its authority and peers.exitPeerId only ever adds
-		// this one narrow allowance at the bottom. `ip daddr !=` keeps it to internet-bound
-		// traffic - reaching other peers on this interface, or a LAN one of them advertises,
-		// stays entirely a matter of grants. Without this, a *governed* exit client would be
-		// dropped by the default-deny below and its exit node would silently do nothing.
+		// these narrow allowances at the bottom. `ip daddr !=` keeps each one to internet-bound
+		// traffic - reaching other peers, or a LAN one of them advertises, stays entirely a
+		// matter of grants. Without this, a *governed* exit client would be dropped by the
+		// default-deny below and its exit node would silently do nothing.
+		//
+		// One rule per exit node, each pinned to that node's own interface: a client may only
+		// leave through the exit node it was assigned to. Routing already guarantees that (its
+		// `ip rule` names one table), so this is defence in depth rather than the boundary - but
+		// a single shared rule would quietly permit any exit client down any exit link the day
+		// something else puts a packet there.
 		const notLocal = renderExcluded([server.cidrRange, ...server.advertisedRoutes]);
-		if (server.exitClientIps.length && server.exitPeerIp && notLocal) {
-			fwdBody.push(`\tip saddr @${exitClientsName} oifname ${quote(server.interfaceName)} ip daddr != ${notLocal} accept comment ${quote('exit node')}`);
+		if (notLocal) {
+			withClients.forEach((node, k) => {
+				fwdBody.push(`\tip saddr @s${i}e${k} oifname ${quote(node.interfaceName)} ip daddr != ${notLocal} accept comment ${quote(`exit node ${node.ip}`)}`);
+			});
 		}
 		fwdBody.push(`\tip saddr @${governedName} drop`); // governed, nothing matched -> default deny
 		fwdBody.push(`\treturn`); // ungoverned -> unrestricted, as before
@@ -224,29 +247,18 @@ export const buildRuleset = (servers: FirewallServer[]): string => {
 		}
 		inBody.push(`\tdrop`);
 		inChains.push(`chain ${inName} {\n${inBody.join('\n')}\n}`);
-
-		if (server.enableNat) {
-			natLines.push(`\tip saddr ${server.cidrRange} oifname != ${managedIfaceSet} masquerade`);
-		}
 	});
 
 	const parts: string[] = [];
 
 	parts.push(...sets);
 
-	// Safety net: an ungoverned peer falls through `fwd_s{i}`'s `return` (it's
-	// unrestricted, matching today's behaviour) and would otherwise hit this base
-	// chain's `policy accept` even for traffic leaving via a non-wg interface - i.e.
-	// internet/LAN egress, only reachable at all once postrouting can masquerade it
-	// (`enableNat`). That capability is new and must stay opt-in per peer/tag, so
-	// explicitly deny it for any wg-sourced traffic not already accepted by a
-	// grant. Only added when some server has NAT on - with NAT off
-	// everywhere (the default) such traffic already can't work (no route back), so
-	// this stays a true no-op for every deployment that hasn't touched the feature.
-	// Peer-to-peer reachability (iif == oif, both managed wg interfaces) is untouched.
-	const egressGuard = allInterfaces.length && servers.some((s) => s.enableNat) ? [`\tiifname ${managedIfaceSet} oifname != ${managedIfaceSet} drop`] : [];
-
-	parts.push([`chain forward {`, `\ttype filter hook forward priority filter; policy accept;`, `\tct state invalid drop`, `\tct state established,related accept`, ...forwardLines, ...egressGuard, `}`].join('\n'));
+	// No egress guard, and no postrouting chain: this manager does not masquerade, so a wg
+	// packet routed out a non-wg interface leaves with its vpn source address and nothing can
+	// route the reply back. There is no hub-side egress path to permit or deny - a client
+	// reaches the internet through an exit node peer, whose traffic never leaves the wg
+	// interface here (see exitNodes above).
+	parts.push([`chain forward {`, `\ttype filter hook forward priority filter; policy accept;`, `\tct state invalid drop`, `\tct state established,related accept`, ...forwardLines, `}`].join('\n'));
 
 	parts.push(...fwdChains);
 	parts.push(...srcChains);
@@ -254,10 +266,6 @@ export const buildRuleset = (servers: FirewallServer[]): string => {
 	if (inputLines.length) {
 		parts.push([`chain input {`, `\ttype filter hook input priority filter; policy accept;`, `\tct state established,related accept`, ...inputLines, `}`].join('\n'));
 		parts.push(...inChains);
-	}
-
-	if (natLines.length) {
-		parts.push([`chain postrouting {`, `\ttype nat hook postrouting priority srcnat; policy accept;`, ...natLines, `}`].join('\n'));
 	}
 
 	const body = parts.map((p) => indent(p)).join('\n\n');
@@ -335,8 +343,6 @@ const toFirewallServer = (graph: PolicyGraph): FirewallServer => {
 			dst = { kind: 'cidr', cidr: grant.dstCidr };
 		} else if (grant.dstKind === 'server') {
 			dst = { kind: 'server' };
-		} else if (grant.dstKind === 'internet') {
-			dst = { kind: 'internet' };
 		} else if (grant.dstKind === 'any') {
 			dst = { kind: 'any' };
 		}
@@ -352,21 +358,20 @@ const toFirewallServer = (graph: PolicyGraph): FirewallServer => {
 		firewallGrants.push({ action: grant.action, src, dst, protocol: grant.protocol, ports: grant.ports, comment: grant.comment });
 	}
 
-	// Same derivation the server config and the host's policy routing use - see
-	// lib/exitTopology.ts.
-	const exit = exitTopology(graph);
+	// Same derivation the configs and the host's policy routing use - see lib/exitTopology.ts.
+	const topology = exitTopology(graph);
 
 	return {
 		interfaceName: graph.server.interfaceName,
 		cidrRange: graph.server.cidrRange,
 		wgAddress: graph.server.wgAddress,
-		enableNat: graph.server.enableNat,
 		tags: firewallTags,
 		grants: firewallGrants,
 		governedIps: [...governedPeerIds].map((id) => peerIp.get(id)).filter((ip): ip is string => Boolean(ip)),
-		exitClientIps: exit.clientIps,
-		exitPeerIp: exit.exitPeerIp,
-		advertisedRoutes: exit.advertisedRoutes,
+		// An exit node with no provisioned link has no interface to name, so it contributes no
+		// rule - matching the config and routing layers, which also skip it.
+		exitNodes: topology.exitNodes.flatMap((node) => (node.link ? [{ interfaceName: node.link.interfaceName, ip: node.ip, clientIps: node.clientIps }] : [])),
+		advertisedRoutes: topology.allAdvertisedRoutes,
 	};
 };
 

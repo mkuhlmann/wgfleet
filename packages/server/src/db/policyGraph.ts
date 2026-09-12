@@ -36,7 +36,14 @@ export async function policyGraphOf(server: ServerPeer): Promise<PolicyGraph> {
 		db.query.policyGrantsTable.findMany({ where: eq(policyGrantsTable.serverPeerId, server.id), orderBy: asc(policyGrantsTable.position) }),
 	]);
 
-	const assignments = peers.length ? await db.query.peerTagAssignmentsTable.findMany({ where: inArray(peerTagAssignmentsTable.peerId, peers.map((p) => p.id)) }) : [];
+	const assignments = peers.length
+		? await db.query.peerTagAssignmentsTable.findMany({
+				where: inArray(
+					peerTagAssignmentsTable.peerId,
+					peers.map((p) => p.id),
+				),
+			})
+		: [];
 
 	return { server, tags, peers, assignments, grants };
 }
@@ -86,7 +93,7 @@ export type PolicyDocument = {
 		srcKind: 'tag' | 'peer';
 		srcTag?: string;
 		srcPeerId?: string;
-		dstKind: 'tag' | 'peer' | 'cidr' | 'server' | 'internet' | 'any';
+		dstKind: 'tag' | 'peer' | 'cidr' | 'server' | 'any';
 		dstTag?: string;
 		dstPeerId?: string;
 		dstCidr?: string;
@@ -128,9 +135,7 @@ export function toPolicyDocument(graph: PolicyGraph): PolicyDocument {
 			ports: g.ports,
 			comment: g.comment,
 		})),
-		peerTags: graph.peers
-			.filter((p) => (tagNamesByPeer.get(p.id)?.length ?? 0) > 0)
-			.map((p) => ({ peerId: p.id, friendlyName: p.friendlyName ?? undefined, tags: tagNamesByPeer.get(p.id)! })),
+		peerTags: graph.peers.filter((p) => (tagNamesByPeer.get(p.id)?.length ?? 0) > 0).map((p) => ({ peerId: p.id, friendlyName: p.friendlyName ?? undefined, tags: tagNamesByPeer.get(p.id)! })),
 	};
 }
 
@@ -143,22 +148,30 @@ export function toPolicyDocument(graph: PolicyGraph): PolicyDocument {
  * (`peers.advertisedRoutes`) show up in a permitted client's normal config: advertising adds
  * no new permission mechanism, so "which clients get the LAN in their AllowedIPs" is answered
  * by the same ordered grants list as every other destination.
+ *
+ * Nothing here ever widens to `0.0.0.0/0`. It used to, for an `internet`- or `any`-dst grant,
+ * back when the hub masqueraded; with hub egress gone that would route the client's internet
+ * traffic into a tunnel that drops it - a hint that actively breaks the client rather than
+ * merely being too narrow. The one config that legitimately carries `0.0.0.0/0` is the
+ * `?exit=true` rendering, which is a different destination entirely (an exit node's uplink).
  */
 export function allowedIpsForPeer(graph: PolicyGraph, peer: Peer): string {
 	const tagIds = new Set(graph.assignments.filter((a) => a.peerId === peer.id).map((a) => a.tagId));
 
-	const applicable = graph.grants.filter(
-		(g) => g.enabled && g.action === 'allow' && ((g.srcKind === 'peer' && g.srcPeerId === peer.id) || (g.srcKind === 'tag' && g.srcTagId !== null && tagIds.has(g.srcTagId)))
-	);
-
-	if (applicable.some((g) => g.dstKind === 'internet' || g.dstKind === 'any')) return '0.0.0.0/0';
+	const applicable = graph.grants.filter((g) => g.enabled && g.action === 'allow' && ((g.srcKind === 'peer' && g.srcPeerId === peer.id) || (g.srcKind === 'tag' && g.srcTagId !== null && tagIds.has(g.srcTagId))));
 
 	// A grant that hands a peer a LAN it advertises itself would route that LAN into the
 	// tunnel on the machine that *is* its gateway - a loop, and the one case where a routing
 	// hint can break the advertiser rather than merely be too narrow. Grants are written
 	// against tags, so this is easy to hit by accident: tag the advertiser like its peers.
 	const ownRoutes = new Set(advertisedRoutesOf(peer));
-	const extraCidrs = applicable.filter((g) => g.dstKind === 'cidr' && g.dstCidr && !ownRoutes.has(g.dstCidr)).map((g) => g.dstCidr!);
 
-	return [graph.server.cidrRange, ...extraCidrs].join(', ');
+	// An `any`-dst grant permits every reachable destination, so the hint has to name them:
+	// this interface's range plus every subnet route a peer on it advertises. Enumerating
+	// beats the old `0.0.0.0/0` shorthand now that /0 means "via an exit node".
+	const reachable = applicable.some((g) => g.dstKind === 'any') ? exitTopology(graph).allAdvertisedRoutes : [];
+
+	const extraCidrs = [...reachable, ...applicable.filter((g) => g.dstKind === 'cidr' && g.dstCidr).map((g) => g.dstCidr!)].filter((cidr) => !ownRoutes.has(cidr));
+
+	return [graph.server.cidrRange, ...new Set(extraCidrs)].join(', ');
 }

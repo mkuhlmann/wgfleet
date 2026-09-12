@@ -32,25 +32,10 @@ export const serverPeersTable = sqliteTable('serverPeers', {
 	wgPrivateKey: text('wgPrivateKey').notNull(),
 	wgPublicKey: text('wgPublicKey').notNull(),
 
-	// gates masquerade for this server's cidrRange. `allowInternet` on a group is
-	// inert without this - keeps upgrading an existing deployment from silently
-	// turning it into an internet gateway.
-	enableNat: integer('enableNat', { mode: 'boolean' }).notNull().default(false),
-
 	// Resolver handed to clients as `DNS =` in their generated config (wg/config.ts). Null
 	// omits the line entirely, which is today's behaviour. Lives on the server rather than
 	// per-peer because it describes the network the tunnel leads into, not one client.
 	dns: text('dns'),
-
-	// Routing table this interface's exit-node traffic is policy-routed into (see
-	// wg/exitRouting.ts). Per-interface rather than per-peer so unmarking and re-marking an
-	// exit node never churns the table number under live traffic, and allocated explicitly
-	// (lowest free in EXIT_ROUTE_TABLE_MIN..MAX, see db/servers.ts's allocateRouteTableId)
-	// rather than derived from an ordinal - deleting a server must not renumber the tables
-	// of the servers that outlive it. Same `.default(sql`0`)` caveat as statsSince below:
-	// drizzle's sqlite dialect prefers a static default over $defaultFn, so every
-	// create-server path must pass a real value explicitly.
-	routeTableId: integer('routeTableId').notNull().default(sql`0`),
 
 	// Lifetime traffic totals since statsSince, manually resettable (see api/traffic.ts). Kept
 	// as running counters rather than derived from trafficBucketsTable because that table is
@@ -67,7 +52,9 @@ export const serverPeersTable = sqliteTable('serverPeers', {
 	// new row's insert too - every create-server/create-peer handler must pass statsSince: new
 	// Date() explicitly (see api/servers.ts, api/serversPeers.ts) rather than relying on this
 	// column default for "now".
-	statsSince: integer('statsSince', { mode: 'timestamp' }).notNull().default(sql`0`),
+	statsSince: integer('statsSince', { mode: 'timestamp' })
+		.notNull()
+		.default(sql`0`),
 });
 
 export type ServerPeer = typeof serverPeersTable.$inferSelect;
@@ -97,7 +84,7 @@ export const peerTagsTable = sqliteTable(
 		name: text('name').notNull(),
 		friendlyName: text('friendlyName'),
 	},
-	(t) => [unique().on(t.serverPeerId, t.name)]
+	(t) => [unique().on(t.serverPeerId, t.name)],
 );
 
 export type PeerTag = typeof peerTagsTable.$inferSelect;
@@ -129,7 +116,7 @@ export const peerTagAssignmentsTable = sqliteTable(
 			.notNull()
 			.references(() => peerTagsTable.id, { onDelete: 'cascade' }),
 	},
-	(t) => [unique().on(t.peerId, t.tagId)]
+	(t) => [unique().on(t.peerId, t.tagId)],
 );
 
 export type PeerTagAssignment = typeof peerTagAssignmentsTable.$inferSelect;
@@ -179,13 +166,18 @@ export const policyGrantsTable = sqliteTable('policyGrants', {
 	srcTagId: text('srcTagId').references(() => peerTagsTable.id, { onDelete: 'cascade' }),
 	srcPeerId: text('srcPeerId').references(() => peersTable.id, { onDelete: 'cascade' }),
 
-	dstKind: text('dstKind', { enum: ['tag', 'peer', 'cidr', 'server', 'internet', 'any'] }).notNull(),
+	// No 'internet': the hub does not masquerade, so there is no hub-side egress path to
+	// permit or deny (see drizzle/0004_drop_hub_egress.sql). A client reaches the internet
+	// through an exit node peer, which is routing rather than policy - peers.exitPeerId.
+	dstKind: text('dstKind', { enum: ['tag', 'peer', 'cidr', 'server', 'any'] }).notNull(),
 	dstTagId: text('dstTagId').references(() => peerTagsTable.id, { onDelete: 'cascade' }),
 	dstPeerId: text('dstPeerId').references(() => peersTable.id, { onDelete: 'cascade' }),
 	dstCidr: text('dstCidr'),
 
 	// 'any' matches every protocol/port; ports is only meaningful for tcp/udp
-	protocol: text('protocol', { enum: ['any', 'tcp', 'udp', 'icmp'] }).notNull().default('any'),
+	protocol: text('protocol', { enum: ['any', 'tcp', 'udp', 'icmp'] })
+		.notNull()
+		.default('any'),
 	// comma-separated ports/ranges, e.g. "22,80,8000-8100" - null/empty means all ports
 	ports: text('ports'),
 
@@ -256,14 +248,42 @@ export const peersTable = sqliteTable(
 		// no tags and no grant naming this peer directly = unrestricted (today's behaviour preserved).
 
 		// --- exit nodes (see wg/exitRouting.ts) ------------------------------------------
-		// This peer is its server's exit node: internet-bound traffic from peers that point
-		// their exitPeerId at it is policy-routed into its tunnel and NAT'd by its own machine.
-		// At most one per server - only one peer can own AllowedIPs 0.0.0.0/0 on a wg interface
-		// (enforced in api/serversPeers.ts, not by the db).
+		// This peer is an exit node: internet-bound traffic from peers that point their
+		// exitPeerId at it is policy-routed into its tunnel and NAT'd by its own machine.
+		//
+		// A server may have any number of them, because an exit node does not live on its
+		// server's wg interface at all - it gets a **dedicated interface of its own** on the
+		// hub (the exit link, the five columns below). Only one peer can own
+		// `AllowedIPs = 0.0.0.0/0` on a given wg interface, and wireguard picks the peer to
+		// send a packet to from the packet's destination address alone, so N exit nodes
+		// sharing one interface would have N-1 of them silently lose the /0. One interface
+		// each removes the collision instead of rationing it - see wg/exitLinks.ts.
 		isExitNode: integer('isExitNode', { mode: 'boolean' }).notNull().default(false),
 
+		// --- the exit link: this exit node's own interface on the hub --------------------
+		// All five are null exactly when isExitNode is false, and are allocated/released by
+		// reconcileExitLinks (wg/exitLinks.ts) rather than by any write handler - that way a
+		// row that became an exit node by any path (api, policy import, a direct db write, or
+		// an older schema that predates these columns) is provisioned on the next converge.
+		//
+		// Stored rather than derived: an ordinal would renumber every surviving link when one
+		// is removed, which under live traffic means retargeting another exit node's default
+		// route and handing its clients someone else's uplink.
+		exitInterfaceName: text('exitInterfaceName').unique(),
+		exitPrivateKey: text('exitPrivateKey'),
+		exitPublicKey: text('exitPublicKey'),
+		// Its own UDP port on the hub. The exit node dials in, so this port has to be
+		// reachable from that machine - published in docker, opened in the host firewall.
+		// That is the one operational cost of an exit node, and the ui says so explicitly.
+		exitListenPort: integer('exitListenPort').unique(),
+		// Policy-routing table for the clients assigned to this exit node. Per exit node, not
+		// per server: the table's default route names the exit link, which is what makes
+		// "client A exits here, client B exits there" expressible at all.
+		exitRouteTableId: integer('exitRouteTableId').unique(),
+
 		// The exit node this peer reaches the internet through, or null for "no exit node".
-		// Must name a peer on the same server carrying isExitNode. This column is both the
+		// Any exit node on the same server - that is the whole point of the per-exit-node
+		// interface above. Must name a peer on the same server carrying isExitNode. This column is both the
 		// permission and the routing instruction: no exitPeerId means no `ip rule`, so the
 		// peer physically cannot use an exit node even if it hand-edits its own AllowedIPs.
 		exitPeerId: text('exitPeerId').references((): any => peersTable.id, { onDelete: 'set null' }),
@@ -314,11 +334,13 @@ export const peersTable = sqliteTable(
 		// new row's insert too - every create-server/create-peer handler must pass statsSince: new
 		// Date() explicitly (see api/servers.ts, api/serversPeers.ts) rather than relying on this
 		// column default for "now".
-		statsSince: integer('statsSince', { mode: 'timestamp' }).notNull().default(sql`0`),
+		statsSince: integer('statsSince', { mode: 'timestamp' })
+			.notNull()
+			.default(sql`0`),
 	},
 	// one wgAddress per server - resolvePeerAddress (wg/addressing.ts) checks this in-app, but
 	// only the DB constraint closes the race between two concurrent peer creates/updates.
-	(t) => [unique().on(t.serverPeerId, t.wgAddress)]
+	(t) => [unique().on(t.serverPeerId, t.wgAddress)],
 );
 
 export const peersRelation = relations(peersTable, ({ one, many }) => ({
@@ -368,7 +390,7 @@ export const trafficBucketsTable = sqliteTable(
 		rxBytes: integer('rxBytes').notNull().default(0),
 		txBytes: integer('txBytes').notNull().default(0),
 	},
-	(t) => [unique().on(t.peerId, t.resolution, t.bucketStart), index('trafficBuckets_server_res_bucket_idx').on(t.serverPeerId, t.resolution, t.bucketStart)]
+	(t) => [unique().on(t.peerId, t.resolution, t.bucketStart), index('trafficBuckets_server_res_bucket_idx').on(t.serverPeerId, t.resolution, t.bucketStart)],
 );
 
 export type TrafficBucket = typeof trafficBucketsTable.$inferSelect;
@@ -389,7 +411,7 @@ export const adminSessionsTable = sqliteTable(
 
 		expiresAt: integer('expiresAt', { mode: 'timestamp' }).notNull(),
 	},
-	(t) => [index('adminSessions_token_idx').on(t.token), index('adminSessions_expiresAt_idx').on(t.expiresAt)]
+	(t) => [index('adminSessions_token_idx').on(t.token), index('adminSessions_expiresAt_idx').on(t.expiresAt)],
 );
 
 export type AdminSession = typeof adminSessionsTable.$inferSelect;

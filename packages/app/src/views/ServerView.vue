@@ -41,14 +41,11 @@
 						<span class="whitespace-nowrap">reserved ips</span>
 						<span class="text-text text-right">{{ server.reservedIps }}</span>
 
-						<span class="whitespace-nowrap">nat</span>
-						<span class="text-text text-right">{{ server.enableNat ? 'enabled' : 'disabled' }}</span>
-
 						<span class="whitespace-nowrap">dns</span>
 						<span class="text-text text-right break-all">{{ server.dns ?? '-' }}</span>
 
-						<span class="whitespace-nowrap">exit node</span>
-						<span class="text-text text-right break-all">{{ exitNode ? (exitNode.friendlyName ?? exitNode.wgAddress) : '-' }}</span>
+						<span class="whitespace-nowrap">exit nodes</span>
+						<span class="text-text text-right break-all">{{ exitNodes.length ? exitNodes.map((n) => n.peer.friendlyName ?? n.peer.wgAddress).join(', ') : '-' }}</span>
 					</div>
 				</BaseCard>
 
@@ -82,7 +79,9 @@
 								<span v-if="advertisedRoutes(peer).length" class="text-muted border border-border rounded-sm px-1.5 py-0.5">subnets</span>
 							</div>
 
-							<div v-if="peer.isExitNode && !isReachable(peer)" class="text-xs text-down">exit node offline - {{ exitClientCount(peer.id) }} client(s) have no internet while it stays down. there is no fallback to the hub by design</div>
+							<div v-if="peer.isExitNode && !isReachable(peer)" class="text-xs text-down">
+								exit node offline - {{ exitClientCount(peer.id) }} client(s) have no internet while it stays down. the hub is not a fallback; it does not route to the internet at all
+							</div>
 
 							<div class="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 text-sm text-muted">
 								<span class="whitespace-nowrap">id</span>
@@ -233,11 +232,11 @@ const { data: serverTraffic } = useQuery(computed(() => queryServerTraffic(serve
 const tagNameById = computed(() => new Map((tags.value ?? []).map((t) => [t.id, t.friendlyName ?? t.name])));
 const tagNames = (tagIds: string[] | undefined) => (tagIds ?? []).map((id) => tagNameById.value.get(id)).filter((name): name is string => Boolean(name));
 
-// At most one exit node per interface (a wireguard cryptokey-routing constraint - only one
-// peer can own AllowedIPs 0.0.0.0/0), enforced by the api. Derived by the same projection the
-// server config, the nft ruleset and the host's policy routing use - see lib/exitTopology.ts.
+// Any number of exit nodes per server - each one lives on a wg interface of its own, so they
+// never compete for AllowedIPs 0.0.0.0/0 (see wg/exitLinks.ts). Derived by the same projection
+// the configs, the nft ruleset and the host's policy routing use - see lib/exitTopology.ts.
 const exitTopology = computed(() => exitTopologyOf(peers.value ?? []));
-const exitNode = computed(() => exitTopology.value.exitPeer);
+const exitNodes = computed(() => exitTopology.value.exitNodes);
 const exitNodeLabel = (peerId: string) => {
 	const node = (peers.value ?? []).find((p) => p.id === peerId);
 	return node ? (node.friendlyName ?? node.wgAddress) : peerId;
@@ -313,14 +312,15 @@ const deletePeer = async (peerId: string) => {
 	// invalidate.afterPeerDelete
 	await invalidate.afterPeerDelete(queryClient, serverId);
 
-	// Deleting an exit node unassigns its clients rather than silently routing them out the
-	// hub's own uplink - say so, since it leaves them with no internet until reassigned.
+	// Deleting an exit node unassigns its clients - say so, since it leaves them with no
+	// internet at all until another exit node is assigned. There is no hub egress to fall back
+	// to (drizzle/0008_drop_hub_egress.sql).
 	const unassigned = response.data?.unassignedExitClients ?? [];
 	if (unassigned.length) {
 		toast.add({
 			severity: 'info',
 			summary: 'Exit node deleted',
-			detail: `${unassigned.map((p) => p.friendlyName ?? p.wgAddress).join(', ')} no longer have internet access. Assign another exit node or grant internet via the hub.`,
+			detail: `${unassigned.map((p) => p.friendlyName ?? p.wgAddress).join(', ')} no longer have internet access. Assign them another exit node.`,
 			life: 10000,
 		});
 	}

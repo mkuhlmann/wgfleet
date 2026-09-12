@@ -5,7 +5,6 @@ import IPCIDR from 'ip-cidr';
 import { eq, and, ne } from 'drizzle-orm';
 import { wgDerivePublicKey, wgGenKey } from '../wg/shell';
 import { converge } from '../wg/converge';
-import { allocateRouteTableId } from '@server/db/servers';
 import { auth } from './auth';
 import { createLog } from '@server/lib/log';
 import { generateServerConfig } from '@server/wg/config';
@@ -29,7 +28,7 @@ export const serversRoutes = new Elysia()
 		},
 		{
 			verifyAuth: { scope: 'admin' },
-		}
+		},
 	)
 	.post(
 		'/wg/servers',
@@ -49,13 +48,6 @@ export const serversRoutes = new Elysia()
 				return status(400, 'wgAddress is not in CIDR range');
 			}
 
-			// Allocated up front and stored, never derived from an ordinal - see
-			// db/servers.ts's allocateRouteTableId for why the id has to be stable.
-			const routeTableId = await allocateRouteTableId();
-			if (routeTableId === undefined) {
-				return status(400, 'No free policy-routing table id available for a new server');
-			}
-
 			const peer = await db
 				.insert(serverPeersTable)
 				.values({
@@ -72,11 +64,9 @@ export const serversRoutes = new Elysia()
 					wgPrivateKey: privateKey,
 					wgPublicKey: publicKey,
 
-					enableNat: body.enableNat,
 					dns: body.dns,
 
-					// both column defaults are a literal 0 - see schema.ts's statsSince/routeTableId comments
-					routeTableId,
+					// the column default is a literal 0 - see schema.ts's statsSince comment
 					statsSince: new Date(),
 				})
 				.returning();
@@ -98,11 +88,10 @@ export const serversRoutes = new Elysia()
 				wgEndpoint: t.String(),
 				wgListenPort: t.Integer({ minimum: WG_LISTEN_PORT_MIN, maximum: WG_LISTEN_PORT_MAX }),
 				wgAddress: t.String(),
-				enableNat: t.Optional(t.Boolean({ default: false })),
 				dns: t.Optional(t.String()),
 			}),
 			verifyAuth: { scope: 'admin' },
-		}
+		},
 	)
 	.get(
 		'/wg/servers/:id',
@@ -111,7 +100,7 @@ export const serversRoutes = new Elysia()
 		{
 			params: t.Object({ id: t.String() }),
 			serverScope: true,
-		}
+		},
 	)
 	.patch(
 		'/wg/servers/:id',
@@ -149,7 +138,6 @@ export const serversRoutes = new Elysia()
 				wgEndpoint: t.Optional(t.String()),
 				wgListenPort: t.Optional(t.Integer({ minimum: WG_LISTEN_PORT_MIN, maximum: WG_LISTEN_PORT_MAX })),
 				wgAddress: t.Optional(t.String()),
-				enableNat: t.Optional(t.Boolean()),
 				// null clears it - omitting the `DNS =` line from generated peer configs
 				dns: t.Optional(t.Nullable(t.String())),
 			}),
@@ -157,7 +145,7 @@ export const serversRoutes = new Elysia()
 				id: t.String(),
 			}),
 			serverScope: true,
-		}
+		},
 	)
 	.get('/wg/servers/:id/config', async ({ wgServer }) => await generateServerConfig(wgServer), {
 		params: t.Object({

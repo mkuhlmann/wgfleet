@@ -1,8 +1,9 @@
 import { db } from '@server/db';
 import { type ServerPeer } from '@server/db/schema';
-import { isInterfaceUp, resetFirewall, startServer, stopServer, wgShow } from './shell';
+import { isInterfaceUp, listInterfaces, resetFirewall, stopInterface, wgShow } from './shell';
 import { resetExitRouting } from './exitRouting';
-import { converge, convergeHost } from './converge';
+import { allExitLinks, isExitLinkInterface } from './exitLinks';
+import { converge } from './converge';
 import { recordServerTraffic, rollupAndPrune, trafficStatsEnabled } from './traffic';
 import { createLog } from '@server/lib/log';
 
@@ -15,24 +16,37 @@ const constructWgManager = () => {
 	const _start = async () => {
 		servers = await db.query.serverPeersTable.findMany();
 
-		for (const server of servers) {
-			log.info(`Checking server ${server.interfaceName}`);
-			if (await isInterfaceUp(server.interfaceName)) {
-				log.info(`Server ${server.interfaceName} is up, deleting link.`);
-				await stopServer(server);
-			}
-			log.info(`Starting server ${server.interfaceName}`);
-			await startServer(server);
+		// Delete every interface we might own before starting anything, rather than reloading
+		// whatever survived a restart: `wg syncconf` applies peers but not the `[Interface]`
+		// half, so an interface left over from an older config could keep an address or a
+		// `Table = off` this boot no longer wants. Exit links are swept by name, since the peer
+		// that owned one may have been deleted while this process was down.
+		const known = new Set(servers.map((s) => s.interfaceName));
+		for (const name of await listInterfaces()) {
+			if (!known.has(name) && !isExitLinkInterface(name)) continue;
+			log.info(`${name} is up, deleting link before start`);
+			await stopInterface(name);
 		}
 
-		// Interfaces are all up at this point, so only the host-wide state is left to apply.
-		await convergeHost();
+		// converge brings up a server's own interface *and* one per exit node, having first
+		// reconciled which exit links should exist at all - including provisioning one for an
+		// exit node that predates those columns (see wg/exitLinks.ts).
+		for (const server of servers) {
+			log.info(`Starting server ${server.interfaceName}`);
+			const result = await converge(server.id);
+			if (!result.ok) log.error(`Failed to start ${server.interfaceName}: ${result.reason}`);
+		}
 
 		loop();
 	};
 
 	const refreshInfo = async () => {
 		log.info('Checking servers');
+		const linksByServer = new Map<string, string[]>();
+		for (const link of await allExitLinks()) {
+			linksByServer.set(link.serverPeerId, [...(linksByServer.get(link.serverPeerId) ?? []), link.interfaceName]);
+		}
+
 		for (const server of servers) {
 			const wgShowResult = await wgShow(server.interfaceName);
 
@@ -45,7 +59,16 @@ const constructWgManager = () => {
 				continue;
 			}
 
-			for (const peer of wgShowResult.peers) {
+			// This server's exit nodes are peers of their own interfaces, not of this one, so
+			// their status and counters have to be collected from each link and merged in - they
+			// are still peers *of this server* everywhere the api and ui are concerned.
+			const samples = [...wgShowResult.peers];
+			for (const linkName of linksByServer.get(server.id) ?? []) {
+				const linkResult = await wgShow(linkName);
+				if (linkResult) samples.push(...linkResult.peers);
+			}
+
+			for (const peer of samples) {
 				peerInfo[peer.publicKey] = {
 					connected: Date.now() - peer.latestHandshake * 1000 < 180000,
 					wgEndpoint: peer.endpoint,
@@ -59,7 +82,7 @@ const constructWgManager = () => {
 				try {
 					await recordServerTraffic(
 						server,
-						wgShowResult.peers.map((p) => ({ publicKey: p.publicKey, transferRx: p.transferRx, transferTx: p.transferTx }))
+						samples.map((p) => ({ publicKey: p.publicKey, transferRx: p.transferRx, transferTx: p.transferTx })),
 					);
 				} catch (error) {
 					log.error(`Failed to record traffic for ${server.interfaceName}: ${error}`);
@@ -96,17 +119,19 @@ const constructWgManager = () => {
 			clearTimeout(loopTimeout);
 		}
 
-		for (const server of servers) {
-			if (await isInterfaceUp(server.interfaceName)) {
-				log.info(`Stopping server ${server.interfaceName}`);
-				await stopServer(server);
+		const links = await allExitLinks();
+
+		for (const interfaceName of [...servers.map((s) => s.interfaceName), ...links.map((l) => l.interfaceName)]) {
+			if (await isInterfaceUp(interfaceName)) {
+				log.info(`Stopping ${interfaceName}`);
+				await stopInterface(interfaceName);
 			}
 		}
 
 		await resetFirewall();
 		// Deleting the interfaces above drops each exit table's routes along with the device, but
 		// the `ip rule` entries pointing at those tables outlive it - clear them explicitly.
-		await resetExitRouting(servers.map((s) => s.routeTableId));
+		await resetExitRouting(links.map((l) => l.routeTableId));
 	};
 
 	return { start, stop, peerInfo };

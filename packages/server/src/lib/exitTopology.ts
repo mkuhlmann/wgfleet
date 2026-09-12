@@ -12,6 +12,9 @@ export type ExitTopologyPeer = {
 	isExitNode: boolean;
 	exitPeerId: string | null;
 	advertisedRoutes: string | null;
+	exitInterfaceName: string | null;
+	exitListenPort: number | null;
+	exitRouteTableId: number | null;
 };
 
 /**
@@ -24,37 +27,89 @@ export type ExitTopologyPeer = {
  */
 export const advertisedRoutesOf = (peer: { advertisedRoutes: string | null }): string[] => parseCidrList(peer.advertisedRoutes);
 
-export type ExitTopology<P> = {
-	/**
-	 * This wg interface's exit node, or undefined. At most one per interface, because only one
-	 * peer can own `AllowedIPs = 0.0.0.0/0` on it - the api enforces that
-	 * (assertExitNodeInvariants in api/serversPeers.ts). The id tie-break below only decides
-	 * which one wins if a direct db write ever broke that invariant, so that a config, a
-	 * ruleset and a routing table can't each pick a *different* exit node from the same rows.
-	 */
-	exitPeer: P | undefined;
-	/** the exit node's ip, or null - what the wg modules interpolate */
-	exitPeerIp: string | null;
-	/** ips of the peers whose `exitPeerId` names that exit node, excluding the node itself */
+/**
+ * An exit node's dedicated interface on the hub. Null while the columns are unprovisioned,
+ * which is the state a row is in between "isExitNode became true" and the converge that
+ * allocates it (wg/exitLinks.ts) - and the state every exit node created before those columns
+ * existed starts in. Every consumer must therefore treat a link-less exit node as inert rather
+ * than assume the columns are there.
+ */
+export type ExitLink = {
+	interfaceName: string;
+	listenPort: number;
+	routeTableId: number;
+};
+
+export const exitLinkOf = (peer: ExitTopologyPeer): ExitLink | null =>
+	peer.isExitNode && peer.exitInterfaceName && peer.exitListenPort !== null && peer.exitRouteTableId !== null ? { interfaceName: peer.exitInterfaceName, listenPort: peer.exitListenPort, routeTableId: peer.exitRouteTableId } : null;
+
+export type ExitNode<P> = {
+	peer: P;
+	/** the exit node's own tunnel address - what the wg modules interpolate */
+	ip: string;
+	/** the peers whose `exitPeerId` names it, never including itself */
+	clients: P[];
+	/** the same, as ips */
 	clientIps: string[];
-	/** every subnet route advertised by any peer on this interface, already network-aligned */
+	/** its interface on the hub, or null when not provisioned yet */
+	link: ExitLink | null;
+	/** subnet routes it advertises - these live on its link, not on the server's own interface */
 	advertisedRoutes: string[];
 };
 
+export type ExitTopology<P> = {
+	/**
+	 * Every peer carrying `isExitNode`, ordered by id. Any number of them per server: each one
+	 * owns `AllowedIPs = 0.0.0.0/0` on an interface of its own, so they never compete for the
+	 * prefix (which wireguard resolves by silently reassigning it to the last writer).
+	 *
+	 * The order is not cosmetic - wg/firewall.ts derives ordinal nft object names from it.
+	 */
+	exitNodes: ExitNode<P>[];
+	/** the peers that stay on the server's own wg interface - everything that is not an exit node */
+	plainPeers: P[];
+	/** subnet routes advertised by peers on the server's own interface */
+	interfaceAdvertisedRoutes: string[];
+	/** every subnet route on this server, wherever its advertiser lives */
+	allAdvertisedRoutes: string[];
+};
+
 /**
- * Who the exit node is, who routes through it, and what LANs sit behind this interface's peers
- * - one derivation, shared by the server config (wg/config.ts), the nft ruleset
- * (wg/firewall.ts), the host's policy routing (wg/exitRouting.ts) and the frontend's server
- * view. Pure. Each of those used to re-derive all four fields from the raw peer rows with its
- * own copy of the tie-break rule above.
+ * Which peers are exit nodes, who routes through each of them, and what LANs sit behind this
+ * server's peers - one derivation, shared by the server and exit-link configs (wg/config.ts),
+ * the nft ruleset (wg/firewall.ts), the host's policy routing (wg/exitRouting.ts) and the
+ * frontend's server and policy views. Pure.
+ *
+ * The split between `exitNodes` and `plainPeers` is the load-bearing part: an exit node is
+ * *not* a peer of its server's wg interface, it is the single peer of its own. Every consumer
+ * that iterates "this server's peers" has to pick one of the two lists deliberately, which is
+ * what stops an exit node quietly reappearing on the shared interface and taking `0.0.0.0/0`
+ * back from another one.
  */
 export function exitTopologyOf<P extends ExitTopologyPeer>(peers: P[]): ExitTopology<P> {
-	const exitPeer: P | undefined = peers.filter((p) => p.isExitNode).sort((a, b) => a.id.localeCompare(b.id))[0];
+	const exitPeers = peers.filter((p) => p.isExitNode).sort((a, b) => a.id.localeCompare(b.id));
+	const plainPeers = peers.filter((p) => !p.isExitNode);
+
+	const exitNodes: ExitNode<P>[] = exitPeers.map((peer) => {
+		const clients = peers.filter((p) => p.exitPeerId === peer.id && p.id !== peer.id);
+
+		return {
+			peer,
+			ip: peer.wgAddress,
+			clients,
+			clientIps: clients.map((p) => p.wgAddress),
+			link: exitLinkOf(peer),
+			advertisedRoutes: advertisedRoutesOf(peer),
+		};
+	});
 
 	return {
-		exitPeer,
-		exitPeerIp: exitPeer?.wgAddress ?? null,
-		clientIps: exitPeer ? peers.filter((p) => p.exitPeerId === exitPeer.id && p.id !== exitPeer.id).map((p) => p.wgAddress) : [],
-		advertisedRoutes: peers.flatMap(advertisedRoutesOf),
+		exitNodes,
+		plainPeers,
+		interfaceAdvertisedRoutes: plainPeers.flatMap(advertisedRoutesOf),
+		allAdvertisedRoutes: peers.flatMap(advertisedRoutesOf),
 	};
 }
+
+/** The exit node a peer is assigned to, or undefined - resolved against the same projection. */
+export const exitNodeFor = <P extends ExitTopologyPeer>(topology: ExitTopology<P>, peer: { exitPeerId: string | null }): ExitNode<P> | undefined => (peer.exitPeerId ? topology.exitNodes.find((node) => node.peer.id === peer.exitPeerId) : undefined);

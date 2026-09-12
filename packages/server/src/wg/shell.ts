@@ -41,14 +41,11 @@ const capabilities = await detectCapabilities();
 
 if (!capabilities.crypto || !capabilities.network || !capabilities.firewall) {
 	if (process.env.NODE_ENV === 'production' && !forceShim) {
-		throw new Error(
-			'wg/wg-quick/ip/nft are missing or lack permission to manage network interfaces (NET_ADMIN capability required). ' +
-				'Refusing to silently fall back to the development shim in production. Set WG_DEV_SHIM=true to override.'
-		);
+		throw new Error('wg/wg-quick/ip/nft are missing or lack permission to manage network interfaces (NET_ADMIN capability required). ' + 'Refusing to silently fall back to the development shim in production. Set WG_DEV_SHIM=true to override.');
 	}
 	log.warn(
 		`⚠️  WireGuard/network tooling unavailable (crypto: ${capabilities.crypto ? 'real' : 'shimmed'}, interfaces: ${capabilities.network ? 'real' : 'shimmed'}, firewall: ${capabilities.firewall ? 'real' : 'shimmed'}). ` +
-			'Running with the development shim — no real tunnels or network changes will be made.'
+			'Running with the development shim — no real tunnels or network changes will be made.',
 	);
 }
 
@@ -58,9 +55,10 @@ export const wgDerivePublicKey = capabilities.crypto ? real.wgDerivePublicKey : 
 
 export const wgShow = capabilities.network ? real.wgShow : shim.wgShow;
 export const isInterfaceUp = capabilities.network ? real.isInterfaceUp : shim.isInterfaceUp;
-export const startServer = capabilities.network ? real.startServer : shim.startServer;
-export const reloadServer = capabilities.network ? real.reloadServer : shim.reloadServer;
-export const stopServer = capabilities.network ? real.stopServer : shim.stopServer;
+export const listInterfaces = capabilities.network ? real.listInterfaces : shim.listInterfaces;
+export const startInterface = capabilities.network ? real.startInterface : shim.startInterface;
+export const reloadInterface = capabilities.network ? real.reloadInterface : shim.reloadInterface;
+export const stopInterface = capabilities.network ? real.stopInterface : shim.stopInterface;
 // `network`, not `firewall`: exit routing is pure `ip rule`/`ip route` and must not depend on
 // nft being available - see the rejected-alternative note in wg/exitRouting.ts.
 export const applyExitRouting = capabilities.network ? real.applyExitRouting : shim.applyExitRouting;

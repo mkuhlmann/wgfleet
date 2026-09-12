@@ -55,7 +55,7 @@ const grantBody = t.Object({
 	srcKind: t.Union([t.Literal('tag'), t.Literal('peer')]),
 	srcTagId: t.Optional(t.String()),
 	srcPeerId: t.Optional(t.String()),
-	dstKind: t.Union([t.Literal('tag'), t.Literal('peer'), t.Literal('cidr'), t.Literal('server'), t.Literal('internet'), t.Literal('any')]),
+	dstKind: t.Union([t.Literal('tag'), t.Literal('peer'), t.Literal('cidr'), t.Literal('server'), t.Literal('any')]),
 	dstTagId: t.Optional(t.String()),
 	dstPeerId: t.Optional(t.String()),
 	dstCidr: t.Optional(t.String()),
@@ -95,7 +95,6 @@ async function validateGrant(serverPeerId: string, g: typeof grantBody.static): 
 			if (!g.dstCidr || !isIpv4Cidr(g.dstCidr)) return `Invalid or non-ipv4 CIDR: ${g.dstCidr}`;
 			break;
 		case 'server':
-		case 'internet':
 		case 'any':
 			break;
 	}
@@ -110,7 +109,7 @@ const policyGrantDoc = t.Object({
 	srcKind: t.Union([t.Literal('tag'), t.Literal('peer')]),
 	srcTag: t.Optional(t.String()),
 	srcPeerId: t.Optional(t.String()),
-	dstKind: t.Union([t.Literal('tag'), t.Literal('peer'), t.Literal('cidr'), t.Literal('server'), t.Literal('internet'), t.Literal('any')]),
+	dstKind: t.Union([t.Literal('tag'), t.Literal('peer'), t.Literal('cidr'), t.Literal('server'), t.Literal('any')]),
 	dstTag: t.Optional(t.String()),
 	dstPeerId: t.Optional(t.String()),
 	dstCidr: t.Optional(t.String()),
@@ -136,7 +135,7 @@ export const policyRoutes = new Elysia()
 			const counts = memberCountByTag(graph);
 			return graph.tags.map((tag) => ({ ...tag, memberCount: counts.get(tag.id) ?? 0 }));
 		},
-		{ params: t.Object({ id: t.String() }), serverScope: true }
+		{ params: t.Object({ id: t.String() }), serverScope: true },
 	)
 	.post(
 		'/wg/servers/:id/tags',
@@ -156,7 +155,7 @@ export const policyRoutes = new Elysia()
 			body: t.Object({ name: t.RegExp(nameRegex), friendlyName: t.Optional(t.String()) }),
 			params: t.Object({ id: t.String() }),
 			serverScope: true,
-		}
+		},
 	)
 	.patch(
 		'/wg/servers/:id/tags/:tagId',
@@ -185,7 +184,7 @@ export const policyRoutes = new Elysia()
 			body: t.Object({ name: t.Optional(t.RegExp(nameRegex)), friendlyName: t.Optional(t.String()) }),
 			params: t.Object({ id: t.String(), tagId: t.String() }),
 			serverScope: true,
-		}
+		},
 	)
 	.delete(
 		'/wg/servers/:id/tags/:tagId',
@@ -209,7 +208,7 @@ export const policyRoutes = new Elysia()
 
 			return { success: true };
 		},
-		{ params: t.Object({ id: t.String(), tagId: t.String() }), serverScope: true }
+		{ params: t.Object({ id: t.String(), tagId: t.String() }), serverScope: true },
 	)
 	// --- grants (ordered, replace-all) ------------------------------------
 	.get(
@@ -217,7 +216,7 @@ export const policyRoutes = new Elysia()
 		async ({ wgServer: server, params }) => {
 			return db.query.policyGrantsTable.findMany({ where: eq(policyGrantsTable.serverPeerId, server.id), orderBy: asc(policyGrantsTable.position) });
 		},
-		{ params: t.Object({ id: t.String() }), serverScope: true }
+		{ params: t.Object({ id: t.String() }), serverScope: true },
 	)
 	.put(
 		'/wg/servers/:id/grants',
@@ -261,7 +260,7 @@ export const policyRoutes = new Elysia()
 			body: t.Object({ grants: t.Array(grantBody) }),
 			params: t.Object({ id: t.String() }),
 			serverScope: true,
-		}
+		},
 	)
 	// --- whole-document policy (json import/export) ------------------------
 	.get(
@@ -269,7 +268,7 @@ export const policyRoutes = new Elysia()
 		async ({ wgServer: server, params }) => {
 			return toPolicyDocument(await policyGraphOf(server));
 		},
-		{ params: t.Object({ id: t.String() }), serverScope: true }
+		{ params: t.Object({ id: t.String() }), serverScope: true },
 	)
 	.put(
 		'/wg/servers/:id/policy',
@@ -308,7 +307,6 @@ export const policyRoutes = new Elysia()
 						if (!g.dstCidr || !isIpv4Cidr(g.dstCidr)) return status(400, `Invalid or non-ipv4 CIDR: ${g.dstCidr}`);
 						break;
 					case 'server':
-					case 'internet':
 					case 'any':
 						break;
 				}
@@ -370,5 +368,5 @@ export const policyRoutes = new Elysia()
 
 			return toPolicyDocument(await policyGraphOf(server));
 		},
-		{ body: policyDocBody, params: t.Object({ id: t.String() }), serverScope: true }
+		{ body: policyDocBody, params: t.Object({ id: t.String() }), serverScope: true },
 	);

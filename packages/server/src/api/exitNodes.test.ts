@@ -6,9 +6,10 @@ import { eq } from 'drizzle-orm';
 import { shellCallLog } from '@server/wg/shell';
 
 // Exit-node invariants live in the api layer, not the db (sqlite FK enforcement is never
-// turned on here) - assertExitNodeInvariants in api/serversPeers.ts is the only place they
-// hold, so this covers it directly. Fixture ids are prefixed per-file: the whole test run
-// shares one in-memory database (see tests/setup.ts).
+// turned on here) - checkPeerInvariants in lib/peerInvariants.ts is the only place they hold,
+// so this covers it directly, together with the exit-link provisioning converge does off the
+// back of them. Fixture ids are prefixed per-file: the whole test run shares one in-memory
+// database (see tests/setup.ts).
 const SERVER = 'exitNodes-server';
 const OTHER = 'exitNodes-otherServer';
 
@@ -34,7 +35,6 @@ describe('exit nodes', () => {
 					wgEndpoint: 'exithost:51966',
 					wgPrivateKey: 'privateKey',
 					wgPublicKey: 'publicKey',
-					routeTableId: 52800,
 				},
 				{
 					id: OTHER,
@@ -46,7 +46,6 @@ describe('exit nodes', () => {
 					wgEndpoint: 'exithost:51967',
 					wgPrivateKey: 'privateKey',
 					wgPublicKey: 'publicKey',
-					routeTableId: 52801,
 				},
 			])
 			.execute();
@@ -70,20 +69,68 @@ describe('exit nodes', () => {
 	});
 
 	describe('marking an exit node', () => {
-		it('rejects a second exit node on the same interface', async () => {
-			// hard wireguard constraint, not a policy choice: only one peer per interface can
-			// own AllowedIPs 0.0.0.0/0
+		it('accepts a second exit node on the same server, each on a link of its own', async () => {
+			// The constraint is one 0.0.0.0/0 owner per *interface*, and every exit node gets an
+			// interface to itself (wg/exitLinks.ts) - so a server can have as many as it likes.
 			const response = await patch(SERVER, 'exitNodes-client', { isExitNode: true });
+			expect(response.status).toBe(200);
 
-			expect(response.status).toBe(400);
-			expect(await response.text()).toContain('already has an exit node');
+			const peers = await db.query.peersTable.findMany({ where: eq(peersTable.serverPeerId, SERVER) });
+			const links = peers.filter((p) => p.isExitNode).map((p) => p.exitInterfaceName);
+
+			expect(links).toHaveLength(2);
+			expect(new Set(links).size).toBe(2); // distinct interfaces...
+			expect(links.every((name) => name !== null)).toBe(true);
+			expect(new Set(peers.filter((p) => p.isExitNode).map((p) => p.exitListenPort)).size).toBe(2); // ...on distinct ports
+		});
+
+		it('brings up an interface per exit node, and none of them is the server', async () => {
+			shellCallLog.reset();
+			await patch(SERVER, 'exitNodes-client', { isExitNode: true });
+
+			const peers = await db.query.peersTable.findMany({ where: eq(peersTable.serverPeerId, SERVER) });
+			for (const exitNode of peers.filter((p) => p.isExitNode)) {
+				expect(shellCallLog.isUp(exitNode.exitInterfaceName!)).toBe(true);
+				// exactly one peer on it - the exit node itself, owning the default route
+				expect(shellCallLog.configFor(exitNode.exitInterfaceName!)).toContain('AllowedIPs = 0.0.0.0/0');
+			}
+
+			// and the server's own interface carries neither of them any more
+			expect(shellCallLog.configFor('wgExit0')).not.toContain('0.0.0.0/0');
+		});
+
+		it('releases the link again when the peer stops being an exit node', async () => {
+			await patch(SERVER, 'exitNodes-client', { isExitNode: true });
+			const provisioned = (await db.query.peersTable.findFirst({ where: eq(peersTable.id, 'exitNodes-client') }))!.exitInterfaceName!;
+			expect(shellCallLog.isUp(provisioned)).toBe(true);
+
+			// no reset(): the recording adapter's isInterfaceUp state has to carry over, or
+			// converge sees a down interface and skips the teardown it is meant to do here
+			const before = shellCallLog.calls().length;
+			expect((await patch(SERVER, 'exitNodes-client', { isExitNode: false })).status).toBe(200);
+
+			const after = (await db.query.peersTable.findFirst({ where: eq(peersTable.id, 'exitNodes-client') }))!;
+			expect(after.exitInterfaceName).toBeNull();
+			expect(after.exitListenPort).toBeNull();
+			expect(shellCallLog.calls().slice(before)).toContainEqual({ fn: 'stopInterface', interfaceName: provisioned });
+			expect(shellCallLog.isUp(provisioned)).toBe(false);
+		});
+
+		it('honours an operator-pinned udp port, and refuses one already in use', async () => {
+			// The operator has to publish this port, so silently substituting another is worse
+			// than refusing.
+			expect((await patch(SERVER, 'exitNodes-client', { isExitNode: true, exitListenPort: 51950 })).status).toBe(200);
+			expect((await db.query.peersTable.findFirst({ where: eq(peersTable.id, 'exitNodes-client') }))!.exitListenPort).toBe(51950);
+
+			const clash = await post(SERVER, { friendlyName: 'third', isExitNode: true, exitListenPort: 51950 });
+			expect(clash.status).toBe(400);
+			expect(await clash.text()).toContain('already in use');
 		});
 
 		it('allows an exit node on a different interface', async () => {
 			const response = await post(OTHER, { friendlyName: 'other-exit', isExitNode: true });
 
-			// wgExit1's own exit node is exitNodes-foreign, so this is the second there too
-			expect(response.status).toBe(400);
+			expect(response.status).toBe(200);
 		});
 
 		it('accepts re-marking the peer that is already the exit node (idempotent PATCH)', async () => {
@@ -109,17 +156,36 @@ describe('exit nodes', () => {
 	});
 
 	describe('assigning an exit node', () => {
-		it('assigns an exit node and converges the interface', async () => {
+		it('assigns an exit node and routes that client into its link', async () => {
 			shellCallLog.reset();
 			const response = await patch(SERVER, 'exitNodes-client', { exitPeerId: 'exitNodes-exit' });
 
 			expect(response.status).toBe(200);
 
-			// the assignment changes the interface config (Table = off, the exit node's
-			// AllowedIPs) as well as routing, so it must converge, not just sync policy
+			const exitNode = (await db.query.peersTable.findFirst({ where: eq(peersTable.id, 'exitNodes-exit') }))!;
 			expect(shellCallLog.callsFor('wgExit0').length).toBeGreaterThan(0);
-			expect(shellCallLog.lastAppliedExitRouting()).toContain('ip -4 rule add from 10.66.0.3/32 table 52800');
-			expect(shellCallLog.lastAppliedExitRouting()).toContain('ip -4 route replace default dev wgExit0 table 52800');
+			expect(shellCallLog.lastAppliedExitRouting()).toContain(`ip -4 rule add from 10.66.0.3/32 table ${exitNode.exitRouteTableId}`);
+			expect(shellCallLog.lastAppliedExitRouting()).toContain(`ip -4 route replace default dev ${exitNode.exitInterfaceName} table ${exitNode.exitRouteTableId}`);
+		});
+
+		it('sends two clients of the same server to two different exit nodes', async () => {
+			// The whole point of the per-exit-node interface: two ip rules naming two tables,
+			// each with a default route out of a different device. One shared interface could not
+			// express this at all - the peer within an interface is picked by destination, and
+			// both clients want the same destination.
+			await patch(SERVER, 'exitNodes-client', { isExitNode: true });
+
+			const clientA = await (await post(SERVER, { friendlyName: 'client-a', exitPeerId: 'exitNodes-exit' })).json();
+			const clientB = await (await post(SERVER, { friendlyName: 'client-b', exitPeerId: 'exitNodes-client' })).json();
+
+			const [nodeA, nodeB] = await Promise.all([db.query.peersTable.findFirst({ where: eq(peersTable.id, 'exitNodes-exit') }), db.query.peersTable.findFirst({ where: eq(peersTable.id, 'exitNodes-client') })]);
+			const routing = shellCallLog.lastAppliedExitRouting() ?? [];
+
+			expect(nodeA!.exitRouteTableId).not.toBe(nodeB!.exitRouteTableId);
+			expect(routing).toContain(`ip -4 rule add from ${clientA.wgAddress}/32 table ${nodeA!.exitRouteTableId}`);
+			expect(routing).toContain(`ip -4 rule add from ${clientB.wgAddress}/32 table ${nodeB!.exitRouteTableId}`);
+			expect(routing).toContain(`ip -4 route replace default dev ${nodeA!.exitInterfaceName} table ${nodeA!.exitRouteTableId}`);
+			expect(routing).toContain(`ip -4 route replace default dev ${nodeB!.exitInterfaceName} table ${nodeB!.exitRouteTableId}`);
 		});
 
 		it('installs no ip rule for a peer without an exit node - the rule is the permission', async () => {
@@ -128,7 +194,8 @@ describe('exit nodes', () => {
 
 			// scoped to this server's own table: syncExitRouting reads every server, and the test
 			// run shares one in-memory db, so unrelated fixture files contribute their own rules
-			expect(shellCallLog.lastAppliedExitRouting()?.some((c) => c.includes('rule add') && c.includes('table 52800'))).toBe(false);
+			const exitNode = (await db.query.peersTable.findFirst({ where: eq(peersTable.id, 'exitNodes-exit') }))!;
+			expect(shellCallLog.lastAppliedExitRouting()?.some((c) => c.includes('rule add') && c.includes(`table ${exitNode.exitRouteTableId}`))).toBe(false);
 		});
 
 		it('rejects an exit node belonging to another server', async () => {
@@ -154,24 +221,6 @@ describe('exit nodes', () => {
 			const response = await patch(SERVER, 'exitNodes-client', { isExitNode: true, exitPeerId: 'exitNodes-exit' });
 
 			expect(response.status).toBe(400);
-		});
-
-		it('rejects an exit node assignment when the peer already has internet via the hub', async () => {
-			// routing wins over the grant, so the grant would be silently inert - reject rather
-			// than let the db hold a state the ui's three-way selector cannot display
-			await db.insert(policyGrantsTable).values({
-				serverPeerId: SERVER,
-				position: 0,
-				action: 'allow',
-				srcKind: 'peer',
-				srcPeerId: 'exitNodes-client',
-				dstKind: 'internet',
-			});
-
-			const response = await patch(SERVER, 'exitNodes-client', { exitPeerId: 'exitNodes-exit' });
-
-			expect(response.status).toBe(400);
-			expect(await response.text()).toContain('internet');
 		});
 
 		it('clears the assignment when exitPeerId is explicitly null', async () => {

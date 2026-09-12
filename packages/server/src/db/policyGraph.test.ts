@@ -71,7 +71,7 @@ describe('policyGraph', () => {
 					action: 'allow',
 					srcKind: 'tag',
 					srcTagId: 'policyGraph-tag-dev',
-					dstKind: 'internet',
+					dstKind: 'any',
 				},
 			])
 			.execute();
@@ -133,11 +133,26 @@ describe('policyGraph', () => {
 			expect(allowedIpsForPeer(graph!, peer)).toBe('10.90.90.0/24');
 		});
 
-		it('allowedIpsForPeer widens to 0.0.0.0/0 for an internet/any grant, and ignores a disabled one', async () => {
+		it('allowedIpsForPeer ignores a disabled grant', async () => {
 			const graph = await loadPolicyGraph('policyGraph-server');
 			const devPeer = graph!.peers.find((p) => p.id === 'policyGraph-dev1')!;
-			// the only internet grant on dev is disabled (policyGraph-grant-disabled) - must not widen
+			// the only `any` grant on dev is disabled (policyGraph-grant-disabled)
 			expect(allowedIpsForPeer(graph!, devPeer)).toBe('10.90.90.0/24');
+		});
+
+		it('allowedIpsForPeer enumerates what an `any` grant reaches rather than widening to 0.0.0.0/0', async () => {
+			// /0 in a normal config would route the client's internet traffic into a tunnel the
+			// hub no longer masquerades out of - see drizzle/0008_drop_hub_egress.sql. The one
+			// rendering that legitimately carries /0 is ?exit=true.
+			await db.update(peersTable).set({ advertisedRoutes: '192.168.90.0/24' }).where(eq(peersTable.id, 'policyGraph-db1')).execute();
+			await db.update(policyGrantsTable).set({ enabled: true }).where(eq(policyGrantsTable.id, 'policyGraph-grant-disabled')).execute();
+
+			const graph = await loadPolicyGraph('policyGraph-server');
+			const devPeer = graph!.peers.find((p) => p.id === 'policyGraph-dev1')!;
+			expect(allowedIpsForPeer(graph!, devPeer)).toBe('10.90.90.0/24, 192.168.90.0/24');
+
+			await db.update(policyGrantsTable).set({ enabled: false }).where(eq(policyGrantsTable.id, 'policyGraph-grant-disabled')).execute();
+			await db.update(peersTable).set({ advertisedRoutes: null }).where(eq(peersTable.id, 'policyGraph-db1')).execute();
 		});
 
 		it('allowedIpsForPeer appends an extra cidr from an enabled dstKind cidr grant', async () => {

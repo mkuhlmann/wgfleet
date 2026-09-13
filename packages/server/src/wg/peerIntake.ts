@@ -6,6 +6,7 @@ import { advertisedRoutesOf } from '@server/lib/exitTopology';
 import { resolveAdvertisedRoutes, resolvePeerAddress } from './addressing';
 import { loadExitLinkTaken } from './exitLinks';
 import { WG_LISTEN_PORT_MAX, WG_LISTEN_PORT_MIN } from '@server/lib/validation';
+import { failure, type Failure } from '@server/lib/failure';
 
 /**
  * Everything a peer write can set. `undefined` means "leave unchanged" on update and "use the
@@ -36,11 +37,11 @@ export type ResolvedPeerWrite = {
 	tagIds: string[] | undefined;
 };
 
-export type PeerWriteResult = { ok: true; values: ResolvedPeerWrite } | { ok: false; message: string };
+export type PeerWriteResult = { ok: true; values: ResolvedPeerWrite } | { ok: false; failure: Failure };
 
 /**
  * Resolves one peer write - create when `current` is null, update otherwise - into the column
- * values to store, or a single error message.
+ * values to store, or a single `Failure` naming the field that was refused.
  *
  * This is the whole peer write path behind one interface. It used to be four helpers called in
  * sequence by two near-identical handlers, each returning errors in a different shape (a
@@ -69,13 +70,13 @@ export async function resolvePeerWrite(server: ServerPeer, current: Peer | null,
 		taken.add(server.wgAddress);
 
 		const resolved = resolvePeerAddress(server.cidrRange, server.reservedIps, taken, { requested: request.wgAddress });
-		if (!resolved.ok) return { ok: false, message: resolved.message };
+		if (!resolved.ok) return resolved;
 
 		wgAddress = resolved.ip;
 	}
 
 	const invariantError = checkPeerInvariants(await loadInvariantSnapshot(server), current, request);
-	if (invariantError) return { ok: false, message: invariantError };
+	if (invariantError) return { ok: false, failure: invariantError };
 
 	const advertised = await resolveAdvertisedRoutesFor(server, current, request);
 	if (!advertised.ok) return advertised;
@@ -108,17 +109,17 @@ export async function resolvePeerWrite(server: ServerPeer, current: Peer | null,
  * next converge, which is exactly what an operator moving the port in their firewall wants.
  * Clearing it (null) hands the choice back to the allocator.
  */
-async function resolveExitListenPort(current: Peer | null, request: PeerWriteRequest): Promise<{ ok: true; value: number | null } | { ok: false; message: string }> {
+async function resolveExitListenPort(current: Peer | null, request: PeerWriteRequest): Promise<{ ok: true; value: number | null } | { ok: false; failure: Failure }> {
 	if (request.exitListenPort === undefined) return { ok: true, value: current?.exitListenPort ?? null };
 	if (request.exitListenPort === null) return { ok: true, value: null };
 
 	const port = request.exitListenPort;
 	if (!Number.isInteger(port) || port < WG_LISTEN_PORT_MIN || port > WG_LISTEN_PORT_MAX) {
-		return { ok: false, message: `exitListenPort must be between ${WG_LISTEN_PORT_MIN} and ${WG_LISTEN_PORT_MAX}` };
+		return { ok: false, failure: failure(`exitListenPort must be between ${WG_LISTEN_PORT_MIN} and ${WG_LISTEN_PORT_MAX}`, 'exitListenPort') };
 	}
 
 	const taken = await loadExitLinkTaken(current?.id);
-	if (taken.listenPorts.has(port)) return { ok: false, message: `Port ${port} is already in use by another interface` };
+	if (taken.listenPorts.has(port)) return { ok: false, failure: failure(`Port ${port} is already in use by another interface`, 'exitListenPort') };
 
 	return { ok: true, value: port };
 }
@@ -141,7 +142,7 @@ async function loadInvariantSnapshot(server: ServerPeer) {
  * than per-server: every *other* peer's advertisements plus every *other* interface's own
  * `cidrRange`, whose connected route an `ip route replace` would overwrite.
  */
-async function resolveAdvertisedRoutesFor(server: ServerPeer, current: Peer | null, request: PeerWriteRequest): Promise<{ ok: true; value: string | null } | { ok: false; message: string }> {
+async function resolveAdvertisedRoutesFor(server: ServerPeer, current: Peer | null, request: PeerWriteRequest): Promise<{ ok: true; value: string | null } | { ok: false; failure: Failure }> {
 	if (request.advertisedRoutes === undefined) return { ok: true, value: current?.advertisedRoutes ?? null };
 
 	const [allServers, allPeers] = await Promise.all([db.query.serverPeersTable.findMany(), db.query.peersTable.findMany()]);
@@ -157,7 +158,7 @@ async function resolveAdvertisedRoutesFor(server: ServerPeer, current: Peer | nu
 	];
 
 	const resolved = resolveAdvertisedRoutes(request.advertisedRoutes, server.cidrRange, reserved);
-	if (!resolved.ok) return { ok: false, message: resolved.message };
+	if (!resolved.ok) return resolved;
 
 	// Stored comma-separated and network-aligned, so wg/config.ts, wg/exitRouting.ts and
 	// wg/firewall.ts can all interpolate the entries verbatim. Null rather than '' for empty,

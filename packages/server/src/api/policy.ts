@@ -1,9 +1,13 @@
-import { Elysia, status, t } from 'elysia';
+import { Elysia, t } from 'elysia';
+import { fail } from './failure';
+import { failure } from '@server/lib/failure';
 import { db } from '../db';
 import { peerTagAssignmentsTable, peerTagsTable, peersTable, policyGrantsTable } from '../db/schema';
-import { eq, and, ne, inArray, asc } from 'drizzle-orm';
+import { eq, and, inArray, asc } from 'drizzle-orm';
 import { nanoid } from 'nanoid';
-import { isIpv4Cidr } from '../wg/firewall';
+import { checkGrantInvariants, type GrantInvariantSnapshot, type GrantRef } from '@server/lib/grantInvariants';
+import { checkTagInvariants } from '@server/lib/tagInvariants';
+import { TAG_NAME_REGEX } from '@server/lib/validation';
 import { converge } from '../wg/converge';
 import { memberCountByTag, policyGraphOf, toPolicyDocument } from '@server/db/policyGraph';
 import { auth } from './auth';
@@ -11,38 +15,9 @@ import { createLog } from '@server/lib/log';
 
 const log = createLog('http');
 
-const nameRegex = /^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$/;
-
-// comma-separated ports/ranges, e.g. "22,80,8000-8100" - each endpoint 1-65535, lo <= hi
-const portsRegex = /^\d{1,5}(-\d{1,5})?(,\d{1,5}(-\d{1,5})?)*$/;
-const maxPortEntries = 32;
-
-async function isTagNameInUse(serverPeerId: string, name: string, excludeTagId?: string) {
-	const existing = await db.query.peerTagsTable.findFirst({
-		where: excludeTagId ? and(eq(peerTagsTable.serverPeerId, serverPeerId), eq(peerTagsTable.name, name), ne(peerTagsTable.id, excludeTagId)) : and(eq(peerTagsTable.serverPeerId, serverPeerId), eq(peerTagsTable.name, name)),
-	});
-	return !!existing;
-}
-
-function isValidPorts(ports: string): boolean {
-	if (!portsRegex.test(ports)) return false;
-	const entries = ports.split(',');
-	if (entries.length > maxPortEntries) return false;
-	for (const entry of entries) {
-		const [loStr, hiStr] = entry.split('-');
-		const lo = Number(loStr);
-		const hi = hiStr !== undefined ? Number(hiStr) : lo;
-		if (lo < 1 || lo > 65535 || hi < 1 || hi > 65535 || lo > hi) return false;
-	}
-	return true;
-}
-
-// ports is only meaningful for tcp/udp - returns an error message, or null if ok
-function validatePorts(protocol: string | undefined, ports: string | null | undefined): string | null {
-	if (!ports || !ports.trim()) return null;
-	if (protocol !== 'tcp' && protocol !== 'udp') return 'ports can only be set when protocol is tcp or udp';
-	if (!isValidPorts(ports)) return `Invalid ports: ${ports}`;
-	return null;
+/** Every tag on this server, as lib/tagInvariants.ts wants it. */
+async function loadTagSnapshot(serverPeerId: string) {
+	return { tags: await db.select({ id: peerTagsTable.id, name: peerTagsTable.name }).from(peerTagsTable).where(eq(peerTagsTable.serverPeerId, serverPeerId)) };
 }
 
 // id-based grant shape - used by the structured editor (PUT .../grants), which already has
@@ -64,42 +39,33 @@ const grantBody = t.Object({
 	comment: t.Optional(t.Nullable(t.String())),
 });
 
-// validates an id-based grant against this server's tags/peers - null means valid
-async function validateGrant(serverPeerId: string, g: typeof grantBody.static): Promise<string | null> {
-	if (g.srcKind === 'tag') {
-		if (!g.srcTagId) return 'srcTagId is required when srcKind is "tag"';
-		const tag = await db.query.peerTagsTable.findFirst({ where: and(eq(peerTagsTable.id, g.srcTagId), eq(peerTagsTable.serverPeerId, serverPeerId)) });
-		if (!tag) return `Source tag ${g.srcTagId} not found on this server`;
-	} else if (!g.srcPeerId) {
-		return 'srcPeerId is required when srcKind is "peer"';
-	} else {
-		const peer = await db.query.peersTable.findFirst({ where: and(eq(peersTable.id, g.srcPeerId), eq(peersTable.serverPeerId, serverPeerId)) });
-		if (!peer) return `Source peer ${g.srcPeerId} not found on this server`;
-	}
+/**
+ * One grant's references, as lib/grantInvariants.ts wants them. The two write paths spell a
+ * grant differently - this one by id, the JSON policy document by tag *name* - so they resolve
+ * to this shape first and then run the identical rules, instead of validating the same five
+ * dstKind cases twice.
+ */
+const grantRefs = (g: {
+	srcKind: 'tag' | 'peer';
+	srcTagId?: string | null;
+	srcPeerId?: string | null;
+	dstKind: 'tag' | 'peer' | 'cidr' | 'server' | 'any';
+	dstTagId?: string | null;
+	dstPeerId?: string | null;
+	dstCidr?: string | null;
+}): { src: GrantRef; dst: GrantRef } => ({
+	src: g.srcKind === 'tag' ? { kind: 'tag', id: g.srcTagId } : { kind: 'peer', id: g.srcPeerId },
+	dst: g.dstKind === 'tag' ? { kind: 'tag', id: g.dstTagId } : g.dstKind === 'peer' ? { kind: 'peer', id: g.dstPeerId } : g.dstKind === 'cidr' ? { kind: 'cidr', cidr: g.dstCidr } : { kind: g.dstKind },
+});
 
-	switch (g.dstKind) {
-		case 'tag': {
-			if (!g.dstTagId) return 'dstTagId is required when dstKind is "tag"';
-			const tag = await db.query.peerTagsTable.findFirst({ where: and(eq(peerTagsTable.id, g.dstTagId), eq(peerTagsTable.serverPeerId, serverPeerId)) });
-			if (!tag) return `Destination tag ${g.dstTagId} not found on this server`;
-			break;
-		}
-		case 'peer': {
-			if (!g.dstPeerId) return 'dstPeerId is required when dstKind is "peer"';
-			const peer = await db.query.peersTable.findFirst({ where: and(eq(peersTable.id, g.dstPeerId), eq(peersTable.serverPeerId, serverPeerId)) });
-			if (!peer) return `Destination peer ${g.dstPeerId} not found on this server`;
-			break;
-		}
-		case 'cidr':
-			// ipv4-only - the firewall this feeds (wg/firewall.ts) is ipv4-only throughout
-			if (!g.dstCidr || !isIpv4Cidr(g.dstCidr)) return `Invalid or non-ipv4 CIDR: ${g.dstCidr}`;
-			break;
-		case 'server':
-		case 'any':
-			break;
-	}
+/** Tag and peer ids on this server - what the grant rules resolve references against. */
+async function loadGrantSnapshot(serverPeerId: string): Promise<GrantInvariantSnapshot> {
+	const [tags, peers] = await Promise.all([
+		db.select({ id: peerTagsTable.id }).from(peerTagsTable).where(eq(peerTagsTable.serverPeerId, serverPeerId)),
+		db.select({ id: peersTable.id }).from(peersTable).where(eq(peersTable.serverPeerId, serverPeerId)),
+	]);
 
-	return validatePorts(g.protocol, g.ports);
+	return { tagIds: tags.map((t) => t.id), peerIds: peers.map((p) => p.id) };
 }
 
 // The JSON policy document format - grants reference tags by name (see grantBody comment above).
@@ -119,7 +85,7 @@ const policyGrantDoc = t.Object({
 });
 
 const policyDocBody = t.Object({
-	tags: t.Array(t.Object({ name: t.RegExp(nameRegex), friendlyName: t.Optional(t.String()) })),
+	tags: t.Array(t.Object({ name: t.RegExp(TAG_NAME_REGEX), friendlyName: t.Optional(t.String()) })),
 	grants: t.Array(policyGrantDoc),
 	peerTags: t.Array(t.Object({ peerId: t.String(), friendlyName: t.Optional(t.String()), tags: t.Array(t.String()) })),
 });
@@ -140,9 +106,10 @@ export const policyRoutes = new Elysia()
 	.post(
 		'/wg/servers/:id/tags',
 		async ({ wgServer: server, params, body }) => {
-			if (await isTagNameInUse(server.id, body.name)) {
-				return status(400, 'A tag with this name already exists on this server');
-			}
+			// the same function TagModal.vue validates with (lib/tagInvariants.ts) - name format
+			// and uniqueness stated once rather than re-spelled on each side
+			const invalid = checkTagInvariants(await loadTagSnapshot(server.id), null, body);
+			if (invalid) return fail(400, invalid);
 
 			const tag = await db.insert(peerTagsTable).values({ serverPeerId: server.id, name: body.name, friendlyName: body.friendlyName }).returning();
 
@@ -152,7 +119,7 @@ export const policyRoutes = new Elysia()
 			return tag[0];
 		},
 		{
-			body: t.Object({ name: t.RegExp(nameRegex), friendlyName: t.Optional(t.String()) }),
+			body: t.Object({ name: t.RegExp(TAG_NAME_REGEX), friendlyName: t.Optional(t.String()) }),
 			params: t.Object({ id: t.String() }),
 			serverScope: true,
 		},
@@ -163,11 +130,10 @@ export const policyRoutes = new Elysia()
 			const tag = await db.query.peerTagsTable.findFirst({
 				where: and(eq(peerTagsTable.id, params.tagId), eq(peerTagsTable.serverPeerId, server.id)),
 			});
-			if (!tag) return status(404, 'Tag not found');
+			if (!tag) return fail(404, 'Tag not found');
 
-			if (body.name && (await isTagNameInUse(server.id, body.name, tag.id))) {
-				return status(400, 'A tag with this name already exists on this server');
-			}
+			const invalid = checkTagInvariants(await loadTagSnapshot(server.id), tag, body);
+			if (invalid) return fail(400, invalid);
 
 			const updated = await db
 				.update(peerTagsTable)
@@ -181,7 +147,7 @@ export const policyRoutes = new Elysia()
 			return updated[0];
 		},
 		{
-			body: t.Object({ name: t.Optional(t.RegExp(nameRegex)), friendlyName: t.Optional(t.String()) }),
+			body: t.Object({ name: t.Optional(t.RegExp(TAG_NAME_REGEX)), friendlyName: t.Optional(t.String()) }),
 			params: t.Object({ id: t.String(), tagId: t.String() }),
 			serverScope: true,
 		},
@@ -192,7 +158,7 @@ export const policyRoutes = new Elysia()
 			const tag = await db.query.peerTagsTable.findFirst({
 				where: and(eq(peerTagsTable.id, params.tagId), eq(peerTagsTable.serverPeerId, server.id)),
 			});
-			if (!tag) return status(404, 'Tag not found');
+			if (!tag) return fail(404, 'Tag not found');
 
 			// no db-level FK enforcement (sqlite foreign_keys pragma isn't turned on
 			// anywhere in this codebase), so cascade cleanup happens explicitly here.
@@ -221,9 +187,10 @@ export const policyRoutes = new Elysia()
 	.put(
 		'/wg/servers/:id/grants',
 		async ({ wgServer: server, params, body }) => {
+			const snapshot = await loadGrantSnapshot(server.id);
 			for (const g of body.grants) {
-				const error = await validateGrant(server.id, g);
-				if (error) return status(400, error);
+				const invalid = checkGrantInvariants(snapshot, { ...grantRefs(g), protocol: g.protocol, ports: g.ports });
+				if (invalid) return fail(400, invalid);
 			}
 
 			db.transaction((tx) => {
@@ -275,7 +242,7 @@ export const policyRoutes = new Elysia()
 		async ({ wgServer: server, params, body }) => {
 			const tagNames = new Set<string>();
 			for (const tag of body.tags) {
-				if (tagNames.has(tag.name)) return status(400, `Duplicate tag name in document: ${tag.name}`);
+				if (tagNames.has(tag.name)) return fail(400, `Duplicate tag name in document: ${tag.name}`);
 				tagNames.add(tag.name);
 			}
 
@@ -283,36 +250,22 @@ export const policyRoutes = new Elysia()
 			const peerIds = new Set(peers.map((p) => p.id));
 
 			for (const pt of body.peerTags) {
-				if (!peerIds.has(pt.peerId)) return status(400, `Peer ${pt.peerId} not found on this server`);
+				if (!peerIds.has(pt.peerId)) return fail(400, `Peer ${pt.peerId} not found on this server`);
 				for (const tagName of pt.tags) {
-					if (!tagNames.has(tagName)) return status(400, `Unknown tag "${tagName}" referenced for peer ${pt.peerId}`);
+					if (!tagNames.has(tagName)) return fail(400, `Unknown tag "${tagName}" referenced for peer ${pt.peerId}`);
 				}
 			}
 
+			// The document addresses tags by name rather than id (new tags in an imported document
+			// have no id yet), so names *are* the identifiers here - same rules, same module.
+			const documentSnapshot = { tagIds: [...tagNames], peerIds: [...peerIds] };
 			for (const g of body.grants) {
-				if (g.srcKind === 'tag') {
-					if (!g.srcTag || !tagNames.has(g.srcTag)) return status(400, `Unknown source tag "${g.srcTag}"`);
-				} else if (!g.srcPeerId || !peerIds.has(g.srcPeerId)) {
-					return status(400, `Unknown source peer "${g.srcPeerId}"`);
-				}
-
-				switch (g.dstKind) {
-					case 'tag':
-						if (!g.dstTag || !tagNames.has(g.dstTag)) return status(400, `Unknown destination tag "${g.dstTag}"`);
-						break;
-					case 'peer':
-						if (!g.dstPeerId || !peerIds.has(g.dstPeerId)) return status(400, `Unknown destination peer "${g.dstPeerId}"`);
-						break;
-					case 'cidr':
-						if (!g.dstCidr || !isIpv4Cidr(g.dstCidr)) return status(400, `Invalid or non-ipv4 CIDR: ${g.dstCidr}`);
-						break;
-					case 'server':
-					case 'any':
-						break;
-				}
-
-				const portsError = validatePorts(g.protocol, g.ports);
-				if (portsError) return status(400, portsError);
+				const invalid = checkGrantInvariants(documentSnapshot, {
+					...grantRefs({ ...g, srcTagId: g.srcTag, dstTagId: g.dstTag }),
+					protocol: g.protocol,
+					ports: g.ports,
+				});
+				if (invalid) return fail(400, invalid);
 			}
 
 			// all validated (reads only, done above) - apply the whole document atomically.

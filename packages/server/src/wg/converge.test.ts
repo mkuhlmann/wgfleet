@@ -6,7 +6,7 @@ import { converge } from './converge';
 // @server/wg/shell is replaced wholesale by the recording adapter in tests/setup.ts (see
 // shell.recording.ts) - this is the seam candidate 2 made observable: real assertions on
 // what converge actually did, not just that the handler returned 200.
-import { shellCallLog } from '@server/wg/shell';
+import { shellCallLog } from '@server/wg/shell.recording';
 
 describe('converge', () => {
 	beforeAll(async () => {
@@ -51,11 +51,17 @@ describe('converge', () => {
 
 		const first = await converge('convergeTest-serverA');
 		expect(first).toEqual({ ok: true });
-		expect(shellCallLog.callsFor('wgConvA')).toEqual([{ fn: 'startInterface', interfaceName: 'wgConvA' }]);
+		expect(shellCallLog.fnsFor('wgConvA')).toEqual(['startInterface']);
+		// one look at the host per converge, not one probe per interface - the start-vs-reload
+		// decision is made in the plan (wg/plan.ts) from that single snapshot
+		expect(shellCallLog.fns().filter((fn) => fn === 'listInterfaces')).toHaveLength(1);
 		// firewall, then exit routing last - the latter installs `ip route ... dev <iface>` and
 		// so has to run after the interface exists (see converge()).
-		expect(shellCallLog.calls().at(-2)).toEqual({ fn: 'applyFirewall', ruleset: shellCallLog.lastAppliedRuleset() });
-		expect(shellCallLog.calls().at(-1)).toEqual({ fn: 'applyExitRouting', commands: shellCallLog.lastAppliedExitRouting() });
+		expect(shellCallLog.fns().slice(-2)).toEqual(['applyFirewall', 'applyExitRouting']);
+		// and carried real content, rather than merely being called: the ruleset is always a
+		// whole-fleet replacement (firewall.ts applies `table {}; delete table; table {...}`)
+		expect(shellCallLog.lastAppliedRuleset()).toContain('delete table inet wgmgr');
+		expect(shellCallLog.lastAppliedExitRouting()).not.toBeNull();
 
 		// no shellCallLog.reset() here - the recording adapter's isInterfaceUp state (set by
 		// the startInterface call above) must carry over, same as a real interface would stay up
@@ -63,7 +69,7 @@ describe('converge', () => {
 		const second = await converge('convergeTest-serverA');
 		expect(second).toEqual({ ok: true });
 		const newCalls = shellCallLog.calls().slice(callsBeforeSecond);
-		expect(newCalls.filter((c) => 'interfaceName' in c && c.interfaceName === 'wgConvA')).toEqual([{ fn: 'reloadInterface', interfaceName: 'wgConvA' }]);
+		expect(newCalls.filter((c) => c.args[0] === 'wgConvA').map((c) => c.fn)).toEqual(['reloadInterface']);
 	});
 
 	it('re-resolves the server row itself, so it always converges the latest config', async () => {
@@ -83,8 +89,8 @@ describe('converge', () => {
 		expect(resultB).toEqual({ ok: true });
 
 		const calls = shellCallLog.calls();
-		const aIndex = calls.findIndex((c) => 'interfaceName' in c && c.interfaceName === 'wgConvA');
-		const bIndex = calls.findIndex((c) => 'interfaceName' in c && c.interfaceName === 'wgConvB');
+		const aIndex = calls.findIndex((c) => c.args[0] === 'wgConvA');
+		const bIndex = calls.findIndex((c) => c.args[0] === 'wgConvB');
 		// whichever was queued first (A, since it was passed first to Promise.all) must
 		// fully finish its interface step before B's starts - the chain is global, not
 		// per-server.

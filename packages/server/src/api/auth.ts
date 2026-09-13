@@ -1,4 +1,5 @@
 import { Elysia, t } from 'elysia';
+import { fail } from './failure';
 import { db } from '@server/db';
 import { adminSessionsTable, peersTable } from '@server/db/schema';
 import { and, eq, gt, lt } from 'drizzle-orm';
@@ -32,12 +33,12 @@ export const auth = new Elysia({ name: 'auth' }).macro({
 			scope?: 'admin' | 'server' | 'peer';
 		} = {
 			scope: 'admin',
-		}
+		},
 	) {
 		return {
 			async resolve({ headers, status, params }) {
 				const token = bearerToken(headers.authorization);
-				if (!token) return status(401);
+				if (!token) return fail(401, 'Unauthorized');
 
 				if (await isAdmin(token)) return;
 
@@ -65,7 +66,7 @@ export const auth = new Elysia({ name: 'auth' }).macro({
 					}
 				}
 
-				return status(401);
+				return fail(401, 'Unauthorized');
 			},
 		};
 	},
@@ -84,15 +85,15 @@ export const auth = new Elysia({ name: 'auth' }).macro({
 	serverScope: {
 		async resolve({ headers, status, params }) {
 			const token = bearerToken(headers.authorization);
-			if (!token) return status(401);
+			if (!token) return fail(401, 'Unauthorized');
 
 			const { id } = (params ?? {}) as { id?: string };
 			const server = id ? await resolveServer(id) : undefined;
 
 			const authorized = (await isAdmin(token)) || (!!server && server.authToken === token);
-			if (!authorized) return status(401);
+			if (!authorized) return fail(401, 'Unauthorized');
 
-			if (!server) return status(404, 'Server not found');
+			if (!server) return fail(404, 'Server not found');
 
 			// `wgServer`, not `server`: elysia's own context already carries a readonly
 			// `server` (the Bun server instance), and shadowing it throws at runtime.
@@ -109,19 +110,19 @@ export const auth = new Elysia({ name: 'auth' }).macro({
 	serverPeerScope: {
 		async resolve({ headers, status, params }) {
 			const token = bearerToken(headers.authorization);
-			if (!token) return status(401);
+			if (!token) return fail(401, 'Unauthorized');
 
 			const { id, peerId } = (params ?? {}) as { id?: string; peerId?: string };
 			const server = id ? await resolveServer(id) : undefined;
 
 			const authorized = (await isAdmin(token)) || (!!server && server.authToken === token);
-			if (!authorized) return status(401);
+			if (!authorized) return fail(401, 'Unauthorized');
 
-			if (!server) return status(404, 'Server not found');
+			if (!server) return fail(404, 'Server not found');
 
 			const peer = peerId ? await db.query.peersTable.findFirst({ where: and(eq(peersTable.id, peerId), eq(peersTable.serverPeerId, server.id)) }) : undefined;
 
-			if (!peer) return status(404, 'Peer not found');
+			if (!peer) return fail(404, 'Peer not found');
 
 			// `wgServer`, not `server` - see serverScope above.
 			return { wgServer: server, peer };
@@ -135,15 +136,15 @@ export const auth = new Elysia({ name: 'auth' }).macro({
 	peerScope: {
 		async resolve({ headers, status, params }) {
 			const token = bearerToken(headers.authorization);
-			if (!token) return status(401);
+			if (!token) return fail(401, 'Unauthorized');
 
 			const { id } = (params ?? {}) as { id?: string };
 			const peer = id ? await db.query.peersTable.findFirst({ where: eq(peersTable.id, id) }) : undefined;
 
 			const authorized = (await isAdmin(token)) || (!!peer && peer.authToken === token);
-			if (!authorized) return status(401);
+			if (!authorized) return fail(401, 'Unauthorized');
 
-			if (!peer) return status(404, 'Peer not found');
+			if (!peer) return fail(404, 'Peer not found');
 
 			return { peer };
 		},
@@ -156,7 +157,7 @@ export const authRoutes = new Elysia({ prefix: '/auth' })
 		'/login',
 		async ({ body, status }) => {
 			if (body.token?.trim() !== process.env.ADMIN_TOKEN?.trim()) {
-				return status(401, 'Invalid admin token');
+				return fail(401, 'Invalid admin token');
 			}
 
 			// Opportunistic cleanup of expired sessions
@@ -184,7 +185,7 @@ export const authRoutes = new Elysia({ prefix: '/auth' })
 				remember: t.Optional(t.Boolean()),
 				durationDays: t.Optional(t.Number()),
 			}),
-		}
+		},
 	)
 	.post(
 		'/logout',
@@ -199,7 +200,7 @@ export const authRoutes = new Elysia({ prefix: '/auth' })
 			verifyAuth: {
 				scope: 'admin',
 			},
-		}
+		},
 	)
 	.get(
 		'/verify',
@@ -210,5 +211,5 @@ export const authRoutes = new Elysia({ prefix: '/auth' })
 			verifyAuth: {
 				scope: 'admin',
 			},
-		}
+		},
 	);

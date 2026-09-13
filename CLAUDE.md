@@ -54,11 +54,19 @@ The frontend never calls a generated client or a hand-maintained schema package.
   immediately**, with no build step in between.
 - The frontend also imports DB row types directly (`import type { Peer } from '@server/db/schema'`) instead of
   duplicating them.
-- Field *shapes* are validated by Elysia's `t.*` on the server only. **Cross-row rules are shared**: the pure,
-  io-free modules under `src/lib/` (`validation.ts`, `peerInvariants.ts`, `exitTopology.ts`) are imported by both
-  the route handlers and the Vue modals, so a rule like "a peer cannot be an exit node and use one" is stated once. Anything a
-  modal still checks by hand (e.g. `ServerModal.vue`'s field formats) has to be kept in sync by hand - prefer
-  moving a new cross-row rule into `src/lib/` over mirroring it.
+- Field *shapes* are validated by Elysia's `t.*` on the server only. **Every other rule is shared**: the pure,
+  io-free modules under `src/lib/` - `validation.ts`, `exitTopology.ts` and one `*Invariants.ts` per entity
+  (`peerInvariants`, `serverInvariants`, `grantInvariants`, `tagInvariants`) - are imported by both the route
+  handlers and the Vue modals, so a rule like "a peer cannot be an exit node and use one", or "that udp port is
+  taken", is stated once and checkable on both sides. **A rule a modal states by hand is a bug** - every such
+  mirror that existed had drifted (the grant form's copy of the ports rule was missing the max-entries check;
+  the server form checked an address format the api had no equivalent for, and disagreed with it about
+  trailing prefixes). Put a new rule in `src/lib/` and call it from both.
+- Each invariant module returns a `Failure` (`lib/failure.ts`) - a message **plus the request field it is
+  about** - or null. `api/failure.ts`'s `fail(code, failure)` is the only thing that turns one into an http
+  response, so every error body is json of exactly that shape, and `queries/edenClient.ts` decodes it once and
+  throws an `ApiError` carrying the field. That is what lets a modal put a server-side refusal on the input
+  that caused it (see `queries/useWrite.ts`'s `fields` option).
 
 ### Server: Elysia plugin composition
 
@@ -104,44 +112,63 @@ API handler (see `DELETE /wg/servers/:id/tags/:tagId` in `src/api/policy.ts` for
 await converge(server.id); // peers, servers, tags, grants, policy documents - all of them
 ```
 
-It reconciles the server's **exit links** first (`reconcileExitLinks`, see "Exit nodes" below - a server owns
-its own interface plus one per exit node, and which ones should exist has to be settled before any config is
-rendered), starts each of those interfaces if it isn't up and reloads it otherwise, then re-applies both
-host-wide artefacts (the nft ruleset and the host's policy routing) from a single **fleet snapshot** -
-`loadFleet()` in `db/fleet.ts`, one read of every server's `PolicyGraph`, in the stable order `buildRuleset`'s
-ordinal nft naming depends on. `syncFirewall`/`syncExitRouting` take that snapshot rather than loading their own;
-they used to issue the same N+1 query independently, twice per converge.
+It runs exactly three steps, and the split is the point:
+
+1. **`reconcileExitLinks`** (see "Exit nodes" below) - the only one that *writes*, allocating or releasing a
+   peer's five exit-link columns. Everything below is read after it.
+2. **`planConverge(...)`** (`wg/plan.ts`) - **pure**. Takes one **fleet snapshot** (`loadFleet()` in
+   `db/fleet.ts`, one read of every server's `PolicyGraph`, in the stable order `buildRuleset`'s ordinal nft
+   naming depends on) plus one `listInterfaces()` look at the host, and returns a `ConvergePlan`: an *ordered*
+   list of interface steps (`start` / `reload` / `restart` / `stop`), the route tables to drain, the whole nft
+   ruleset and the whole `ip` command list.
+3. **apply the plan.**
+
+Converge's ordering constraints used to live only in comments (released links go down before anything comes up;
+allocation precedes rendering; routing runs after the devices exist; the orphan sweep runs *here* not *there*),
+with `Promise<void>` types saying none of it - one of them was restated in four places, which is what happens
+when nothing enforces a rule. Now the order **is** the plan, and `wg/plan.test.ts` asserts it without a host.
+The `restart` action exists for the one case a reload silently gets wrong: a just-provisioned exit link whose
+name is still up from a crashed predecessor, where `wg syncconf` would apply the peers but not the new
+`[Interface]` key and port.
 
 This used to be a choice - `converge()` for peer/server config, `syncFirewall()` alone for pure policy changes -
 decided by hand at ten call sites against a rule that lived only in a comment, where picking wrong was a silent
 routing bug rather than a failing test. A policy-only mutation now also reloads the interface: that is a
 `wg syncconf` with identical content, and it puts every nft rebuild on converge's serialized chain instead of
-letting a policy handler race a concurrent converge. `convergeHost()` (no interface step) applies the host-wide
-half alone; `tearDownExitLink()` is the one escape hatch, for the peer-delete handler, which has to take an
-interface down whose describing row is about to disappear.
+letting a policy handler race a concurrent converge. `tearDownExitLink()` is the one escape hatch, for the
+peer-delete handler, which has to take an interface down whose describing row is about to disappear.
 
 Failures are logged, not thrown: a `ConvergeResult` of `{ ok: false }` means the mutation was still applied and
-persisted. Handlers `log.warn` and return 200.
+persisted. Handlers `log.warn` and return 200. The host-wide half is applied **even when an interface step
+failed** - a just-deleted peer has to lose its nft grants and its `ip rule` whether or not the interface came
+back up.
 
 ### The wg/ layer: real vs. shim, and three independent capability axes
 
-`src/wg/shell.ts` is a capability-detecting dispatcher, evaluated once at import time (top-level `await`), that
-picks between `shell.real.ts` (actual `wg`/`wg-quick`/`ip`/`nft` invocations) and `shell.shim.ts` (in-memory
-fakes) **per capability**, not as a single on/off switch:
+`src/wg/host.ts` declares `WgHost`, the interface every adapter at this seam implements, and the pure half of
+the dispatch (`chooseHost`, `readShimOverride`, `capabilityRefusal`) - all of it tested in `wg/host.test.ts`.
+`src/wg/shell.ts` does the io: it probes the host once at import time (top-level `await`) and picks between
+`shell.real.ts` (actual `wg`/`wg-quick`/`ip`/`nft` invocations) and `shell.shim.ts` (in-memory fakes)
+**per capability**, not as a single on/off switch:
 
 | Axis | Probed by | Powers |
 |---|---|---|
 | `crypto` | `Bun.which('wg')` | `wgGenKey`/`wgGenPsk`/`wgDerivePublicKey` |
-| `network` | `wg-quick`+`ip` present, and an actual `ip link add ... type dummy` probe (binaries can exist without `NET_ADMIN`) | `startServer`/`reloadServer`/`stopServer`/`wgShow`/`isInterfaceUp`/`applyExitRouting` |
+| `network` | `wg-quick`+`ip` present, and an actual `ip link add ... type dummy` probe (binaries can exist without `NET_ADMIN`) | `startInterface`/`reloadInterface`/`stopInterface`/`wgShow`/`isInterfaceUp`/`listInterfaces`/`applyExitRouting` |
 | `firewall` | `nft` present and `nft list tables` actually succeeds | `applyFirewall`/`resetFirewall` |
 
 In production (`NODE_ENV=production`), missing any capability throws on boot unless `WG_DEV_SHIM=true` is set
 explicitly - it will not silently fall back to shimmed behavior. Outside production, each missing capability
-logs a warning and shims just that axis. **When adding a new exported function to this layer, add it to all
-four files (`shell.ts`, `shell.real.ts`, `shell.shim.ts`, `shell.recording.ts`)** - `src/tests/setup.ts`'s
-`mock.module('@server/wg/shell', ...)` re-exports `shell.recording.ts` wholesale for every test, so a function
-missing from that adapter is `undefined` in every test. `shell.recording.ts` behaves like the shim but also
-keeps a call log, which is how tests assert *that* a mutation reloaded an interface or resynced policy.
+logs a warning and shims just that axis.
+
+**To add a function to this layer, add it to `WgHost` (`wg/host.ts`)** - `shell.ts` assigns each adapter's
+module namespace to that type, so a missing or mistyped member in `shell.real.ts`/`shell.shim.ts` is a compile
+error. This replaces a four-files-in-sync rule that nothing checked (and that two members had already drifted
+from). The third adapter, `shell.recording.ts`, is the test one: it wraps a deterministic in-memory host with a
+generic recorder, so *every* call is logged without a per-function list, and `src/tests/setup.ts` spreads its
+`recordingHost` over the mocked module rather than re-exporting hand-written names. `shellCallLog` is how tests
+assert that a mutation reloaded an interface or resynced policy - note it records reads (`isInterfaceUp`,
+`listInterfaces`) too. Import it from `@server/wg/shell.recording`, not from `@server/wg/shell`.
 
 Local dev/tests never need root or real WireGuard tooling: `WG_DEV_SHIM=true bun run dev` (or just running
 outside a privileged container) exercises the full app against the shim.
@@ -180,10 +207,13 @@ reason is why `allowedIpsForPeer` (`db/policyGraph.ts`) never widens to `0.0.0.0
 `internet`/`any` grant, and that hint would now route a client's internet traffic into a tunnel that drops it.
 `?exit=true` is the one rendering that legitimately carries `/0`.
 
-`src/wg/firewall.ts` splits into a pure `buildRuleset(servers: FirewallServer[])` (no db, no io - this is what
-`firewall.test.ts` drives directly with fixtures) and a thin `generateFirewallRuleset(fleet)`/`syncFirewall(fleet)`
-that take the fleet snapshot (`loadFleet()` in `db/fleet.ts`) and apply it - they no longer read the db
-themselves, so the ruleset and the exit routing always derive from the same snapshot. Keep new test scenarios on the pure function - `bun:sqlite` under
+`src/wg/firewall.ts` exposes one function: `buildRuleset(fleet: PolicyGraph[])`, pure (no db, no io), taking the
+fleet snapshot itself. It folds in the projection that resolves tags to member ips, decides which peers are
+governed and drops unresolvable grants - that projection used to sit *above* this seam, which meant
+`firewall.test.ts`'s fixtures re-enacted it by hand and nothing verified it. `wg/exitRouting.ts` is the same
+shape (`buildExitRouting(fleet)`, plus a pure `buildExitRoutingChecks(fleet)` for the sysctl warnings).
+Build `PolicyGraph` fixtures with `graphOf()` from `src/tests/graphs.ts`. Keep new test scenarios on the pure
+function - `bun:sqlite` under
 `NODE_ENV=test` is a single in-memory database shared across *all* test files in the same run, so anything
 reading "all servers" from the db in a test would pick up fixtures inserted by unrelated test files (this is why
 existing fixtures prefix ids per-file, e.g. `serversRouter-server`, `peersRouters-server`, `policyRouter-server`).
@@ -211,8 +241,10 @@ steered into one). The things most likely to surprise:
   `reconcileExitLinks` first, so a row that became an exit node by any path - the api, a policy
   import, a direct db write, or `drizzle/0009_exit_links.sql` landing on an install that
   already had one - gets provisioned on the next converge. Releasing works the same way, and
-  `converge` additionally sweeps `wgx`-shaped interfaces no peer claims (a peer deleted while
-  the process was down).
+  the plan additionally stops `wgx`-shaped interfaces no peer claims (a peer deleted while the
+  process was down) - *before* anything starts, so an orphan whose name is about to be reissued
+  is gone first. A link that is reissued while still up is `restart`ed rather than reloaded,
+  since `wg syncconf` would not apply its new key and port.
 - **The `ip rule` is the permission, not the nft rule.** `wg/exitRouting.ts` installs
   `ip rule from <client>/32 table <that exit node's exitRouteTableId>` only for peers with an
   `exitPeerId`. Two clients of one server landing in two different tables, each with
@@ -250,9 +282,10 @@ the route itself is a single main-table entry, so a prefix another interface alr
 interface's own `cidrRange`, whose connected route would be overwritten - is just as unusable. That function also
 network-aligns each entry, since `ip route` and nft both reject a prefix with host bits set.
 
-Like `firewall.ts`, `exitRouting.ts` splits into a pure `buildExitRouting(servers)` (what
-`exitRouting.test.ts` drives) and a thin `syncExitRouting()`; it runs at the *end* of
-`converge()` because `ip route ... dev <iface>` needs the device to exist. Anything touching
+Like `firewall.ts`, `exitRouting.ts` is pure - `buildExitRouting(fleet)` and
+`buildExitRoutingChecks(fleet)`, which is what `exitRouting.test.ts` drives; converge applies
+the commands at the *end* of the plan because `ip route ... dev <iface>` needs the device to
+exist. Anything touching
 `isExitNode`/`exitPeerId` changes the interface config too - which `converge()` handles, since it always applies
 both the interface and the host-wide state.
 
@@ -262,9 +295,17 @@ both the interface and the host-wide state.
 documents the "operator terminal console" system in detail (bracketed `[ action ]` buttons, `>` prompt glyphs,
 `///` section markers, the `Base*` component set, the token palette in `src/assets/main.css`) and explicitly
 lists what not to reach for (no PrimeVue/icon packages/second accent color - both were deliberately removed).
-State: TanStack Vue Query for all server state (`src/queries/*.ts`, `queryOptions()` pattern, mutations inline
-in the modal components that use them), a single Pinia store for the in-memory (non-persisted) auth token
-(`src/stores/auth.ts` - reloading the page logs you out by design).
+State: TanStack Vue Query for all server state (`src/queries/*.ts`, `queryOptions()` pattern), a single Pinia
+store for the in-memory (non-persisted) auth token (`src/stores/auth.ts` - reloading the page logs you out by
+design).
+
+**Every write goes through `useWrite` (`src/queries/useWrite.ts`)** - it takes the eden call, the
+`invalidate.*` fan-out from `queries/keys.ts` and a summary, and owns the rest: routing a field-scoped
+`ApiError` onto the matching key of the form's `errors` object, and everything else to a toast (or, with
+`report: 'inline'`, to `inlineError` - `PolicyJsonPanel.vue` is the one surface that wants that). Do not hand-roll
+a `useMutation` here: the eleven write paths that predate this module each decided failure reporting
+separately, and the three destructive ones (delete a peer, delete a tag, reset traffic) had decided on nothing,
+failing as an unhandled rejection with no UI feedback at all.
 
 ## Agent skills
 

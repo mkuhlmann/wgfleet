@@ -12,7 +12,7 @@
 			<PeerModal v-model:visible="showAddPeerModal" :server="server" />
 			<PeerModal v-model:visible="showEditPeerModal" :peer="selectedPeer" :server="server" />
 			<PeerTrafficModal v-model:visible="showPeerTrafficModal" :server-id="server.id" :peer="selectedTrafficPeer" />
-			<ServerModal v-model:visible="showEditServerModal" :server="server" />
+			<ServerModal v-model:visible="showEditServerModal" :server="server" :servers="servers ?? []" />
 
 			<div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
 				<BaseCard :title="server.friendlyName ?? server.id">
@@ -192,7 +192,7 @@
 </template>
 
 <script setup lang="ts">
-import { queryServer, queryServerPeers } from '@app/queries/queryServers';
+import { queryServer, queryServerPeers, queryServers } from '@app/queries/queryServers';
 import { queryServerTraffic, type TrafficResolution } from '@app/queries/queryTraffic';
 import { queryServerTags } from '@app/queries/queryPolicy';
 import { useQuery, useQueryClient } from '@tanstack/vue-query';
@@ -200,6 +200,7 @@ import { useRoute } from 'vue-router';
 import { ref, computed } from 'vue';
 import { api } from '@app/queries/edenClient';
 import { invalidate } from '@app/queries/keys';
+import { useWrite } from '@app/queries/useWrite';
 import QrcodeVue from 'qrcode.vue';
 import PeerModal from '@app/components/PeerModal.vue';
 import PeerTrafficModal from '@app/components/PeerTrafficModal.vue';
@@ -223,6 +224,9 @@ const serverId = route.params.id as string;
 const toast = useToast();
 
 const { data: server, isLoading } = useQuery(queryServer(serverId));
+// the server form checks "is this port already taken by another server" against this list -
+// see lib/serverInvariants.ts
+const { data: servers } = useQuery(queryServers());
 const { data: peers } = useQuery(queryServerPeers(serverId));
 const { data: tags } = useQuery(queryServerTags(serverId));
 
@@ -261,12 +265,20 @@ const showQrCode = async (peerId: string) => {
 
 type ConfigVariant = { exit?: boolean; nat?: boolean };
 
+// One peer row, several renderings - the exit variant differs from the normal one only in
+// AllowedIPs and DNS (same key, same address), which is what lets a client just switch files.
+// See wg/config.ts.
+const fetchConfig = useWrite({
+	mutationFn: async ({ peerId, variant }: { peerId: string; variant: ConfigVariant }) => (await api.wg.peers({ id: peerId }).config.get({ query: variant })).data ?? '',
+	summary: 'Failed to load the peer configuration',
+	onSuccess: (config) => {
+		wgConfig.value = config;
+	},
+});
+
 const getPeerConfig = async (peerId: string, variant: ConfigVariant = {}) => {
-	// One peer row, several renderings - the exit variant differs from the normal one only in
-	// AllowedIPs and DNS (same key, same address), which is what lets a client just switch
-	// files. See wg/config.ts.
-	const config = await api.wg.peers({ id: peerId }).config.get({ query: variant });
-	wgConfig.value = config.data ?? '';
+	wgConfig.value = '';
+	await fetchConfig.mutateAsync({ peerId, variant }).catch(() => undefined);
 };
 
 const configHeader = ref('configuration');
@@ -304,25 +316,29 @@ const showTraffic = (peer: PublicPeer) => {
 	showPeerTrafficModal.value = true;
 };
 
-const deletePeer = async (peerId: string) => {
+const removePeer = useWrite({
+	mutationFn: async (peerId: string) => (await api.wg.servers({ id: serverId }).peers({ peerId }).delete()).data,
+	summary: 'Failed to delete the peer',
+	// a peer delete also cascades referencing grants server-side (serversPeers.ts)
+	invalidate: (qc) => invalidate.afterPeerDelete(qc, serverId),
+	onSuccess: (result) => {
+		// Deleting an exit node unassigns its clients - say so, since it leaves them with no
+		// internet at all until another exit node is assigned. There is no hub egress to fall
+		// back to (drizzle/0008_drop_hub_egress.sql).
+		const unassigned = result?.unassignedExitClients ?? [];
+		if (unassigned.length) {
+			toast.add({
+				severity: 'info',
+				summary: 'Exit node deleted',
+				detail: `${unassigned.map((p) => p.friendlyName ?? p.wgAddress).join(', ')} no longer have internet access. Assign them another exit node.`,
+				life: 10000,
+			});
+		}
+	},
+});
+
+const deletePeer = (peerId: string) => {
 	if (!confirm('Are you sure you want to delete this peer?')) return;
-
-	const response = await api.wg.servers({ id: serverId }).peers({ peerId: peerId }).delete();
-	// a peer delete also cascades referencing grants server-side (serversPeers.ts) - see
-	// invalidate.afterPeerDelete
-	await invalidate.afterPeerDelete(queryClient, serverId);
-
-	// Deleting an exit node unassigns its clients - say so, since it leaves them with no
-	// internet at all until another exit node is assigned. There is no hub egress to fall back
-	// to (drizzle/0008_drop_hub_egress.sql).
-	const unassigned = response.data?.unassignedExitClients ?? [];
-	if (unassigned.length) {
-		toast.add({
-			severity: 'info',
-			summary: 'Exit node deleted',
-			detail: `${unassigned.map((p) => p.friendlyName ?? p.wgAddress).join(', ')} no longer have internet access. Assign them another exit node.`,
-			life: 10000,
-		});
-	}
+	removePeer.mutate(peerId);
 };
 </script>

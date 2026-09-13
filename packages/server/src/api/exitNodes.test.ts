@@ -3,7 +3,7 @@ import { db } from '../db';
 import { beforeAll, beforeEach, describe, expect, it } from 'bun:test';
 import { peersTable, policyGrantsTable, serverPeersTable } from '@server/db/schema';
 import { eq } from 'drizzle-orm';
-import { shellCallLog } from '@server/wg/shell';
+import { shellCallLog } from '@server/wg/shell.recording';
 
 // Exit-node invariants live in the api layer, not the db (sqlite FK enforcement is never
 // turned on here) - checkPeerInvariants in lib/peerInvariants.ts is the only place they hold,
@@ -112,7 +112,13 @@ describe('exit nodes', () => {
 			const after = (await db.query.peersTable.findFirst({ where: eq(peersTable.id, 'exitNodes-client') }))!;
 			expect(after.exitInterfaceName).toBeNull();
 			expect(after.exitListenPort).toBeNull();
-			expect(shellCallLog.calls().slice(before)).toContainEqual({ fn: 'stopInterface', interfaceName: provisioned });
+			expect(
+				shellCallLog
+					.calls()
+					.slice(before)
+					.filter((c) => c.args[0] === provisioned)
+					.map((c) => c.fn),
+			).toContain('stopInterface');
 			expect(shellCallLog.isUp(provisioned)).toBe(false);
 		});
 

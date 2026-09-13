@@ -23,26 +23,25 @@
 
 <script setup lang="ts">
 import { ref, reactive, watch } from 'vue';
-import { useToast } from '@app/composables/useToast';
-import { useMutation, useQueryClient } from '@tanstack/vue-query';
+import { useWrite } from '@app/queries/useWrite';
 import type { PeerTag, ServerPeer } from '@server/db/schema';
+import { checkTagInvariants } from '@server/lib/tagInvariants';
 import { eden } from '@app/queries/edenClient';
 import { invalidate } from '@app/queries/keys';
 import BaseButton from './BaseButton.vue';
 import BaseInput from './BaseInput.vue';
 import BaseModal from './BaseModal.vue';
 
-const toast = useToast();
-
 const props = defineProps<{
 	tag?: PeerTag;
 	server: ServerPeer;
+	/** every tag on this server - the uniqueness half of lib/tagInvariants.ts needs them */
+	tags?: PeerTag[];
 }>();
 
 const isEditMode = ref(props.tag ? true : false);
 
 const visible = defineModel<boolean>('visible', { required: true });
-const queryClient = useQueryClient();
 
 const form = reactive({
 	name: '',
@@ -53,12 +52,16 @@ const errors = reactive({
 	name: '',
 });
 
-const nameRegex = /^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$/;
-
+// The same function the api decides with (server/src/lib/tagInvariants.ts), including the
+// uniqueness check - which this form could not make before and which therefore always cost a
+// round trip. The name regex used to be a byte-identical second copy of the api's, with no
+// import between them.
 const validate = () => {
 	errors.name = '';
-	if (!nameRegex.test(form.name)) {
-		errors.name = 'lowercase letters, numbers and hyphens only, must start/end with a letter or number.';
+
+	const invalid = checkTagInvariants({ tags: props.tags ?? [] }, props.tag ?? null, { name: form.name });
+	if (invalid) {
+		errors.name = invalid.message;
 		return false;
 	}
 	return true;
@@ -78,45 +81,27 @@ watch(
 		}
 		errors.name = '';
 	},
-	{ immediate: true }
+	{ immediate: true },
 );
 
-const createTag = useMutation({
-	mutationFn: async (data: typeof form) => {
-		const res = await eden.api.v1.wg.servers({ id: props.server.id }).tags.post(data);
-		return res.data;
-	},
-	onSuccess: async () => {
-		await invalidate.afterTagChange(queryClient, props.server.id);
+const createTag = useWrite({
+	mutationFn: async (data: typeof form) => (await eden.api.v1.wg.servers({ id: props.server.id }).tags.post(data)).data,
+	summary: 'Failed to create tag',
+	invalidate: (qc) => invalidate.afterTagChange(qc, props.server.id),
+	// a duplicate name comes back naming `name`, so it lands on the name input
+	fields: errors,
+	onSuccess: () => {
 		visible.value = false;
-	},
-	onError: (error) => {
-		toast.add({
-			severity: 'error',
-			detail: error.message,
-			summary: 'Failed to create tag',
-			life: 5000,
-		});
 	},
 });
 
-const updateTag = useMutation({
-	mutationFn: async (data: typeof form) => {
-		if (!props.tag) return;
-		const res = await eden.api.v1.wg.servers({ id: props.server.id }).tags({ tagId: props.tag.id }).patch(data);
-		return res.data;
-	},
-	onSuccess: async () => {
-		await invalidate.afterTagChange(queryClient, props.server.id);
+const updateTag = useWrite({
+	mutationFn: async (data: typeof form) => (props.tag ? (await eden.api.v1.wg.servers({ id: props.server.id }).tags({ tagId: props.tag.id }).patch(data)).data : undefined),
+	summary: 'Failed to update tag',
+	invalidate: (qc) => invalidate.afterTagChange(qc, props.server.id),
+	fields: errors,
+	onSuccess: () => {
 		visible.value = false;
-	},
-	onError: (error) => {
-		toast.add({
-			severity: 'error',
-			detail: error.message,
-			summary: 'Failed to update tag',
-			life: 5000,
-		});
 	},
 });
 

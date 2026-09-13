@@ -23,6 +23,7 @@ import { ref, computed } from 'vue';
 import { useQuery, useQueryClient } from '@tanstack/vue-query';
 import { queryPeerTraffic, type TrafficResolution } from '@app/queries/queryTraffic';
 import { invalidate } from '@app/queries/keys';
+import { useWrite } from '@app/queries/useWrite';
 import { api } from '@app/queries/edenClient';
 import { formatBytes } from '@app/lib/format';
 import BaseModal from './BaseModal.vue';
@@ -43,18 +44,22 @@ const { data: traffic } = useQuery(
 	computed(() => ({
 		...queryPeerTraffic(props.serverId, props.peer?.id ?? '', resolution.value),
 		enabled: props.visible && !!props.peer,
-	}))
+	})),
 );
 
 const queryClient = useQueryClient();
 
-const reset = async () => {
-	if (!props.peer) return;
-	if (!confirm(`Reset lifetime traffic counters for ${props.peer.friendlyName ?? props.peer.id}?`)) return;
-
-	await api.wg.servers({ id: props.serverId }).peers({ peerId: props.peer.id }).traffic.reset.post();
+const resetTraffic = useWrite({
+	mutationFn: async (peerId: string) => (await api.wg.servers({ id: props.serverId }).peers({ peerId }).traffic.reset.post()).data,
+	summary: 'Failed to reset the traffic counters',
 	// also invalidates this peer's traffic buckets at every resolution, so the chart shown
 	// in this same modal refreshes immediately instead of waiting for the 30s poll
-	await invalidate.afterPeerTrafficReset(queryClient, props.serverId, props.peer.id);
+	invalidate: (qc) => (props.peer ? invalidate.afterPeerTrafficReset(qc, props.serverId, props.peer.id) : undefined),
+});
+
+const reset = () => {
+	if (!props.peer) return;
+	if (!confirm(`Reset lifetime traffic counters for ${props.peer.friendlyName ?? props.peer.id}?`)) return;
+	resetTraffic.mutate(props.peer.id);
 };
 </script>

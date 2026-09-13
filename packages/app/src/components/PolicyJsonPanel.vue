@@ -8,18 +8,15 @@
 				<BaseButton @click="apply" variant="primary" size="sm" :loading="applyMutation.isPending.value" :disabled="!isDirty">apply</BaseButton>
 			</div>
 		</div>
-		<textarea
-			v-model="draft"
-			spellcheck="false"
-			class="w-full h-96 rounded-sm border border-border bg-bg text-text px-3 py-2 text-xs font-mono focus:outline-none focus:border-accent resize-y"
-		></textarea>
+		<textarea v-model="draft" spellcheck="false" class="w-full h-96 rounded-sm border border-border bg-bg text-text px-3 py-2 text-xs font-mono focus:outline-none focus:border-accent resize-y"></textarea>
 		<span v-if="error" class="text-down text-xs">{{ error }}</span>
 	</div>
 </template>
 
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query';
+import { useQuery } from '@tanstack/vue-query';
+import { useWrite } from '@app/queries/useWrite';
 import { queryServerPolicy } from '@app/queries/queryPolicy';
 import { eden } from '@app/queries/edenClient';
 import { invalidate } from '@app/queries/keys';
@@ -29,12 +26,10 @@ import BaseButton from './BaseButton.vue';
 const props = defineProps<{ serverId: string }>();
 
 const toast = useToast();
-const queryClient = useQueryClient();
 
 const { data: policy } = useQuery(queryServerPolicy(props.serverId));
 
 const draft = ref('');
-const error = ref('');
 const copied = ref(false);
 
 const serverText = computed(() => (policy.value ? JSON.stringify(policy.value, null, 2) : ''));
@@ -50,7 +45,7 @@ watch(
 			seeded.value = true;
 		}
 	},
-	{ immediate: true }
+	{ immediate: true },
 );
 
 const isDirty = computed(() => draft.value !== serverText.value);
@@ -66,22 +61,21 @@ const copyToClipboard = async () => {
 	setTimeout(() => (copied.value = false), 2000);
 };
 
-const invalidateAll = () => invalidate.afterPolicyApply(queryClient, props.serverId);
-
-const applyMutation = useMutation({
-	mutationFn: async (body: unknown) => {
-		const res = await eden.api.v1.wg.servers({ id: props.serverId }).policy.put(body as any);
-		return res.data;
-	},
+// The one surface that reports failure inline rather than as a toast, because the operator is
+// editing a document in this same panel and the message is about what they just typed. Stated
+// as `report: 'inline'` rather than by hand-writing a different onError - see queries/useWrite.ts.
+const applyMutation = useWrite({
+	mutationFn: async (body: unknown) => (await eden.api.v1.wg.servers({ id: props.serverId }).policy.put(body as any)).data,
+	summary: 'Failed to apply policy',
+	invalidate: (qc) => invalidate.afterPolicyApply(qc, props.serverId),
+	report: 'inline',
 	onSuccess: (data) => {
 		draft.value = JSON.stringify(data, null, 2);
-		invalidateAll();
 		toast.add({ severity: 'success', summary: 'Policy applied', life: 3000 });
 	},
-	onError: (err: Error) => {
-		error.value = err.message;
-	},
 });
+
+const error = applyMutation.inlineError;
 
 const apply = () => {
 	error.value = '';

@@ -2,8 +2,12 @@ import { beforeAll, describe, expect, it } from 'bun:test';
 import { db } from '@server/db';
 import { peersTable, serverPeersTable, type Peer } from '@server/db/schema';
 import { eq } from 'drizzle-orm';
-import { generateExitLinkConfig, generatePeerConfig, generateServerConfig } from './config';
+import { buildServerConfig, generateExitLinkConfig, generatePeerConfig } from './config';
 import { exitTopologyOf } from '@server/lib/exitTopology';
+import { policyGraphOf } from '@server/db/policyGraph';
+
+/** buildServerConfig takes the policy graph converge already holds - resolve it here. */
+const serverConfig = async (serverId: string) => buildServerConfig(await policyGraphOf((await db.query.serverPeersTable.findFirst({ where: eq(serverPeersTable.id, serverId) }))!));
 
 /** The ExitNode projection for one peer - what generateExitLinkConfig takes. */
 const exitNodeOf = (peers: Peer[], id: string) => exitTopologyOf(peers).exitNodes.find((node) => node.peer.id === id)!;
@@ -111,12 +115,11 @@ describe('wg config generation', () => {
 			.execute();
 	});
 
-	describe('generateServerConfig', () => {
+	describe('buildServerConfig', () => {
 		it("leaves the exit node off its server's interface entirely - it lives on its own link", async () => {
 			// This is what makes more than one exit node per server possible: nothing on this
 			// interface owns 0.0.0.0/0, so there is nothing for two of them to fight over.
-			const server = (await db.query.serverPeersTable.findFirst({ where: eq(serverPeersTable.id, SERVER) }))!;
-			const config = await generateServerConfig(server);
+			const config = await serverConfig(SERVER);
 
 			expect(config).not.toContain('0.0.0.0/0');
 			expect(config).not.toContain('exitPub');
@@ -126,14 +129,11 @@ describe('wg config generation', () => {
 		it('needs no Table = off once the exit node is gone from the interface', async () => {
 			// `Table = off` exists to stop wg-quick routing a peer's AllowedIPs. With no /0 and
 			// nothing advertised here there is nothing outside cidrRange left to route.
-			const server = (await db.query.serverPeersTable.findFirst({ where: eq(serverPeersTable.id, SERVER) }))!;
-
-			expect(await generateServerConfig(server)).not.toContain('Table = off');
+			expect(await serverConfig(SERVER)).not.toContain('Table = off');
 		});
 
 		it('leaves an interface without an exit node byte-identical to before (no Table line)', async () => {
-			const server = (await db.query.serverPeersTable.findFirst({ where: eq(serverPeersTable.id, PLAIN) }))!;
-			const config = await generateServerConfig(server);
+			const config = await serverConfig(PLAIN);
 
 			expect(config).not.toContain('Table');
 			expect(config).toContain('Address = 10.45.45.1/24');
@@ -142,9 +142,7 @@ describe('wg config generation', () => {
 		it('derives the interface Address prefix from cidrRange rather than assuming /24', async () => {
 			// With Table = off the connected route from this prefix is the only thing making the
 			// server's peers routable - a hardcoded /24 on a /16 server blackholes most of them.
-			const server = (await db.query.serverPeersTable.findFirst({ where: eq(serverPeersTable.id, SERVER) }))!;
-
-			expect(await generateServerConfig(server)).toContain('Address = 10.44.0.1/16');
+			expect(await serverConfig(SERVER)).toContain('Address = 10.44.0.1/16');
 		});
 	});
 
@@ -278,10 +276,8 @@ describe('wg config generation', () => {
 	});
 
 	describe('advertised subnet routes', () => {
-		const serverRow = async (id: string) => (await db.query.serverPeersTable.findFirst({ where: eq(serverPeersTable.id, id) }))!;
-
 		it("appends every advertised prefix to the advertiser's server-side AllowedIPs", async () => {
-			const config = await generateServerConfig(await serverRow(ADV));
+			const config = await serverConfig(ADV);
 
 			expect(config).toContain('AllowedIPs = 10.46.46.2, 192.168.1.0/24, 10.10.0.0/16');
 			// no other peer on the interface is affected
@@ -292,13 +288,13 @@ describe('wg config generation', () => {
 			// otherwise wg-quick installs these routes as well, and two systems end up managing
 			// the same ones - the reconciler in wg/exitRouting.ts could no longer tell a stale
 			// route of its own from one wg-quick put there.
-			expect(await generateServerConfig(await serverRow(ADV))).toContain('Table = off');
+			expect(await serverConfig(ADV)).toContain('Table = off');
 		});
 
 		it('puts a peer that is both exit node and advertiser wholly on its own link', async () => {
 			// One peer, one interface: the LAN it advertises moves with it, so the server's own
 			// interface is left with neither the /0 nor the advertisement.
-			expect(await generateServerConfig(await serverRow(BOTH))).not.toContain('192.168.7.0/24');
+			expect(await serverConfig(BOTH)).not.toContain('192.168.7.0/24');
 
 			const link = generateExitLinkConfig(exitNodeOf([await peer('configTest-both')], 'configTest-both'));
 			// the /0 already covers the LAN - the explicit entry is what makes `wg show` name

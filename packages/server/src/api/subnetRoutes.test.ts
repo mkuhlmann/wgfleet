@@ -3,7 +3,7 @@ import { db } from '../db';
 import { beforeAll, beforeEach, describe, expect, it } from 'bun:test';
 import { peersTable, serverPeersTable } from '@server/db/schema';
 import { eq } from 'drizzle-orm';
-import { shellCallLog } from '@server/wg/shell';
+import { shellCallLog } from '@server/wg/shell.recording';
 
 // Advertised subnet routes (see wg/exitRouting.ts for the routing, wg/addressing.ts for the
 // overlap rules). Like the exit-node invariants, the overlap rules are api-only - sqlite FK/check enforcement is never

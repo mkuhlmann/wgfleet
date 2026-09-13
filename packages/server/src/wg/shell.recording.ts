@@ -1,27 +1,87 @@
-// Test-only third adapter at the wg/shell seam (alongside shell.real.ts and shell.shim.ts -
-// see shell.ts's capability-detection dispatcher). Behaves like the shim (no real network/nft
-// changes, no filesystem writes) but additionally keeps a call log and the last-applied
-// firewall ruleset, so tests can assert *that* a mutation reloaded an interface or synced the
-// firewall, not just that the handler returned 200. Wired in via tests/setup.ts's
-// `mock.module('@server/wg/shell', ...)`, which replaces the whole module for every test - see
-// CLAUDE.md's note on the wg/shell layer for why a function missing from an adapter here is
-// `undefined` in every test.
-export type RecordedCall =
-	| { fn: 'startInterface'; interfaceName: string }
-	| { fn: 'reloadInterface'; interfaceName: string }
-	| { fn: 'stopInterface'; interfaceName: string }
-	| { fn: 'applyFirewall'; ruleset: string }
-	| { fn: 'resetFirewall' }
-	| { fn: 'applyExitRouting'; commands: string[] };
+import type { WgHost, WgInterfaceDump } from './host';
+
+/**
+ * Test-only third adapter at the wg/shell seam (alongside shell.real.ts and shell.shim.ts -
+ * see shell.ts's capability dispatcher). Behaves like the shim - no real network/nft changes,
+ * no filesystem writes - but deterministically, and it keeps a log of every call, so tests can
+ * assert *that* a mutation reloaded an interface or resynced the firewall rather than only
+ * that the handler returned 200. Wired in via tests/setup.ts, which spreads `recordingHost`
+ * over the mocked module, so its exports are derived from `WgHost` rather than re-declared -
+ * a function added to the seam is recorded here without touching this file.
+ */
+
+/**
+ * Every call goes through here, so nothing can be implemented-but-not-recorded: `fn` is a
+ * `keyof WgHost` and the arguments are kept verbatim.
+ */
+export type RecordedCall = { [K in keyof WgHost]: { fn: K; args: Parameters<WgHost[K]> } }[keyof WgHost];
 
 const calls: RecordedCall[] = [];
+const upInterfaces = new Set<string>();
+const configs = new Map<string, string>();
 let lastAppliedRuleset: string | null = null;
 let lastAppliedExitRouting: string[] | null = null;
-const upInterfaces = new Set<string>();
+
+/** The behaviour under the recorder: an in-memory host, deterministic so tests can assert on it. */
+const base: WgHost = {
+	wgGenKey: async () => 'mockedPrivateKey',
+	wgGenPsk: async () => 'mockedPsk',
+	wgDerivePublicKey: async (_privateKey: string) => 'mockedPublicKey',
+
+	wgShow: async (_interfaceName: string): Promise<WgInterfaceDump | null> => ({
+		interface: { privateKey: 'mockedPrivateKey', publicKey: 'mockedPublicKey', listenPort: 'mockedPort', fwmark: 'mockedFwmark' },
+		peers: [],
+	}),
+	isInterfaceUp: async (interfaceName: string) => upInterfaces.has(interfaceName),
+	listInterfaces: async () => [...upInterfaces],
+	// The rendered config is recorded too - it is how tests assert what actually went onto an
+	// interface (which peers a server's config carries, and that an exit link carries
+	// 0.0.0.0/0) without a real wg to read it back from.
+	startInterface: async (interfaceName: string, config: string) => {
+		upInterfaces.add(interfaceName);
+		configs.set(interfaceName, config);
+	},
+	reloadInterface: async (interfaceName: string, config: string) => {
+		configs.set(interfaceName, config);
+	},
+	stopInterface: async (interfaceName: string) => {
+		upInterfaces.delete(interfaceName);
+		configs.delete(interfaceName);
+	},
+	applyExitRouting: async (commands: string[]) => {
+		lastAppliedExitRouting = commands;
+	},
+
+	applyFirewall: async (ruleset: string) => {
+		lastAppliedRuleset = ruleset;
+	},
+	resetFirewall: async () => {
+		lastAppliedRuleset = null;
+	},
+};
+
+/** Wraps every member of a host so that calling it appends to `calls` first. */
+const recorded = (host: WgHost): WgHost =>
+	Object.fromEntries(
+		(Object.keys(host) as (keyof WgHost)[]).map((fn) => [
+			fn,
+			(...args: unknown[]) => {
+				calls.push({ fn, args } as RecordedCall);
+				return (host[fn] as (...a: unknown[]) => unknown)(...args);
+			},
+		]),
+	) as WgHost;
+
+export const recordingHost = recorded(base);
 
 export const shellCallLog = {
 	calls: () => [...calls],
-	callsFor: (interfaceName: string) => calls.filter((c) => 'interfaceName' in c && c.interfaceName === interfaceName),
+	/** Every call whose first argument is this interface name, in order. */
+	callsFor: (interfaceName: string) => calls.filter((c) => c.args[0] === interfaceName),
+	/** Just the function names for one interface - the usual "did it start or reload?" question. */
+	fnsFor: (interfaceName: string) => calls.filter((c) => c.args[0] === interfaceName).map((c) => c.fn),
+	/** Just the function names, in call order. */
+	fns: () => calls.map((c) => c.fn),
 	lastAppliedRuleset: () => lastAppliedRuleset,
 	lastAppliedExitRouting: () => lastAppliedExitRouting,
 	isUp: (interfaceName: string) => upInterfaces.has(interfaceName),
@@ -36,56 +96,4 @@ export const shellCallLog = {
 		upInterfaces.clear();
 		configs.clear();
 	},
-};
-
-export const cmd = async (command: string) => ({ stdout: '', stderr: '' });
-
-export const wgGenKey = async () => 'mockedPrivateKey';
-export const wgGenPsk = async () => 'mockedPsk';
-export const wgDerivePublicKey = async (_privateKey: string) => 'mockedPublicKey';
-
-export const wgShow = async (_interfaceName: string) => ({
-	interface: { privateKey: 'mockedPrivateKey', publicKey: 'mockedPublicKey', listenPort: 'mockedPort', fwmark: 'mockedFwmark' },
-	peers: [] as never[],
-});
-
-export const listInterfaces = async (): Promise<string[]> => [...upInterfaces];
-
-export const isInterfaceUp = async (interfaceName: string) => upInterfaces.has(interfaceName);
-
-// The rendered config is recorded too - it is how tests assert what actually went onto an
-// interface (which peers a server's config carries, and that an exit link carries 0.0.0.0/0)
-// without a real wg to read it back from.
-const configs = new Map<string, string>();
-
-export const startInterface = async (interfaceName: string, config: string) => {
-	upInterfaces.add(interfaceName);
-	configs.set(interfaceName, config);
-	calls.push({ fn: 'startInterface', interfaceName });
-};
-
-export const reloadInterface = async (interfaceName: string, config: string) => {
-	configs.set(interfaceName, config);
-	calls.push({ fn: 'reloadInterface', interfaceName });
-};
-
-export const stopInterface = async (interfaceName: string) => {
-	upInterfaces.delete(interfaceName);
-	configs.delete(interfaceName);
-	calls.push({ fn: 'stopInterface', interfaceName });
-};
-
-export const applyFirewall = async (ruleset: string) => {
-	lastAppliedRuleset = ruleset;
-	calls.push({ fn: 'applyFirewall', ruleset });
-};
-
-export const resetFirewall = async () => {
-	lastAppliedRuleset = null;
-	calls.push({ fn: 'resetFirewall' });
-};
-
-export const applyExitRouting = async (commands: string[]) => {
-	lastAppliedExitRouting = commands;
-	calls.push({ fn: 'applyExitRouting', commands });
 };

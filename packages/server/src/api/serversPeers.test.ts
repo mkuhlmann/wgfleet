@@ -2,7 +2,7 @@ import { serversPeersRoute } from './serversPeers';
 import { db } from '../db';
 import { beforeAll, describe, expect, it } from 'bun:test';
 import { peerTagsTable, serverPeersTable } from '@server/db/schema';
-import { shellCallLog } from '@server/wg/shell';
+import { shellCallLog } from '@server/wg/shell.recording';
 
 describe('serversPeersRoute', () => {
 	beforeAll(async () => {

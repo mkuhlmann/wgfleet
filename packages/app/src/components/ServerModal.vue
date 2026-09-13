@@ -57,10 +57,9 @@
 
 <script setup lang="ts">
 import { ref, reactive, watch } from 'vue';
-import { useToast } from '@app/composables/useToast';
-import { useMutation, useQueryClient } from '@tanstack/vue-query';
+import { useWrite } from '@app/queries/useWrite';
 import type { ServerPeer } from '@server/db/schema';
-import { CIDR_REGEX, INTERFACE_NAME_REGEX, IPV4_ADDRESS_REGEX, WG_LISTEN_PORT_MAX, WG_LISTEN_PORT_MIN } from '@server/lib/validation';
+import { checkServerInvariants } from '@server/lib/serverInvariants';
 import { eden } from '@app/queries/edenClient';
 import { invalidate } from '@app/queries/keys';
 import BaseButton from './BaseButton.vue';
@@ -69,14 +68,13 @@ import BaseModal from './BaseModal.vue';
 
 const props = defineProps<{
 	server?: ServerPeer;
+	/** every server on this host - the cross-row half of lib/serverInvariants.ts needs them */
+	servers?: Pick<ServerPeer, 'id' | 'interfaceName' | 'wgListenPort'>[];
 }>();
-
-const toast = useToast();
 
 const isEditMode = ref(props.server ? true : false);
 
 const visible = defineModel<boolean>('visible', { required: true });
-const queryClient = useQueryClient();
 
 const form = reactive({
 	friendlyName: '',
@@ -94,40 +92,33 @@ const errors = reactive({
 	wgAddress: '',
 	wgListenPort: '',
 	cidrRange: '',
+	wgEndpoint: '',
+	reservedIps: '',
 });
 
+/**
+ * The same function the api decides with (server/src/lib/serverInvariants.ts).
+ *
+ * This form used to hand-roll four field-format checks, one of which (wgAddress against
+ * IPV4_ADDRESS_REGEX) the api had no equivalent for at all - and since that regex deliberately
+ * permits a trailing /prefix that the api's containment check then refused, a value this form
+ * called valid could come back 400. The two cross-row rules it could never state - a port
+ * another server already listens on, an address outside the range - are checkable here now,
+ * against the server list already in cache.
+ */
 const validate = () => {
-	let isValid = true;
-	errors.interfaceName = '';
-	errors.wgAddress = '';
-	errors.wgListenPort = '';
-	errors.cidrRange = '';
+	for (const key of Object.keys(errors) as (keyof typeof errors)[]) errors[key] = '';
 
-	// Interface Name validation
-	if (!INTERFACE_NAME_REGEX.test(form.interfaceName)) {
-		errors.interfaceName = 'Invalid interface name. Must be 1-15 alphanumeric characters (allows _, =, +, ., -).';
-		isValid = false;
+	const invalid = checkServerInvariants({ servers: props.servers ?? [] }, props.server ?? null, form);
+	if (invalid) {
+		const field = invalid.field;
+		if (field && field in errors) {
+			errors[field as keyof typeof errors] = invalid.message;
+		}
+		return false;
 	}
 
-	// WireGuard Address validation
-	if (!IPV4_ADDRESS_REGEX.test(form.wgAddress)) {
-		errors.wgAddress = 'Invalid WireGuard Address. Must be a valid IP address (e.g., 10.8.0.1).';
-		isValid = false;
-	}
-
-	// Listen Port validation
-	if (form.wgListenPort < WG_LISTEN_PORT_MIN || form.wgListenPort > WG_LISTEN_PORT_MAX) {
-		errors.wgListenPort = `Port must be between ${WG_LISTEN_PORT_MIN} and ${WG_LISTEN_PORT_MAX}.`;
-		isValid = false;
-	}
-
-	// CIDR Range validation
-	if (!CIDR_REGEX.test(form.cidrRange)) {
-		errors.cidrRange = 'Invalid CIDR range (e.g., 10.8.0.0/24).';
-		isValid = false;
-	}
-
-	return isValid;
+	return true;
 };
 
 watch(
@@ -171,42 +162,26 @@ watch(
 type CreateServerPayload = Omit<typeof form, 'dns'> & { dns?: string };
 type UpdateServerPayload = Omit<typeof form, 'dns'> & { dns: string | null };
 
-const createServer = useMutation({
-	mutationFn: async (data: CreateServerPayload) => {
-		const res = await eden.api.v1.wg.servers.post(data);
-		return res.data;
-	},
-	onSuccess: async () => {
-		await invalidate.afterServerChange(queryClient);
+// `fields: errors` routes a field-scoped refusal onto the input that caused it - the server
+// names the field (server/src/lib/failure.ts), so `wgListenPort already in use` lands on the
+// port input rather than in a toast the form cannot act on.
+const createServer = useWrite({
+	mutationFn: async (data: CreateServerPayload) => (await eden.api.v1.wg.servers.post(data)).data,
+	summary: 'Failed to create server',
+	invalidate: invalidate.afterServerChange,
+	fields: errors,
+	onSuccess: () => {
 		visible.value = false;
-	},
-	onError: (error) => {
-		toast.add({
-			severity: 'error',
-			detail: error.message,
-			summary: 'Failed to create server',
-			life: 5000,
-		});
 	},
 });
 
-const updateServer = useMutation({
-	mutationFn: async (data: UpdateServerPayload) => {
-		if (!props.server) return;
-		const res = await eden.api.v1.wg.servers({ id: props.server?.id }).patch(data);
-		return res.data;
-	},
-	onSuccess: async () => {
-		await invalidate.afterServerChange(queryClient);
+const updateServer = useWrite({
+	mutationFn: async (data: UpdateServerPayload) => (props.server ? (await eden.api.v1.wg.servers({ id: props.server.id }).patch(data)).data : undefined),
+	summary: 'Failed to update server',
+	invalidate: invalidate.afterServerChange,
+	fields: errors,
+	onSuccess: () => {
 		visible.value = false;
-	},
-	onError: (error) => {
-		toast.add({
-			severity: 'error',
-			detail: error.message,
-			summary: 'Failed to update server',
-			life: 5000,
-		});
 	},
 });
 

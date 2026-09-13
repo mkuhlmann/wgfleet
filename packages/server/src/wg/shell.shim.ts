@@ -26,11 +26,6 @@ const shimmedPeer = (peer: { wgPublicKey: string; wgPresharedKey: string | null;
 	};
 };
 
-export const cmd = async (command: string) => {
-	log.warn(`[shim] not running: ${command}`);
-	return { stdout: '', stderr: '' };
-};
-
 export const wgGenKey = async () => {
 	return randomBytes(32).toString('base64');
 };

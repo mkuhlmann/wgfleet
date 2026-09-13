@@ -45,8 +45,46 @@ _Avoid_: "the state" (unqualified - a policy graph is state too, but scoped to o
 **Converge**:
 Applying one server's wg interface plus the host-wide firewall and routing state, from a fleet snapshot. The one
 seam every route handler calls after a mutation, whatever it changed - it is deliberately _not_ a choice between
-"reload the interface" and "just resync the firewall", because that choice was silently wrong-able.
+"reload the interface" and "just resync the firewall", because that choice was silently wrong-able. Three steps:
+reconcile the exit links (the only write), plan, apply.
 _Avoid_: sync (was the name of the two halves this replaced), reload (only the interface half)
+
+**Converge Plan**:
+Everything one converge is going to do, as data (`planConverge`, `wg/plan.ts`): the ordered interface steps
+(`start`/`reload`/`restart`/`stop`), the route tables to drain, the nft ruleset and the `ip` command list. Pure -
+its inputs are a fleet snapshot and one `listInterfaces()` reading of the host, so what used to be five ordering
+constraints stated only in comments, and a start-vs-reload probe per interface, is now one value a test can
+assert against without a host.
+_Avoid_: diff (nothing is compared against previous state - every artefact is rebuilt whole), queue (that is the
+serialization of converge calls, a different thing)
+
+**Interface Step**:
+One entry of a converge plan. `restart` is the one that is not obvious: an interface that is up but whose
+identity just changed, which only happens to an exit link whose name was reissued while a crashed predecessor
+still held it. A reload there is a `wg syncconf`, which applies the peers but never the `[Interface]` half.
+_Avoid_: action (too generic), bounce (says restart without saying why it is not a reload)
+
+**Failure**:
+One rejected write as a value: a message plus the request field it is about (`lib/failure.ts`). Every rule that
+can refuse - address resolution, the four invariant modules, advertised-route overlap - returns one, and
+`api/failure.ts` is the only thing that turns it into an http response. The field is what survives the seam: it
+is what lets a form put a server-side refusal on the input that caused it rather than in a toast.
+_Avoid_: error (used for thrown/unexpected things here; a Failure is an expected answer), validation error (only
+some of them are about a field's shape)
+
+**Invariants**:
+The rules one entity's write must satisfy that its TypeBox schema cannot express - cross-row ones, and ones
+spanning several fields. One pure, io-free module per entity under `lib/` (`peerInvariants`, `serverInvariants`,
+`grantInvariants`, `tagInvariants`), each `check*(snapshot, current, request) -> Failure | null`, imported by
+both the route handler and the form. Pure precisely so both sides can decide with the same function.
+_Avoid_: constraints (implies the db enforces them; sqlite FK enforcement is off, so these modules are the only
+place they hold), validation (that is the schema's job, and happens before a handler runs)
+
+**Wg Host**:
+The set of things this manager can ask of the machine it runs on - keys, interfaces, routes, nft
+(`WgHost`, `wg/host.ts`). One type, three adapters: real, dev shim, and the test recorder. Naming it is what
+replaced a rule that the same function list be maintained by hand in four files.
+_Avoid_: shell (the name of the dispatcher module, not of the capability), driver
 
 **Exit Topology**:
 The projection answering who an interface's exit node is, which peers route through it, and what subnet routes its

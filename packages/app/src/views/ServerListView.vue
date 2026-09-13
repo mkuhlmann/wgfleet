@@ -52,8 +52,8 @@
 		</DataView>
 	</div>
 
-	<ServerModal v-model:visible="showAddModal" />
-	<ServerModal v-model:visible="showEditModal" :server="selectedServer" />
+	<ServerModal v-model:visible="showAddModal" :servers="servers ?? []" />
+	<ServerModal v-model:visible="showEditModal" :server="selectedServer" :servers="servers ?? []" />
 </template>
 
 <script setup lang="ts">

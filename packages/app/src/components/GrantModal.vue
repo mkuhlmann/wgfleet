@@ -100,6 +100,7 @@
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from 'vue';
 import type { PeerTag, Peer, PolicyGrant } from '@server/db/schema';
+import { checkGrantInvariants } from '@server/lib/grantInvariants';
 import BaseButton from './BaseButton.vue';
 import BaseInput from './BaseInput.vue';
 import BaseModal from './BaseModal.vue';
@@ -146,7 +147,7 @@ const emptyForm = (): GrantDraft => ({
 
 const form = reactive<GrantDraft>(emptyForm());
 
-const errors = reactive({ dstCidr: '', ports: '' });
+const errors = reactive({ dstCidr: '', ports: '', srcTagId: '', dstTagId: '' });
 
 const dstKindHint: Record<string, string> = {
 	server: "the gateway's own tunnel address (dns, management api)",
@@ -155,37 +156,47 @@ const dstKindHint: Record<string, string> = {
 
 const dstKindHintText = computed(() => dstKindHint[form.dstKind] ?? '');
 
-// ipv4-only - mirrors wg/firewall.ts isIpv4Cidr
-const isIpv4Cidr = (value: string) => /^(?:\d{1,3}\.){3}\d{1,3}\/(?:[0-9]|[1-2][0-9]|3[0-2])$/.test(value);
-// mirrors api/policy.ts portsRegex + range validation
-const isValidPorts = (value: string) => {
-	if (!/^\d{1,5}(-\d{1,5})?(,\d{1,5}(-\d{1,5})?)*$/.test(value)) return false;
-	for (const entry of value.split(',')) {
-		const [loStr, hiStr] = entry.split('-');
-		const lo = Number(loStr);
-		const hi = hiStr !== undefined ? Number(hiStr) : lo;
-		if (lo < 1 || lo > 65535 || hi < 1 || hi > 65535 || lo > hi) return false;
-	}
-	return true;
-};
-
+// The same function the api decides with (server/src/lib/grantInvariants.ts). This form used to
+// carry its own copies: `isIpv4Cidr` re-declared, and an `isValidPorts` that was byte-identical
+// to the api's *minus* the max-entries check - so a 33-entry list passed here and 400ed there.
 const validate = () => {
 	errors.dstCidr = '';
 	errors.ports = '';
-	let isValid = true;
+	errors.srcTagId = '';
+	errors.dstTagId = '';
 
-	if (form.dstKind === 'cidr' && (!form.dstCidr || !isIpv4Cidr(form.dstCidr))) {
-		errors.dstCidr = 'must be a valid ipv4 cidr, e.g. 192.168.50.0/24';
-		isValid = false;
+	const invalid = checkGrantInvariants(
+		{ tagIds: props.tags.map((t) => t.id), peerIds: props.peers.map((p) => p.id) },
+		{
+			src: form.srcKind === 'tag' ? { kind: 'tag', id: form.srcTagId } : { kind: 'peer', id: form.srcPeerId },
+			dst: form.dstKind === 'tag' ? { kind: 'tag', id: form.dstTagId } : form.dstKind === 'peer' ? { kind: 'peer', id: form.dstPeerId } : form.dstKind === 'cidr' ? { kind: 'cidr', cidr: form.dstCidr } : { kind: form.dstKind },
+			protocol: form.protocol,
+			ports: form.ports,
+		},
+	);
+
+	if (invalid) {
+		const field = invalid.field;
+		if (field && field in errors) {
+			errors[field as keyof typeof errors] = invalid.message;
+		} else {
+			errors.dstCidr = invalid.message;
+		}
+		return false;
 	}
 
-	if (form.ports && form.ports.trim() && !isValidPorts(form.ports.trim())) {
-		errors.ports = 'must be a comma-separated list of ports/ranges, e.g. 22,8000-8100';
-		isValid = false;
-	}
-
-	return isValid;
+	return true;
 };
+
+// Clearing the ports when the protocol stops being tcp/udp, rather than only hiding the input:
+// the rule above refuses ports on any other protocol, and a value left behind by a protocol
+// switch was submitted anyway - producing a 400 about a field no longer on screen.
+watch(
+	() => form.protocol,
+	(protocol) => {
+		if (protocol !== 'tcp' && protocol !== 'udp') form.ports = '';
+	},
+);
 
 watch(
 	() => props.grant,

@@ -8,8 +8,8 @@
 				<BaseButton :as="'router-link'" :to="{ name: 'servers-detail', params: { id: server.id } }" variant="ghost">&laquo; back to server</BaseButton>
 			</div>
 
-			<TagModal v-model:visible="showAddTagModal" :server="server" />
-			<TagModal v-model:visible="showEditTagModal" :tag="selectedTag" :server="server" />
+			<TagModal v-model:visible="showAddTagModal" :server="server" :tags="tags ?? []" />
+			<TagModal v-model:visible="showEditTagModal" :tag="selectedTag" :server="server" :tags="tags ?? []" />
 
 			<div class="flex flex-col gap-4">
 				<div class="flex justify-between items-center flex-wrap gap-3">
@@ -165,6 +165,7 @@ import { useRoute } from 'vue-router';
 import { ref, computed } from 'vue';
 import { eden } from '@app/queries/edenClient';
 import { invalidate } from '@app/queries/keys';
+import { useWrite } from '@app/queries/useWrite';
 import type { PeerTag } from '@server/db/schema';
 import { advertisedRoutesOf, exitTopologyOf } from '@server/lib/exitTopology';
 import BaseButton from '@app/components/BaseButton.vue';
@@ -209,15 +210,22 @@ const editTag = (tag: PeerTag) => {
 	showEditTagModal.value = true;
 };
 
-const deleteTag = async (tagId: string) => {
-	if (!confirm('Delete this tag? Member peers keep their other tags, they are not deleted.')) return;
-
-	await eden.api.v1.wg
-		.servers({ id: route.params.id as string })
-		.tags({ tagId })
-		.delete();
+const removeTag = useWrite({
+	mutationFn: async (tagId: string) =>
+		(
+			await eden.api.v1.wg
+				.servers({ id: route.params.id as string })
+				.tags({ tagId })
+				.delete()
+		).data,
+	summary: 'Failed to delete the tag',
 	// a tag delete also unassigns member peers and removes referencing grants server-side
-	// (policy.ts) - see invalidate.afterTagDelete
-	await invalidate.afterTagDelete(queryClient, route.params.id as string);
+	// (policy.ts)
+	invalidate: (qc) => invalidate.afterTagDelete(qc, route.params.id as string),
+});
+
+const deleteTag = (tagId: string) => {
+	if (!confirm('Delete this tag? Member peers keep their other tags, they are not deleted.')) return;
+	removeTag.mutate(tagId);
 };
 </script>

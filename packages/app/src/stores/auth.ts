@@ -17,12 +17,11 @@ export const useAuthStore = defineStore('authStore', () => {
 				remember,
 			});
 
-			if (resp.error) {
-				throw resp.error.value;
-			}
-
-			const sessionToken = resp.data.token;
-			const rawExpiresAt = resp.data.expiresAt;
+			// no `resp.error` check: the fetcher (queries/edenClient.ts) throws an ApiError on
+			// any status >= 400, so this is only reached on success and `data` is present.
+			const data = resp.data!;
+			const sessionToken = data.token;
+			const rawExpiresAt = data.expiresAt;
 			const expiresAt = typeof rawExpiresAt === 'string' ? rawExpiresAt : new Date(rawExpiresAt).toISOString();
 
 			authToken.value = sessionToken;

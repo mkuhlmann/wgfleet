@@ -1,14 +1,9 @@
-import { db } from '@server/db';
-import { peersTable } from '@server/db/schema';
-import { eq } from 'drizzle-orm';
 import { resolveServer } from '@server/db/servers';
 import { loadFleet } from '@server/db/fleet';
-import { isInterfaceUp, listInterfaces, reloadInterface, startInterface, stopInterface } from './shell';
-import { syncFirewall } from './firewall';
-import { resetExitRouting, syncExitRouting } from './exitRouting';
-import { generateExitLinkConfig, generateServerConfig } from './config';
-import { exitTopologyOf } from '@server/lib/exitTopology';
-import { isExitLinkInterface, reconcileExitLinks } from './exitLinks';
+import { applyExitRouting, applyFirewall, listInterfaces, reloadInterface, startInterface, stopInterface } from './shell';
+import { resetExitRouting, warnOnRoutingSysctls } from './exitRouting';
+import { reconcileExitLinks } from './exitLinks';
+import { planConverge, type ConvergePlan, type InterfaceStep } from './plan';
 import { createLog } from '@server/lib/log';
 
 const log = createLog('wg:converge');
@@ -31,75 +26,64 @@ const queue = <T>(run: () => Promise<T>): Promise<T> => {
 	return result;
 };
 
-/** Start it if it isn't up, reload it if it is - the same decision for every interface kind. */
-const applyInterface = async (interfaceName: string, config: string) => {
-	if (await isInterfaceUp(interfaceName)) {
-		await reloadInterface(interfaceName, config);
-	} else {
-		await startInterface(interfaceName, config);
+const runStep = async (step: InterfaceStep) => {
+	switch (step.action) {
+		case 'stop':
+			if (step.reason === 'orphaned') log.warn(`Deleting orphaned exit link ${step.interfaceName} - no peer claims it any more`);
+			await stopInterface(step.interfaceName);
+			return;
+		case 'start':
+			await startInterface(step.interfaceName, step.config);
+			return;
+		case 'reload':
+			await reloadInterface(step.interfaceName, step.config);
+			return;
+		// Its key and udp port changed, and `wg syncconf` would apply neither - see wg/plan.ts.
+		case 'restart':
+			await stopInterface(step.interfaceName);
+			await startInterface(step.interfaceName, step.config);
+			return;
 	}
 };
 
 /**
- * The two things this manager applies host-wide: one nft ruleset across every server, and one
- * set of policy routes in the host's routing tables. Both are functions of the same fleet
- * snapshot, so it is read once and handed to both - they used to load it independently, which
- * meant the same N+1 query twice per converge and two appliers that could disagree.
+ * The host-wide half: one nft ruleset across every server, and one set of policy routes in the
+ * host's routing tables. Both come out of the same plan, and therefore out of the same fleet
+ * snapshot - they used to load it independently, which meant the same N+1 query twice per
+ * converge and two appliers that could in principle disagree.
  *
- * Neither applier throws (both catch and log internally), so a failure here degrades to a
- * stale-but-consistent ruleset rather than failing the mutation that triggered it.
+ * Neither applier throws: a failure here degrades to a stale-but-consistent ruleset rather than
+ * failing the mutation that triggered it. It is applied even when an interface step failed
+ * above, which is the point - a peer that was just deleted must lose its grants and its
+ * `ip rule` whether or not its server's interface came up.
  */
-const applyHostState = async () => {
-	const fleet = await loadFleet();
+const applyHostState = async (plan: ConvergePlan) => {
+	await resetExitRouting(plan.drainRouteTableIds);
 
-	await sweepOrphanedExitLinks(fleet.flatMap((graph) => [graph.server.interfaceName, ...exitTopologyOf(graph.peers).exitNodes.flatMap((node) => (node.link ? [node.link.interfaceName] : []))]));
-
-	await syncFirewall(fleet);
-
-	// Last, and specifically after the interfaces are up: exit routing installs
-	// `ip route ... dev <interfaceName>`, which needs the device to already exist.
-	await syncExitRouting(fleet);
-};
-
-/**
- * Deletes exit-link interfaces the db no longer describes. reconcileExitLinks already releases
- * the link of a peer that stopped being an exit node, but it cannot see one whose peer row was
- * deleted while this process was down, and the config/ruleset would then keep ignoring a live
- * interface that still owns `0.0.0.0/0`.
- *
- * Only ever touches `wgx`-shaped names that no server and no exit node currently claims, so an
- * interface somebody else on this host manages - including a server that happens to be named
- * like a link - is never a candidate.
- *
- * The routing table that went with an orphan is not recoverable here (its id died with the
- * row), so a leftover `ip rule` can survive a crash. It points at a table this reconcile
- * leaves empty, so it matches nothing and the packet falls through to main; wgManager.stop()
- * clears them on any orderly shutdown.
- */
-const sweepOrphanedExitLinks = async (claimed: string[]) => {
 	try {
-		const keep = new Set(claimed);
-
-		for (const interfaceName of await listInterfaces()) {
-			if (!isExitLinkInterface(interfaceName) || keep.has(interfaceName)) continue;
-
-			log.warn(`Deleting orphaned exit link ${interfaceName} - no peer claims it any more`);
-			await stopInterface(interfaceName);
-		}
+		await applyFirewall(plan.ruleset);
 	} catch (error) {
-		log.error(`Failed to sweep orphaned exit links: ${error}`);
+		log.error(`Failed to sync firewall ruleset: ${error}`);
+	}
+
+	try {
+		// Last, and specifically after the interfaces are up: exit routing installs
+		// `ip route ... dev <interfaceName>`, which needs the device to already exist. The plan
+		// puts the interface steps first for this reason.
+		await applyExitRouting(plan.routing);
+		await warnOnRoutingSysctls(plan.routingChecks);
+	} catch (error) {
+		log.error(`Failed to apply exit routing: ${error}`);
 	}
 };
 
 /**
- * Brings one server's interfaces and the host-wide firewall/routing state in sync with the db:
- * allocates or releases exit links, starts each interface that isn't up yet and reloads the
- * ones that are, then re-applies both host-wide artefacts.
+ * Brings one server's interfaces and the host-wide firewall/routing state in sync with the db.
  *
- * A server is *several* interfaces now: its own, carrying every ordinary peer, plus one per
- * exit node (wg/exitLinks.ts). They converge together because they are one unit of meaning -
- * moving a peer between them is exactly what toggling `isExitNode` does, and doing half of that
- * would leave the peer either on both interfaces or on neither.
+ * A server is *several* interfaces: its own, carrying every ordinary peer, plus one per exit
+ * node (wg/exitLinks.ts). They converge together because they are one unit of meaning - moving
+ * a peer between them is exactly what toggling `isExitNode` does, and doing half of that would
+ * leave the peer either on both interfaces or on neither.
  *
  * **This is the only sync any route handler should call**, whatever it changed. It used to be
  * a choice - `converge()` for peer/server config, `syncFirewall()` alone for pure policy
@@ -108,55 +92,43 @@ const sweepOrphanedExitLinks = async (claimed: string[]) => {
  * mutation now also reloads the interface, which is a `wg syncconf` with identical content:
  * cheap, idempotent, and it puts every nft mutation on the serialized chain above instead of
  * letting a policy handler's ruleset rebuild race a concurrent converge.
+ *
+ * Three steps, in this order and for stated reasons:
+ *
+ *  1. `reconcileExitLinks` - it *writes* (allocating or releasing a peer's five link columns),
+ *     so everything below has to be read after it. A peer that just became an exit node needs
+ *     its interface allocated before its server's config is generated, and generating that
+ *     config is also what removes it from the shared interface.
+ *  2. one fleet snapshot and one look at the host, turned into a `ConvergePlan` (wg/plan.ts) -
+ *     pure, and where every ordering decision now lives.
+ *  3. apply it.
  */
 export const converge = async (serverId: string): Promise<ConvergeResult> =>
 	queue(async () => {
 		const server = await resolveServer(serverId);
 		if (!server) return { ok: false, reason: 'Server not found' };
 
-		// First, because everything below renders from those columns: a peer that just became an
-		// exit node needs its interface allocated before its server's config is generated, and
-		// generating that config is also what removes it from the shared interface.
 		const reconcile = await reconcileExitLinks(server.id);
 		for (const failure of reconcile.failures) {
 			log.warn(`Peer ${failure.peerId} is marked as an exit node but has no usable link: ${failure.message}`);
 		}
 
+		const plan = planConverge({ serverId: server.id, fleet: await loadFleet(), upInterfaces: await listInterfaces(), reconcile });
+
+		let failure: string | null = null;
 		try {
-			// Released links go down before anything comes up, so an interface name or udp port
-			// freed here is reusable within this same converge.
-			for (const interfaceName of reconcile.releasedInterfaces) {
-				if (await isInterfaceUp(interfaceName)) await stopInterface(interfaceName);
-			}
-			await resetExitRouting(reconcile.releasedRouteTableIds);
-
-			await applyInterface(server.interfaceName, await generateServerConfig(server));
-
-			const peers = await db.query.peersTable.findMany({ where: eq(peersTable.serverPeerId, server.id) });
-			for (const node of exitTopologyOf(peers).exitNodes) {
-				// unprovisioned link - reconcileExitLinks already reported why
-				if (!node.link) continue;
-				await applyInterface(node.link.interfaceName, generateExitLinkConfig(node));
+			for (const step of plan.interfaces) {
+				await runStep(step);
 			}
 		} catch (error) {
 			log.error(`Failed to converge interfaces for ${server.interfaceName}: ${error}`);
-			return { ok: false, reason: `Failed to apply interface configuration: ${error}` };
+			failure = `Failed to apply interface configuration: ${error}`;
 		}
 
-		await applyHostState();
+		// Deliberately not in the catch's shadow: see applyHostState.
+		await applyHostState(plan);
 
-		return { ok: true };
-	});
-
-/**
- * The host-wide half alone, without touching any interface. Only correct where every interface
- * has just been brought up by other means - that is, at boot (wg/manager.ts). Route handlers
- * want converge() above.
- */
-export const convergeHost = async (): Promise<ConvergeResult> =>
-	queue(async () => {
-		await applyHostState();
-		return { ok: true };
+		return failure ? { ok: false, reason: failure } : { ok: true };
 	});
 
 /**
@@ -167,7 +139,7 @@ export const convergeHost = async (): Promise<ConvergeResult> =>
 export const tearDownExitLink = async (link: { interfaceName: string; routeTableId: number }) =>
 	queue(async () => {
 		try {
-			if (await isInterfaceUp(link.interfaceName)) await stopInterface(link.interfaceName);
+			if ((await listInterfaces()).includes(link.interfaceName)) await stopInterface(link.interfaceName);
 			await resetExitRouting([link.routeTableId]);
 		} catch (error) {
 			log.error(`Failed to tear down exit link ${link.interfaceName}: ${error}`);

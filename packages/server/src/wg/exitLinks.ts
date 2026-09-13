@@ -123,6 +123,13 @@ export type ExitLinkReconcile = {
 	releasedInterfaces: string[];
 	/** routing tables that went with them */
 	releasedRouteTableIds: number[];
+	/**
+	 * interfaces allocated by *this* reconcile, carrying a brand new keypair and udp port. A
+	 * name freed by a crash can come straight back here while the device is still up, and
+	 * reloading (`wg syncconf`) applies the peers but not the `[Interface]` half - so converge
+	 * has to restart these rather than reload them. See wg/plan.ts.
+	 */
+	provisionedInterfaces: string[];
 	/** peers that wanted a link but could not get one - reported, never thrown */
 	failures: { peerId: string; message: string }[];
 };
@@ -133,13 +140,13 @@ export type ExitLinkReconcile = {
  * of every peer that has one but is no longer an exit node.
  *
  * Never throws: a server whose links cannot all be provisioned must still converge the rest of
- * itself, exactly like syncFirewall/syncExitRouting. The affected exit node simply stays inert
+ * itself, exactly like the appliers converge runs afterwards. The affected exit node stays inert
  * (its link is null everywhere downstream) and is reported back so converge can log it.
  */
 export async function reconcileExitLinks(serverPeerId: string): Promise<ExitLinkReconcile> {
 	const peers = await db.query.peersTable.findMany({ where: eq(peersTable.serverPeerId, serverPeerId) });
 
-	const result: ExitLinkReconcile = { releasedInterfaces: [], releasedRouteTableIds: [], failures: [] };
+	const result: ExitLinkReconcile = { releasedInterfaces: [], releasedRouteTableIds: [], provisionedInterfaces: [], failures: [] };
 
 	for (const peer of peers) {
 		if (!peer.isExitNode && peer.exitInterfaceName) {
@@ -174,6 +181,7 @@ export async function reconcileExitLinks(serverPeerId: string): Promise<ExitLink
 				.where(eq(peersTable.id, peer.id))
 				.execute();
 
+			result.provisionedInterfaces.push(allocation.allocation.interfaceName);
 			log.info(`Provisioned exit link ${allocation.allocation.interfaceName} (udp ${allocation.allocation.listenPort}) for peer ${peer.id}`);
 		}
 	}
@@ -194,10 +202,10 @@ const CLEARED_LINK = {
 const isProvisioned = (peer: Peer) => !!peer.exitInterfaceName && !!peer.exitPrivateKey && !!peer.exitPublicKey && peer.exitListenPort !== null && peer.exitRouteTableId !== null;
 
 /**
- * Every exit-link interface and routing table on the host, for teardown paths that have to
- * clean up state the db is about to stop describing - deleting a server, and shutdown
- * (wg/manager.ts). `ip rule` entries outlive their interface, so they need clearing explicitly
- * even though deleting the device drops its routes.
+ * Every exit-link interface and routing table the db describes - for wg/manager.ts, which
+ * needs them at boot (to merge each link's `wg show` samples into its server's) and at
+ * shutdown (to take them down and clear their rules). `ip rule` entries outlive their
+ * interface, so they need clearing explicitly even though deleting the device drops its routes.
  */
 export async function allExitLinks(): Promise<{ interfaceName: string; routeTableId: number; serverPeerId: string }[]> {
 	const peers = await db.query.peersTable.findMany({ columns: { exitInterfaceName: true, exitRouteTableId: true, serverPeerId: true } });

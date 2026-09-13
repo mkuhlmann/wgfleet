@@ -56,7 +56,7 @@ const log = createLog('wg:exitRouting');
  * **exit link** per exit node (wg/exitLinks.ts), and each needs main-table routes; each link
  * additionally owns a policy table that its clients are steered into.
  */
-export type ExitRoutingServer = {
+type ExitRoutingServer = {
 	/** the server's own wg interface - where every non-exit peer lives */
 	interfaceName: string;
 	/** the vpn subnet, reachable through the interface above */
@@ -70,19 +70,23 @@ export type ExitRoutingServer = {
 	exitLinks: ExitRoutingLink[];
 };
 
-export type ExitRoutingLink = {
+type ExitRoutingLink = {
 	interfaceName: string;
 	/**
 	 * The exit node's own `/32` - without it nothing on the host can reach that peer, since it
-	 * left the server's interface and is no longer covered by its connected route - plus any
-	 * subnet it advertises.
+	 * left the server's interface and is no longer covered by its connected route.
 	 */
-	staticRoutes: string[];
+	nodeRoute: string;
+	/** subnets this exit node advertises, which live on its link rather than the server's */
+	advertisedRoutes: string[];
 	/** the policy table whose default route points at this link */
 	routeTableId: number;
 	/** ips of the peers assigned to this exit node */
 	clientIps: string[];
 };
+
+/** Everything that goes in the main table for one interface, in one list. */
+const staticRoutesOf = (link: ExitRoutingLink): string[] => [link.nodeRoute, ...link.advertisedRoutes];
 
 // `ip rule` has no upsert and no "delete every rule for table N", so draining is a bounded
 // delete-until-it-fails loop. Bounded rather than `while true` so a kernel that somehow keeps
@@ -117,15 +121,20 @@ const inBand = (tableId: number) => tableId >= EXIT_ROUTE_TABLE_MIN && tableId <
  * drained before it is repopulated, so the applied state is a function of the db alone and
  * can't drift no matter which mutation path got us here.
  *
- * Callers must pass every server, including ones with no exit nodes and nothing advertised -
- * that is how a table gets emptied after its exit node loses its last client, and how a route
- * left over from a withdrawn advertisement goes away.
+ * Callers must pass the whole fleet, including servers with no exit nodes and nothing
+ * advertised - that is how a table gets emptied after its exit node loses its last client, and
+ * how a route left over from a withdrawn advertisement goes away.
+ *
+ * Takes the fleet snapshot rather than a pre-resolved projection for the same reason
+ * buildRuleset does (wg/firewall.ts): the projection below is where the decisions are - which
+ * exit node has a link, whose clients are whose, which advertisement sits on which interface -
+ * and above the seam it was verified by nothing.
  */
-export const buildExitRouting = (servers: ExitRoutingServer[]): string[] => {
+export const buildExitRouting = (fleet: PolicyGraph[]): string[] => {
 	const commands: string[] = [];
 
-	for (const server of servers) {
-		const interfaces = [{ interfaceName: server.interfaceName, staticRoutes: server.staticRoutes }, ...server.exitLinks];
+	for (const server of fleet.map(toExitRoutingServer)) {
+		const interfaces = [{ interfaceName: server.interfaceName, staticRoutes: server.staticRoutes }, ...server.exitLinks.map((link) => ({ interfaceName: link.interfaceName, staticRoutes: staticRoutesOf(link) }))];
 
 		// Main table first. Drained unconditionally - an interface with nothing on it is exactly
 		// the case where a route left over from a removed advertisement has to go, and that is
@@ -172,7 +181,7 @@ export const buildExitRouting = (servers: ExitRoutingServer[]): string[] => {
 			}
 
 			// Last and least specific. Requires the device to exist, which is why
-			// syncExitRouting runs at the end of converge(), after every interface is up.
+			// the plan puts the interface steps ahead of the routing for exactly this reason.
 			commands.push(`ip -4 route replace default dev ${link.interfaceName} table ${link.routeTableId}`);
 
 			for (const ip of clientIps) {
@@ -214,10 +223,11 @@ const toExitRoutingServer = (graph: PolicyGraph): ExitRoutingServer => {
 				? [
 						{
 							interfaceName: node.link.interfaceName,
-							// The exit node's own /32 first: its server's connected route no longer covers
-							// it (it is not a peer of that interface any more), so without this nothing on
-							// the host - and therefore no other peer - can reach it at all.
-							staticRoutes: [`${node.ip}/32`, ...node.advertisedRoutes],
+							// Its server's connected route no longer covers this peer (it is not on that
+							// interface any more), so without this nothing on the host - and therefore no
+							// other peer - can reach it at all.
+							nodeRoute: `${node.ip}/32`,
+							advertisedRoutes: node.advertisedRoutes,
 							routeTableId: node.link.routeTableId,
 							clientIps: node.clientIps,
 						},
@@ -225,6 +235,44 @@ const toExitRoutingServer = (graph: PolicyGraph): ExitRoutingServer => {
 				: [],
 		),
 	};
+};
+
+/**
+ * Which interfaces need which host-level sysctl warning, as data. Pure, so the rule "an exit
+ * link with no clients still needs the rp_filter warning if its node advertises" is a fixture
+ * rather than a branch nobody can reach from a test - `readSysctl` below touches the real
+ * /proc, so everything that decided *whether* to read it used to be untestable with it.
+ *
+ * `forwarding` is a list of reasons; empty means nothing on this host forwards at all, and the
+ * ip_forward check is skipped entirely rather than warning a plain hub-only deployment.
+ */
+export const buildExitRoutingChecks = (fleet: PolicyGraph[]): { reversePath: { interfaceName: string; reason: string }[]; forwarding: string[] } => {
+	const reversePath: { interfaceName: string; reason: string }[] = [];
+	const forwarding: string[] = [];
+
+	const ADVERTISES = 'has a peer advertising subnet routes';
+
+	for (const server of fleet.map(toExitRoutingServer)) {
+		if (server.staticRoutes.length) {
+			reversePath.push({ interfaceName: server.interfaceName, reason: ADVERTISES });
+			forwarding.push(`${server.interfaceName} has advertised subnet routes`);
+		}
+
+		for (const link of server.exitLinks) {
+			const advertises = link.advertisedRoutes.length > 0;
+
+			if (link.clientIps.length) {
+				reversePath.push({ interfaceName: link.interfaceName, reason: 'is an exit node link' });
+				forwarding.push(`${link.interfaceName} routes ${link.clientIps.length} client(s) through an exit node`);
+			} else if (advertises) {
+				reversePath.push({ interfaceName: link.interfaceName, reason: ADVERTISES });
+			}
+
+			if (advertises) forwarding.push(`${link.interfaceName} has advertised subnet routes`);
+		}
+	}
+
+	return { reversePath, forwarding };
 };
 
 /** A /proc/sys integer, or null where /proc isn't readable (container, non-linux). */
@@ -287,45 +335,14 @@ const warnOnForwardingDisabled = async (reasons: string[]) => {
 };
 
 /**
- * Brings the host's policy routing in sync with the db. Never throws - a failure here leaves
- * exit clients without internet but must not fail the mutation that triggered it or take the
- * interface down with it, matching syncFirewall's contract.
- *
- * Takes the fleet snapshot (db/fleet.ts) rather than reading it, so that this and syncFirewall
- * apply the same one - see wg/converge.ts, the only caller.
+ * Emits the sysctl warnings a plan calls for. The *deciding* is pure (buildExitRoutingChecks
+ * above); this only reads /proc and logs, which is why the two are separate at all.
  */
-export const syncExitRouting = async (fleet: PolicyGraph[]) => {
-	try {
-		const servers = fleet.map(toExitRoutingServer);
-		await applyExitRouting(buildExitRouting(servers));
-
-		const forwardingReasons: string[] = [];
-
-		for (const server of servers) {
-			if (server.staticRoutes.length) {
-				await warnOnStrictReversePath(server.interfaceName, 'has a peer advertising subnet routes');
-				forwardingReasons.push(`${server.interfaceName} has advertised subnet routes`);
-			}
-
-			for (const link of server.exitLinks) {
-				// its own /32 is always there, so anything beyond one entry is a real advertisement
-				const advertises = link.staticRoutes.length > 1;
-
-				if (link.clientIps.length) {
-					await warnOnStrictReversePath(link.interfaceName, 'is an exit node link');
-					forwardingReasons.push(`${link.interfaceName} routes ${link.clientIps.length} client(s) through an exit node`);
-				} else if (advertises) {
-					await warnOnStrictReversePath(link.interfaceName, 'has a peer advertising subnet routes');
-				}
-
-				if (advertises) forwardingReasons.push(`${link.interfaceName} has advertised subnet routes`);
-			}
-		}
-
-		await warnOnForwardingDisabled(forwardingReasons);
-	} catch (error) {
-		log.error(`Failed to apply exit routing: ${error}`);
+export const warnOnRoutingSysctls = async (checks: { reversePath: { interfaceName: string; reason: string }[]; forwarding: string[] }) => {
+	for (const check of checks.reversePath) {
+		await warnOnStrictReversePath(check.interfaceName, check.reason);
 	}
+	await warnOnForwardingDisabled(checks.forwarding);
 };
 
 export const resetExitRouting = async (tableIds: number[]) => {

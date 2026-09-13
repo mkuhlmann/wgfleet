@@ -1,6 +1,8 @@
 import { createLog } from '@server/lib/log';
-import { applyFirewall } from './shell';
 import { exitTopology, type PolicyGraph } from '@server/db/policyGraph';
+// Applied defensively here as well as at the api (lib/grantInvariants.ts): a dstCidr already in
+// the db - from before that check existed - must not be able to break every future sync.
+import { isIpv4Cidr } from '@server/lib/validation';
 
 const log = createLog('wg:firewall');
 
@@ -12,13 +14,13 @@ const log = createLog('wg:firewall');
 // through untouched - unrestricted, exactly like the old `groupId = null` behaviour. This is what
 // makes "policy on the individual client" take precedence over tag-level policy: a peer-scoped
 // grant placed above the tag-scoped ones in the ordered list wins.
-export type FirewallTag = {
+type FirewallTag = {
 	id: string;
 	name: string;
 	memberIps: string[];
 };
 
-export type FirewallGrant = {
+type FirewallGrant = {
 	action: 'allow' | 'deny';
 	src: { kind: 'tag'; tagId: string } | { kind: 'peer'; ip: string };
 	dst: { kind: 'tag'; tagId: string } | { kind: 'peer'; ip: string } | { kind: 'cidr'; cidr: string } | { kind: 'server' } | { kind: 'any' };
@@ -32,7 +34,7 @@ export type FirewallGrant = {
  * the clients allowed down it. One per exit node rather than one per server, because that is
  * how many interfaces there are - see wg/exitLinks.ts.
  */
-export type FirewallExitNode = {
+type FirewallExitNode = {
 	/** the exit link's interface name - the `oifname` exit traffic leaves through */
 	interfaceName: string;
 	/** the exit node's own ip. Traffic *to* it is ordinary peer traffic, governed by grants. */
@@ -47,10 +49,9 @@ export type FirewallExitNode = {
 	clientIps: string[];
 };
 
-export type FirewallServer = {
+type FirewallServer = {
 	interfaceName: string;
 	cidrRange: string;
-	wgAddress: string;
 	tags: FirewallTag[];
 	// already in evaluation order (ascending `position`, enabled only) - see toFirewallServer
 	grants: FirewallGrant[];
@@ -77,14 +78,6 @@ export type FirewallServer = {
 // instead - the human name still appears as an nft `comment` for readability.
 const sanitizeComment = (value: string) => value.replace(/[\\"\r\n]/g, '').slice(0, 64);
 
-// This feature is ipv4-only throughout (see the `meta nfproto ipv6 drop` in buildRuleset).
-// `ip daddr <cidr>` is the ipv4-specific match - handing it an ipv6 literal is an
-// nft type error (`nft -f` exits 1: "Address family for hostname not supported"),
-// not something nft just ignores. Used both to gate the api (`policy.ts`) and,
-// defensively, here - a dstCidr already in the db (e.g. from before this check
-// existed) must not be able to permanently break every future sync.
-export const isIpv4Cidr = (value: string) => /^(?:\d{1,3}\.){3}\d{1,3}\/(?:[0-9]|[1-2][0-9]|3[0-2])$/.test(value);
-
 const quote = (value: string) => `"${value}"`;
 
 // `ip daddr != x` for one prefix, `ip daddr != { x, y }` for several - nft accepts a negated
@@ -100,11 +93,11 @@ const renderExcluded = (cidrs: string[]): string | undefined => {
 };
 
 /**
- * Pure ruleset builder - no db, no io. Takes an explicit, ordered list of servers
- * (ordinal position determines the generated nft names, so callers must pass a
- * stable order) and returns the full `table inet wgmgr` nft script as text.
+ * Emits the nft script from the projection below. Internal: the module's interface is
+ * buildRuleset(fleet), so that the projection and the emission are tested as one thing - see
+ * the note there.
  */
-export const buildRuleset = (servers: FirewallServer[]): string => {
+const emitRuleset = (servers: FirewallServer[]): string => {
 	// resolve a tag's db id -> its ordinal `s{i}t{j}` name, across all servers (grants are
 	// api-validated to never cross servers, but this stays robust to a stale cross-server id)
 	const tagSetName = new Map<string, string>();
@@ -171,7 +164,6 @@ export const buildRuleset = (servers: FirewallServer[]): string => {
 	const forwardLines: string[] = [];
 	const inputLines: string[] = [];
 	const fwdChains: string[] = [];
-	const srcChains: string[] = [];
 	const inChains: string[] = [];
 
 	servers.forEach((server, i) => {
@@ -261,7 +253,6 @@ export const buildRuleset = (servers: FirewallServer[]): string => {
 	parts.push([`chain forward {`, `\ttype filter hook forward priority filter; policy accept;`, `\tct state invalid drop`, `\tct state established,related accept`, ...forwardLines, `}`].join('\n'));
 
 	parts.push(...fwdChains);
-	parts.push(...srcChains);
 
 	if (inputLines.length) {
 		parts.push([`chain input {`, `\ttype filter hook input priority filter; policy accept;`, `\tct state established,related accept`, ...inputLines, `}`].join('\n'));
@@ -287,7 +278,7 @@ const indent = (block: string) =>
 		.map((line) => (line ? '\t' + line : line))
 		.join('\n');
 
-// Builds this server's FirewallServer from its policy graph (see db/policyGraph.ts) -
+// Builds this server's projection from its policy graph (see db/policyGraph.ts) -
 // resolves tag/peer references to ips, drops anything unresolvable (stale assignment, a
 // grant naming a deleted tag/peer, a non-ipv4 dstCidr) rather than letting it break the
 // whole ruleset, and derives `governedIps` per the "governed" rule documented on
@@ -364,7 +355,6 @@ const toFirewallServer = (graph: PolicyGraph): FirewallServer => {
 	return {
 		interfaceName: graph.server.interfaceName,
 		cidrRange: graph.server.cidrRange,
-		wgAddress: graph.server.wgAddress,
 		tags: firewallTags,
 		grants: firewallGrants,
 		governedIps: [...governedPeerIds].map((id) => peerIp.get(id)).filter((ip): ip is string => Boolean(ip)),
@@ -376,25 +366,15 @@ const toFirewallServer = (graph: PolicyGraph): FirewallServer => {
 };
 
 /**
- * The ruleset for a whole fleet snapshot (db/fleet.ts). Pure apart from the snapshot it is
- * handed - the ordinal nft naming in buildRuleset depends on the snapshot's order, which
- * loadFleet() is what guarantees.
- */
-export const generateFirewallRuleset = (fleet: PolicyGraph[]) => buildRuleset(fleet.map(toFirewallServer));
-
-/**
- * Regenerates the whole ruleset (it is global across all servers) and applies it
- * atomically. A failed apply leaves the previous ruleset in place - log and move on
- * rather than tearing the table down, since a partial/failed state is worse than a
- * stale-but-consistent one.
+ * The whole `table inet wgmgr` script for a fleet snapshot (db/fleet.ts). Pure - no db, no io.
  *
- * Takes the fleet snapshot rather than reading it, so that this and syncExitRouting apply the
- * same one - see wg/converge.ts, the only caller.
+ * This takes the snapshot rather than a pre-resolved projection on purpose. The projection
+ * above is where the interesting decisions live - which peers are governed, which grants are
+ * dropped as unresolvable, which exit node has no link yet - and while it sat above this
+ * function's seam, every one of those decisions was re-enacted by hand in the fixtures and
+ * verified by nothing. One interface, one test surface.
+ *
+ * The ordinal nft naming (`s{i}`, `s{i}t{j}`) depends on the snapshot's order, which is what
+ * loadFleet() guarantees.
  */
-export const syncFirewall = async (fleet: PolicyGraph[]) => {
-	try {
-		await applyFirewall(generateFirewallRuleset(fleet));
-	} catch (error) {
-		log.error(`Failed to sync firewall ruleset: ${error}`);
-	}
-};
+export const buildRuleset = (fleet: PolicyGraph[]): string => emitRuleset(fleet.map(toFirewallServer));

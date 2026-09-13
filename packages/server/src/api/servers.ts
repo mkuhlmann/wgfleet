@@ -1,22 +1,23 @@
-import { Elysia, status, t } from 'elysia';
+import { Elysia, t } from 'elysia';
+import { fail } from './failure';
 import { db } from '../db';
 import { serverPeersTable } from '../db/schema';
-import IPCIDR from 'ip-cidr';
-import { eq, and, ne } from 'drizzle-orm';
+import { eq } from 'drizzle-orm';
 import { wgDerivePublicKey, wgGenKey } from '../wg/shell';
 import { converge } from '../wg/converge';
 import { auth } from './auth';
 import { createLog } from '@server/lib/log';
-import { generateServerConfig } from '@server/wg/config';
+import { buildServerConfig } from '@server/wg/config';
+import { policyGraphOf } from '@server/db/policyGraph';
 import { CIDR_REGEX, INTERFACE_NAME_REGEX, WG_LISTEN_PORT_MAX, WG_LISTEN_PORT_MIN } from '@server/lib/validation';
+import { checkServerInvariants } from '@server/lib/serverInvariants';
 
 const log = createLog('http');
 
-async function isPortInUse(port: number, excludeServerId?: string) {
-	const existing = await db.query.serverPeersTable.findFirst({
-		where: excludeServerId ? and(eq(serverPeersTable.wgListenPort, port), ne(serverPeersTable.id, excludeServerId)) : eq(serverPeersTable.wgListenPort, port),
-	});
-	return !!existing;
+/** Every server on this host, as lib/serverInvariants.ts wants it. */
+async function loadServerInvariantSnapshot() {
+	const servers = await db.select({ id: serverPeersTable.id, interfaceName: serverPeersTable.interfaceName, wgListenPort: serverPeersTable.wgListenPort }).from(serverPeersTable);
+	return { servers };
 }
 
 export const serversRoutes = new Elysia()
@@ -33,20 +34,14 @@ export const serversRoutes = new Elysia()
 	.post(
 		'/wg/servers',
 		async ({ body }) => {
-			if (await isPortInUse(body.wgListenPort)) {
-				return status(400, 'Port already in use by another server');
-			}
+			// The same function ServerModal.vue validates with (lib/serverInvariants.ts), so the
+			// two cross-row rules - a port another server already listens on, an address outside
+			// the range - are checkable client-side instead of only by submitting.
+			const invalid = checkServerInvariants(await loadServerInvariantSnapshot(), null, body);
+			if (invalid) return fail(400, invalid);
 
 			const privateKey = await wgGenKey();
 			const publicKey = await wgDerivePublicKey(privateKey);
-
-			if (!IPCIDR.isValidCIDR(body.cidrRange)) {
-				return status(400, 'Invalid CIDR range');
-			}
-
-			if (!new IPCIDR(body.cidrRange).contains(body.wgAddress)) {
-				return status(400, 'wgAddress is not in CIDR range');
-			}
 
 			const peer = await db
 				.insert(serverPeersTable)
@@ -105,17 +100,8 @@ export const serversRoutes = new Elysia()
 	.patch(
 		'/wg/servers/:id',
 		async ({ wgServer: server, body }) => {
-			if (body.wgListenPort && (await isPortInUse(body.wgListenPort, server.id))) {
-				return status(400, 'Port already in use by another server');
-			}
-
-			if (body.cidrRange && !IPCIDR.isValidCIDR(body.cidrRange)) {
-				return status(400, 'Invalid CIDR range');
-			}
-
-			if (body.wgAddress && !new IPCIDR(body.cidrRange ?? server.cidrRange).contains(body.wgAddress)) {
-				return status(400, 'wgAddress is not in CIDR range');
-			}
+			const invalid = checkServerInvariants(await loadServerInvariantSnapshot(), server, body);
+			if (invalid) return fail(400, invalid);
 
 			const updatedServer = await db.update(serverPeersTable).set(body).where(eq(serverPeersTable.id, server.id)).returning();
 
@@ -147,7 +133,7 @@ export const serversRoutes = new Elysia()
 			serverScope: true,
 		},
 	)
-	.get('/wg/servers/:id/config', async ({ wgServer }) => await generateServerConfig(wgServer), {
+	.get('/wg/servers/:id/config', async ({ wgServer }) => buildServerConfig(await policyGraphOf(wgServer)), {
 		params: t.Object({
 			id: t.String(),
 		}),

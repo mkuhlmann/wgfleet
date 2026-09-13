@@ -1,29 +1,37 @@
 import { describe, expect, it } from 'bun:test';
-import { buildExitRouting, buildExitRoutingTeardown, type ExitRoutingLink, type ExitRoutingServer } from './exitRouting';
+import { buildExitRouting, buildExitRoutingChecks, buildExitRoutingTeardown } from './exitRouting';
+import { graphOf, type GraphSpec, type PeerSpec } from '@server/tests/graphs';
 
-// Driven entirely against the pure builder - no db, no io. See CLAUDE.md on why test
-// scenarios belong on the pure function rather than on syncExitRouting (a single in-memory
-// database is shared across every test file, so anything reading "all servers" would pick up
-// fixtures from unrelated files).
-const link = (overrides: Partial<ExitRoutingLink> = {}): ExitRoutingLink => ({
-	interfaceName: 'wgx0',
-	staticRoutes: ['10.0.0.2/32'],
-	routeTableId: 52000,
-	clientIps: ['10.0.0.3'],
-	...overrides,
-});
+// Driven against the pure builders, which take the fleet snapshot (db/fleet.ts) - no db, no io.
+// See CLAUDE.md on why test scenarios belong here rather than on a db-reading applier (a single
+// in-memory database is shared across every test file, so anything reading "all servers" would
+// pick up fixtures from unrelated files).
+const server = (spec: GraphSpec = {}) => graphOf({ cidrRange: '10.0.0.0/24', wgAddress: '10.0.0.1', ...spec });
 
-const server = (overrides: Partial<ExitRoutingServer> = {}): ExitRoutingServer => ({
-	interfaceName: 'wg0',
-	cidrRange: '10.0.0.0/24',
-	staticRoutes: [],
-	exitLinks: [],
-	...overrides,
-});
+/** An exit node peer plus its clients - what used to be a hand-built ExitRoutingLink. */
+const exitNode = (spec: { id?: string; ip?: string; interfaceName?: string; routeTableId?: number; clientIps?: string[]; advertisedRoutes?: string; provisioned?: boolean } = {}): PeerSpec[] => {
+	const id = spec.id ?? 'n0';
+	const ip = spec.ip ?? '10.0.0.2';
+	const clientIps = spec.clientIps ?? ['10.0.0.3'];
+
+	return [
+		{
+			id,
+			ip,
+			isExitNode: true,
+			advertisedRoutes: spec.advertisedRoutes ?? null,
+			link: spec.provisioned === false ? null : { interfaceName: spec.interfaceName ?? 'wgx0', listenPort: 51900, routeTableId: spec.routeTableId ?? 52000 },
+		},
+		...clientIps.map((clientIp, i) => ({ id: `${id}-c${i}`, ip: clientIp, exitPeerId: id })),
+	];
+};
+
+/** A plain peer advertising subnet routes - what used to be a server-level `staticRoutes`. */
+const advertiser = (routes: string[], id = 'adv'): PeerSpec => ({ id, ip: '10.0.0.7', advertisedRoutes: routes.join(',') });
 
 describe('buildExitRouting', () => {
 	it('drains an exit link with no clients and leaves its table empty', () => {
-		const commands = buildExitRouting([server({ exitLinks: [link({ clientIps: [] })] })]);
+		const commands = buildExitRouting([server({ peers: exitNode({ clientIps: [] }) })]);
 
 		expect(commands.some((c) => c.includes('ip -4 rule del table 52000'))).toBe(true);
 		expect(commands.some((c) => c.includes('ip -4 route flush table 52000'))).toBe(true);
@@ -33,7 +41,7 @@ describe('buildExitRouting', () => {
 	it('builds a complete table per exit node, not just a default route', () => {
 		// An exit client's ip rule captures *all* of its traffic, so a table holding only the
 		// default route would give it the internet and take away every one of its peers.
-		const commands = buildExitRouting([server({ exitLinks: [link({ clientIps: ['10.0.0.3', '10.0.0.4'] })] })]);
+		const commands = buildExitRouting([server({ peers: exitNode({ clientIps: ['10.0.0.3', '10.0.0.4'] }) })]);
 
 		expect(commands).toEqual([
 			'ip -4 route flush dev wg0 proto static 2>/dev/null || true',
@@ -57,7 +65,7 @@ describe('buildExitRouting', () => {
 		// within an interface is chosen by destination, and both clients want the whole internet.
 		const commands = buildExitRouting([
 			server({
-				exitLinks: [link({ interfaceName: 'wgx0', staticRoutes: ['10.0.0.2/32'], routeTableId: 52000, clientIps: ['10.0.0.3'] }), link({ interfaceName: 'wgx1', staticRoutes: ['10.0.0.4/32'], routeTableId: 52001, clientIps: ['10.0.0.5'] })],
+				peers: [...exitNode({ id: 'n0', ip: '10.0.0.2', interfaceName: 'wgx0', routeTableId: 52000, clientIps: ['10.0.0.3'] }), ...exitNode({ id: 'n1', ip: '10.0.0.4', interfaceName: 'wgx1', routeTableId: 52001, clientIps: ['10.0.0.5'] })],
 			}),
 		]);
 
@@ -71,7 +79,7 @@ describe('buildExitRouting', () => {
 		// Both /32s go into both tables, so the split across interfaces is invisible to peers.
 		const commands = buildExitRouting([
 			server({
-				exitLinks: [link({ interfaceName: 'wgx0', staticRoutes: ['10.0.0.2/32'], routeTableId: 52000, clientIps: ['10.0.0.3'] }), link({ interfaceName: 'wgx1', staticRoutes: ['10.0.0.4/32'], routeTableId: 52001, clientIps: ['10.0.0.5'] })],
+				peers: [...exitNode({ id: 'n0', ip: '10.0.0.2', interfaceName: 'wgx0', routeTableId: 52000, clientIps: ['10.0.0.3'] }), ...exitNode({ id: 'n1', ip: '10.0.0.4', interfaceName: 'wgx1', routeTableId: 52001, clientIps: ['10.0.0.5'] })],
 			}),
 		]);
 
@@ -79,10 +87,31 @@ describe('buildExitRouting', () => {
 		expect(commands).toContain('ip -4 route replace 10.0.0.2/32 dev wgx0 table 52001');
 	});
 
+	it('ignores an exit node whose link is not provisioned yet', () => {
+		// It reaches converge before reconcileExitLinks has allocated anything, and a route or
+		// rule naming an interface that does not exist would simply fail to apply.
+		const commands = buildExitRouting([server({ peers: exitNode({ provisioned: false }) })]);
+
+		expect(commands.some((c) => c.includes('rule add'))).toBe(false);
+		expect(commands.some((c) => c.includes('table'))).toBe(false);
+		expect(commands).toEqual(['ip -4 route flush dev wg0 proto static 2>/dev/null || true']);
+	});
+
+	it('routes a client only into an exit node of its own server', () => {
+		// exitPeerId is api-validated to name a peer on the same server, but a stale id must not
+		// steer a client into a table whose default route belongs to somebody else's uplink.
+		const commands = buildExitRouting([
+			server({ id: 's0', interfaceName: 'wg0', peers: [...exitNode({ id: 'n0', clientIps: [] }), { id: 'stray', ip: '10.0.0.8', exitPeerId: 'foreign-node' }] }),
+			server({ id: 's1', interfaceName: 'wg1', cidrRange: '10.1.0.0/24', peers: exitNode({ id: 'foreign-node', ip: '10.1.0.2', interfaceName: 'wgx1', routeTableId: 52001, clientIps: [] }) }),
+		]);
+
+		expect(commands.some((c) => c.includes('rule add from 10.0.0.8/32'))).toBe(false);
+	});
+
 	it('drains before it repopulates, so a full reconcile can never duplicate a rule', () => {
 		// `ip rule add` has no upsert - applying twice without the drain would leave two rules
 		// for the same client, and removing that client once would leave one behind.
-		const commands = buildExitRouting([server({ exitLinks: [link()] })]);
+		const commands = buildExitRouting([server({ peers: exitNode() })]);
 
 		const drainAt = commands.findIndex((c) => c.includes('rule del table 52000'));
 		const addAt = commands.findIndex((c) => c.includes('rule add from 10.0.0.3/32'));
@@ -92,21 +121,21 @@ describe('buildExitRouting', () => {
 	});
 
 	it('flushes the table of an exit node that has no clients yet, rather than leaving a default route behind', () => {
-		const commands = buildExitRouting([server({ exitLinks: [link({ clientIps: [] })] })]);
+		const commands = buildExitRouting([server({ peers: exitNode({ clientIps: [] }) })]);
 
 		expect(commands.some((c) => c.includes('route flush table 52000'))).toBe(true);
 		expect(commands.some((c) => c.includes('route replace default'))).toBe(false);
 	});
 
 	it('emits rules in a stable order regardless of client order, so a no-op sync is a no-op', () => {
-		const a = buildExitRouting([server({ exitLinks: [link({ clientIps: ['10.0.0.9', '10.0.0.3'] })] })]);
-		const b = buildExitRouting([server({ exitLinks: [link({ clientIps: ['10.0.0.3', '10.0.0.9'] })] })]);
+		const a = buildExitRouting([server({ peers: exitNode({ clientIps: ['10.0.0.9', '10.0.0.3'] }) })]);
+		const b = buildExitRouting([server({ peers: exitNode({ clientIps: ['10.0.0.3', '10.0.0.9'] }) })]);
 
 		expect(a).toEqual(b);
 	});
 
 	it('deduplicates a client listed twice', () => {
-		const commands = buildExitRouting([server({ exitLinks: [link({ clientIps: ['10.0.0.3', '10.0.0.3'] })] })]);
+		const commands = buildExitRouting([server({ peers: exitNode({ clientIps: ['10.0.0.3', '10.0.0.3'] }) })]);
 
 		expect(commands.filter((c) => c.includes('rule add from 10.0.0.3/32'))).toHaveLength(1);
 	});
@@ -115,7 +144,7 @@ describe('buildExitRouting', () => {
 		// table 0 is what a directly written row would carry - flushing it would clobber routing
 		// this manager has nothing to do with. The main-table routes need no table, so they run.
 		for (const routeTableId of [0, 254, 53000]) {
-			const commands = buildExitRouting([server({ exitLinks: [link({ routeTableId })] })]);
+			const commands = buildExitRouting([server({ peers: exitNode({ routeTableId }) })]);
 
 			expect(commands.some((c) => c.includes('table'))).toBe(false);
 			expect(commands.some((c) => c.includes('rule'))).toBe(false);
@@ -124,7 +153,7 @@ describe('buildExitRouting', () => {
 	});
 
 	it('bounds the drain loop so it cannot spin forever', () => {
-		const drain = buildExitRouting([server({ exitLinks: [link()] })]).find((c) => c.includes('rule del'));
+		const drain = buildExitRouting([server({ peers: exitNode() })]).find((c) => c.includes('rule del'));
 
 		expect(drain).toContain('[ $i -lt 512 ]');
 	});
@@ -134,7 +163,7 @@ describe('buildExitRouting - advertised subnet routes', () => {
 	it('installs a main-table route per advertised prefix, with no ip rule at all', () => {
 		// Destination-based, unlike the exit node's source-based rule: any peer the firewall
 		// permits reaches the LAN, so there is no per-client state to install.
-		const commands = buildExitRouting([server({ staticRoutes: ['192.168.1.0/24'] })]);
+		const commands = buildExitRouting([server({ peers: [advertiser(['192.168.1.0/24'])] })]);
 
 		expect(commands).toContain('ip -4 route replace 192.168.1.0/24 dev wg0 proto static');
 		expect(commands.some((c) => c.includes('rule add'))).toBe(false);
@@ -144,7 +173,7 @@ describe('buildExitRouting - advertised subnet routes', () => {
 	it('drains its own proto-static routes before repopulating, so a removed advertisement goes away', () => {
 		// The main table cannot be flushed wholesale, so the routes are tagged `proto static`
 		// and only that proto is drained - see STATIC_ROUTE_PROTO in exitRouting.ts.
-		const commands = buildExitRouting([server({ staticRoutes: ['192.168.1.0/24'] })]);
+		const commands = buildExitRouting([server({ peers: [advertiser(['192.168.1.0/24'])] })]);
 
 		const drainAt = commands.findIndex((c) => c.includes('route flush dev wg0 proto static'));
 		const addAt = commands.findIndex((c) => c.includes('route replace 192.168.1.0/24'));
@@ -158,8 +187,8 @@ describe('buildExitRouting - advertised subnet routes', () => {
 	});
 
 	it('emits routes in a stable, deduplicated order so a no-op sync is a no-op', () => {
-		const a = buildExitRouting([server({ staticRoutes: ['192.168.9.0/24', '192.168.1.0/24', '192.168.1.0/24'] })]);
-		const b = buildExitRouting([server({ staticRoutes: ['192.168.1.0/24', '192.168.9.0/24'] })]);
+		const a = buildExitRouting([server({ peers: [advertiser(['192.168.9.0/24', '192.168.1.0/24', '192.168.1.0/24'])] })]);
+		const b = buildExitRouting([server({ peers: [advertiser(['192.168.1.0/24', '192.168.9.0/24'])] })]);
 
 		expect(a).toEqual(b);
 		expect(a.filter((c) => c.includes('192.168.1.0/24'))).toHaveLength(1);
@@ -168,7 +197,7 @@ describe('buildExitRouting - advertised subnet routes', () => {
 	it("reaches an advertised LAN from inside an exit client's table too", () => {
 		// Otherwise assigning an exit node would silently revoke a client's access to every
 		// advertised subnet, since its rule captures all of its traffic.
-		const commands = buildExitRouting([server({ staticRoutes: ['192.168.1.0/24'], exitLinks: [link()] })]);
+		const commands = buildExitRouting([server({ peers: [...exitNode(), advertiser(['192.168.1.0/24'])] })]);
 
 		expect(commands).toContain('ip -4 route replace 192.168.1.0/24 dev wg0 proto static');
 		expect(commands).toContain('ip -4 route replace 192.168.1.0/24 dev wg0 table 52000');
@@ -177,7 +206,7 @@ describe('buildExitRouting - advertised subnet routes', () => {
 	it("puts an exit node's own advertisements on its link, alongside its reachability route", () => {
 		// An exit node that also advertises a LAN is one peer on one interface - both kinds of
 		// route therefore belong on that interface, not on the server's.
-		const commands = buildExitRouting([server({ exitLinks: [link({ staticRoutes: ['10.0.0.2/32', '192.168.1.0/24'] })] })]);
+		const commands = buildExitRouting([server({ peers: exitNode({ advertisedRoutes: '192.168.1.0/24' }) })]);
 
 		expect(commands).toContain('ip -4 route replace 192.168.1.0/24 dev wgx0 proto static');
 		expect(commands).toContain('ip -4 route replace 10.0.0.2/32 dev wgx0 proto static');
@@ -185,10 +214,43 @@ describe('buildExitRouting - advertised subnet routes', () => {
 	});
 
 	it('routes each server its own advertisements', () => {
-		const commands = buildExitRouting([server({ interfaceName: 'wg0', staticRoutes: ['192.168.1.0/24'] }), server({ interfaceName: 'wg1', staticRoutes: ['192.168.2.0/24'] })]);
+		const commands = buildExitRouting([server({ id: 's0', interfaceName: 'wg0', peers: [advertiser(['192.168.1.0/24'])] }), server({ id: 's1', interfaceName: 'wg1', cidrRange: '10.1.0.0/24', peers: [advertiser(['192.168.2.0/24'], 'adv1')] })]);
 
 		expect(commands).toContain('ip -4 route replace 192.168.1.0/24 dev wg0 proto static');
 		expect(commands).toContain('ip -4 route replace 192.168.2.0/24 dev wg1 proto static');
+	});
+});
+
+describe('buildExitRoutingChecks', () => {
+	it('says nothing at all for a hub with no exit nodes and nothing advertised', () => {
+		// a plain deployment forwards nothing, so neither sysctl is its problem
+		expect(buildExitRoutingChecks([server({ peers: [{ id: 'p0', ip: '10.0.0.5' }] })])).toEqual({ reversePath: [], forwarding: [] });
+	});
+
+	it('warns about the exit link an exit client actually uses', () => {
+		const checks = buildExitRoutingChecks([server({ peers: exitNode() })]);
+
+		expect(checks.reversePath).toEqual([{ interfaceName: 'wgx0', reason: 'is an exit node link' }]);
+		expect(checks.forwarding).toEqual(['wgx0 routes 1 client(s) through an exit node']);
+	});
+
+	it('still warns about an exit link whose node advertises but has no clients', () => {
+		// no client means no exit traffic, but the advertised LAN is still forwarded over it
+		const checks = buildExitRoutingChecks([server({ peers: exitNode({ clientIps: [], advertisedRoutes: '192.168.1.0/24' }) })]);
+
+		expect(checks.reversePath).toEqual([{ interfaceName: 'wgx0', reason: 'has a peer advertising subnet routes' }]);
+		expect(checks.forwarding).toEqual(['wgx0 has advertised subnet routes']);
+	});
+
+	it('is silent about an exit link with neither clients nor advertisements', () => {
+		expect(buildExitRoutingChecks([server({ peers: exitNode({ clientIps: [] }) })])).toEqual({ reversePath: [], forwarding: [] });
+	});
+
+	it("names the server's own interface when an ordinary peer advertises", () => {
+		const checks = buildExitRoutingChecks([server({ peers: [advertiser(['192.168.1.0/24'])] })]);
+
+		expect(checks.reversePath).toEqual([{ interfaceName: 'wg0', reason: 'has a peer advertising subnet routes' }]);
+		expect(checks.forwarding).toEqual(['wg0 has advertised subnet routes']);
 	});
 });
 

@@ -1,7 +1,12 @@
 import IPCIDR from 'ip-cidr';
-import { CIDR_REGEX, parseCidrList } from '@server/lib/validation';
+import { parseCidrList } from '@server/lib/validation';
+import { failure, type Failure } from '@server/lib/failure';
+import { checkAdvertisedRoute } from '@server/lib/peerInvariants';
+// normalizeCidr lives in lib/validation.ts so the peer form can normalise as it validates
+export { normalizeCidr } from '@server/lib/validation';
+import { normalizeCidr } from '@server/lib/validation';
 
-export type ResolvePeerAddressResult = { ok: true; ip: string } | { ok: false; message: string };
+export type ResolvePeerAddressResult = { ok: true; ip: string } | { ok: false; failure: Failure };
 
 /**
  * Resolves the wgAddress a peer should get: validates a caller-requested address against the
@@ -13,11 +18,11 @@ export function resolvePeerAddress(cidrRange: string, reservedIps: number, exist
 
 	if (options?.requested) {
 		if (!cidr.contains(options.requested)) {
-			return { ok: false, message: 'wgAddress is not in CIDR range' };
+			return { ok: false, failure: failure('wgAddress is not in CIDR range', 'wgAddress') };
 		}
 
 		if (existingAddresses.has(options.requested)) {
-			return { ok: false, message: 'IP already in use' };
+			return { ok: false, failure: failure('IP already in use', 'wgAddress') };
 		}
 
 		return { ok: true, ip: options.requested };
@@ -37,16 +42,8 @@ export function resolvePeerAddress(cidrRange: string, reservedIps: number, exist
 		}
 	}
 
-	return { ok: false, message: 'No more IPs available' };
+	return { ok: false, failure: failure('No more IPs available', 'wgAddress') };
 }
-
-/**
- * Network address + prefix for a CIDR whose host bits may be set - `192.168.1.5/24` becomes
- * `192.168.1.0/24`. Both `ip route` and nft reject an unaligned prefix outright (nft: "Interval
- * is not aligned"), and CIDR_REGEX admits one, so anything that reaches a generated command or
- * ruleset has to be normalised first.
- */
-export const normalizeCidr = (cidr: string): string => `${new IPCIDR(cidr).start()}/${cidr.split('/')[1]}`;
 
 /**
  * Do two CIDR blocks share any address? Prefixes are aligned by the time this is called
@@ -59,7 +56,7 @@ export const cidrsOverlap = (a: string, b: string): boolean => new IPCIDR(a).con
 // re-exported here, where most of its callers already look for it.
 export { advertisedRoutesOf } from '@server/lib/exitTopology';
 
-export type ResolveAdvertisedRoutesResult = { ok: true; routes: string[] } | { ok: false; message: string };
+export type ResolveAdvertisedRoutesResult = { ok: true; routes: string[] } | { ok: false; failure: Failure };
 
 /**
  * Validates and normalises the subnet routes one peer advertises (`peers.advertisedRoutes`,
@@ -89,18 +86,9 @@ export function resolveAdvertisedRoutes(input: string | null | undefined, cidrRa
 	const routes: string[] = [];
 
 	for (const entry of entries) {
-		if (!CIDR_REGEX.test(entry)) {
-			return { ok: false, message: `Invalid or non-ipv4 CIDR: ${entry}` };
-		}
-
-		// A /0 advertisement is an exit node wearing the wrong hat: it claims the same
-		// AllowedIPs the exit node owns, so on an interface that has one the two would collide
-		// outright, and on one that doesn't it would make the advertiser a de-facto exit node
-		// while bypassing every invariant that role carries (one per interface, exitPeerId as
-		// the permission). Point the operator at the feature that actually models this.
-		if (entry.endsWith('/0')) {
-			return { ok: false, message: 'A default route (/0) is what an exit node advertises - mark the peer as an exit node instead of advertising 0.0.0.0/0 as a subnet route' };
-		}
+		// format and the /0 rule - shared with the peer form, see lib/peerInvariants.ts
+		const invalid = checkAdvertisedRoute(entry);
+		if (invalid) return { ok: false, failure: invalid };
 
 		const route = normalizeCidr(entry);
 
@@ -108,12 +96,12 @@ export function resolveAdvertisedRoutes(input: string | null | undefined, cidrRa
 		// Address; a peer claiming part of it would take over routing for peers on the same
 		// interface, which is what grants are for.
 		if (cidrsOverlap(route, cidrRange)) {
-			return { ok: false, message: `${route} overlaps this server's own range (${cidrRange}) - advertise a network behind the peer, not part of the vpn subnet` };
+			return { ok: false, failure: failure(`${route} overlaps this server's own range (${cidrRange}) - advertise a network behind the peer, not part of the vpn subnet`, 'advertisedRoutes') };
 		}
 
 		const clash = routes.find((existing) => cidrsOverlap(existing, route));
 		if (clash) {
-			return { ok: false, message: `${route} overlaps ${clash}, which this peer already advertises` };
+			return { ok: false, failure: failure(`${route} overlaps ${clash}, which this peer already advertises`, 'advertisedRoutes') };
 		}
 
 		routes.push(route);
@@ -123,7 +111,7 @@ export function resolveAdvertisedRoutes(input: string | null | undefined, cidrRa
 		for (const owner of reserved) {
 			const clash = owner.routes.find((existing) => cidrsOverlap(existing, route));
 			if (clash) {
-				return { ok: false, message: `${route} overlaps ${clash}, already used by ${owner.label}. A prefix can have only one owner - on a wireguard interface, and in the host's main routing table.` };
+				return { ok: false, failure: failure(`${route} overlaps ${clash}, already used by ${owner.label}. A prefix can have only one owner - on a wireguard interface, and in the host's main routing table.`, 'advertisedRoutes') };
 			}
 		}
 	}

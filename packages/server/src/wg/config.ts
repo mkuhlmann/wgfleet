@@ -1,7 +1,5 @@
-import { db } from '@server/db';
-import { peersTable, type Peer, type ServerPeer } from '@server/db/schema';
-import { eq } from 'drizzle-orm';
-import { allowedIpsForPeer, loadPolicyGraph } from '@server/db/policyGraph';
+import { type Peer, type ServerPeer } from '@server/db/schema';
+import { allowedIpsForPeer, loadPolicyGraph, type PolicyGraph } from '@server/db/policyGraph';
 import { advertisedRoutesOf, exitLinkOf, exitNodeFor, exitTopologyOf, type ExitNode } from '@server/lib/exitTopology';
 
 /**
@@ -21,10 +19,15 @@ const interfaceAddress = (server: ServerPeer): string => {
 	return `${server.wgAddress}/${prefix || '24'}`;
 };
 
-export const generateServerConfig = async (server: ServerPeer) => {
-	const peers = await db.query.peersTable.findMany({
-		where: eq(peersTable.serverPeerId, server.id),
-	});
+/**
+ * The hub-side config for a server's own wg interface. Takes the policy graph rather than the
+ * server row and a db read of its own: converge() already holds the fleet snapshot every other
+ * artefact is rendered from, and re-reading the peers here made "which peer is on which
+ * interface" a question with two answers that had to agree by hand.
+ */
+export const buildServerConfig = (graph: PolicyGraph): string => {
+	const server = graph.server;
+	const peers = graph.peers;
 
 	// Same derivation the nft ruleset and the host's policy routing use - see
 	// lib/exitTopology.ts. `plainPeers` is the load-bearing part: an exit node is *not* a peer

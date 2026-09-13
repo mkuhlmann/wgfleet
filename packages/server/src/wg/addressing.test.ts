@@ -10,17 +10,17 @@ describe('resolvePeerAddress', () => {
 
 		it('rejects a requested address outside the CIDR range', () => {
 			const result = resolvePeerAddress('10.20.20.0/24', 50, new Set(), { requested: '10.20.21.5' });
-			expect(result).toEqual({ ok: false, message: 'wgAddress is not in CIDR range' });
+			expect(result).toEqual({ ok: false, failure: { message: 'wgAddress is not in CIDR range', field: 'wgAddress' } });
 		});
 
 		it('rejects a requested address already in use', () => {
 			const result = resolvePeerAddress('10.20.20.0/24', 50, new Set(['10.20.20.5']), { requested: '10.20.20.5' });
-			expect(result).toEqual({ ok: false, message: 'IP already in use' });
+			expect(result).toEqual({ ok: false, failure: { message: 'IP already in use', field: 'wgAddress' } });
 		});
 
 		it('rejects an IPv6 address against an IPv4 CIDR rather than misinterpreting it', () => {
 			const result = resolvePeerAddress('10.20.20.0/24', 50, new Set(), { requested: '2001:db8::1' });
-			expect(result).toEqual({ ok: false, message: 'wgAddress is not in CIDR range' });
+			expect(result).toEqual({ ok: false, failure: { message: 'wgAddress is not in CIDR range', field: 'wgAddress' } });
 		});
 	});
 
@@ -48,12 +48,12 @@ describe('resolvePeerAddress', () => {
 			expect(result).toEqual({ ok: true, ip: '10.20.20.2' });
 
 			const exhausted = resolvePeerAddress('10.20.20.0/30', 0, new Set(['10.20.20.1', '10.20.20.2']));
-			expect(exhausted).toEqual({ ok: false, message: 'No more IPs available' });
+			expect(exhausted).toEqual({ ok: false, failure: { message: 'No more IPs available', field: 'wgAddress' } });
 		});
 
 		it('reports exhaustion once reservedIps has consumed the whole range', () => {
 			const result = resolvePeerAddress('10.20.20.0/24', 256, new Set());
-			expect(result).toEqual({ ok: false, message: 'No more IPs available' });
+			expect(result).toEqual({ ok: false, failure: { message: 'No more IPs available', field: 'wgAddress' } });
 		});
 	});
 });
@@ -122,7 +122,7 @@ describe('resolveAdvertisedRoutes', () => {
 		const result = resolveAdvertisedRoutes('0.0.0.0/0', SERVER_CIDR, []);
 
 		expect(result.ok).toBe(false);
-		expect(result.ok === false && result.message).toContain('exit node');
+		expect(result.ok === false && result.failure.message).toContain('exit node');
 	});
 
 	it("rejects a prefix overlapping the server's own range, which the connected route already owns", () => {
@@ -138,7 +138,7 @@ describe('resolveAdvertisedRoutes', () => {
 		const result = resolveAdvertisedRoutes('192.168.0.0/16', SERVER_CIDR, taken);
 
 		expect(result.ok).toBe(false);
-		expect(result.ok === false && result.message).toContain('branch-router');
+		expect(result.ok === false && result.failure.message).toContain('branch-router');
 	});
 
 	it("rejects a prefix contained in another peer's", () => {
@@ -157,6 +157,6 @@ describe('resolveAdvertisedRoutes', () => {
 		const result = resolveAdvertisedRoutes('192.168.0.0/16, 192.168.1.0/24', SERVER_CIDR, []);
 
 		expect(result.ok).toBe(false);
-		expect(result.ok === false && result.message).toContain('already advertises');
+		expect(result.ok === false && result.failure.message).toContain('already advertises');
 	});
 });

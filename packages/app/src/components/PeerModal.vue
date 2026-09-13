@@ -110,11 +110,11 @@
 
 <script setup lang="ts">
 import { ref, reactive, watch, computed } from 'vue';
-import { useToast } from '@app/composables/useToast';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query';
+import { useQuery } from '@tanstack/vue-query';
+import { useWrite } from '@app/queries/useWrite';
 import type { Peer, ServerPeer } from '@server/db/schema';
-import { CIDR_REGEX, IPV4_ADDRESS_REGEX, WG_LISTEN_PORT_MAX, WG_LISTEN_PORT_MIN, parseCidrList } from '@server/lib/validation';
-import { checkPeerInvariants } from '@server/lib/peerInvariants';
+import { IPV4_ADDRESS_REGEX, WG_LISTEN_PORT_MAX, WG_LISTEN_PORT_MIN, normalizeCidr, parseCidrList } from '@server/lib/validation';
+import { checkAdvertisedRoute, checkPeerInvariants } from '@server/lib/peerInvariants';
 import { exitLinkOf, exitTopologyOf } from '@server/lib/exitTopology';
 import { eden } from '@app/queries/edenClient';
 import { queryServerTags } from '@app/queries/queryPolicy';
@@ -123,8 +123,6 @@ import { invalidate } from '@app/queries/keys';
 import BaseButton from './BaseButton.vue';
 import BaseInput from './BaseInput.vue';
 import BaseModal from './BaseModal.vue';
-
-const toast = useToast();
 
 const props = defineProps<{
 	// wgLast* are internal delta-tracking bookkeeping the api never returns (see serversPeers.ts)
@@ -135,7 +133,6 @@ const props = defineProps<{
 const isEditMode = ref(props.peer ? true : false);
 
 const visible = defineModel<boolean>('visible', { required: true });
-const queryClient = useQueryClient();
 
 const { data: tags } = useQuery(queryServerTags(props.server.id));
 const { data: peers } = useQuery(queryServerPeers(props.server.id));
@@ -190,6 +187,10 @@ const errors = reactive({
 	isExitNode: '',
 	advertisedRoutes: '',
 	exitListenPort: '',
+	// server-side only: a stale tag id, or an exit node that vanished between load and submit.
+	// Present so a field-scoped failure has somewhere to land (see queries/useWrite.ts).
+	tagIds: '',
+	exitPeerId: '',
 });
 
 // The per-server state lib/peerInvariants.ts decides against, assembled from what this form
@@ -205,6 +206,8 @@ const validate = () => {
 	errors.isExitNode = '';
 	errors.advertisedRoutes = '';
 	errors.exitListenPort = '';
+	errors.tagIds = '';
+	errors.exitPeerId = '';
 
 	// Range only - whether the port is free depends on every other interface on the host, so
 	// that check stays server-side (resolveExitListenPort in wg/peerIntake.ts).
@@ -232,21 +235,35 @@ const validate = () => {
 		exitPeerId: form.exitPeerId,
 	});
 	if (invariantError) {
-		errors.isExitNode = invariantError;
+		// each rule names the field it is about, so "tags not found" no longer lands on the
+		// exit-node checkbox the way it did when this was a bare string
+		const field = invariantError.field;
+		if (field && field in errors) {
+			errors[field as keyof typeof errors] = invariantError.message;
+		} else {
+			errors.isExitNode = invariantError.message;
+		}
 		isValid = false;
 	}
 
-	// Format only. Whether a prefix overlaps another peer's advertisement or the server's own
-	// range depends on every other peer, so that check stays server-side
-	// (resolveAdvertisedRoutesFor in api/serversPeers.ts) and surfaces as a toast.
-	for (const entry of parseCidrList(form.advertisedRoutes)) {
-		if (!CIDR_REGEX.test(entry)) {
-			errors.advertisedRoutes = `Invalid CIDR: ${entry}. Subnet routes are IPv4 only, e.g. 192.168.1.0/24.`;
-			isValid = false;
-		} else if (entry.endsWith('/0')) {
-			errors.advertisedRoutes = 'A default route is what an exit node advertises - use the exit node checkbox instead of 0.0.0.0/0.';
+	// The same two rules the api applies per prefix (checkAdvertisedRoute, lib/peerInvariants.ts),
+	// with the same message - this used to restate both by hand. Whether a prefix *overlaps*
+	// another peer's advertisement or another interface's range depends on every peer on the
+	// host, so that half stays server-side (resolveAdvertisedRoutes in wg/addressing.ts) and now
+	// comes back naming this same field.
+	const entries = parseCidrList(form.advertisedRoutes);
+	for (const entry of entries) {
+		const invalid = checkAdvertisedRoute(entry);
+		if (invalid) {
+			errors.advertisedRoutes = invalid.message;
 			isValid = false;
 		}
+	}
+
+	// Network-align what will be stored, so the input stops showing a value the api would
+	// silently rewrite (192.168.1.5/24 -> 192.168.1.0/24).
+	if (isValid && entries.length) {
+		form.advertisedRoutes = entries.map(normalizeCidr).join(', ');
 	}
 
 	return isValid;
@@ -288,42 +305,26 @@ watch(
 // `typeof form`'s `string` doesn't allow. exitListenPort is the same idea with a number.
 type PeerPayload = Omit<typeof form, 'exitDns' | 'advertisedRoutes'> & { exitDns: string | null; advertisedRoutes: string | null; exitListenPort: number | null };
 
-const createPeer = useMutation({
-	mutationFn: async (data: PeerPayload) => {
-		const res = await eden.api.v1.wg.servers({ id: props.server.id }).peers.post(data);
-		return res.data;
-	},
-	onSuccess: async () => {
-		await invalidate.afterPeerChange(queryClient, props.server.id);
+// The cross-row checks this form cannot make (is the address free, does a prefix overlap
+// another peer's, is the udp port taken) all name their field server-side, so they land on the
+// same input the client-side rules use rather than in a toast.
+const createPeer = useWrite({
+	mutationFn: async (data: PeerPayload) => (await eden.api.v1.wg.servers({ id: props.server.id }).peers.post(data)).data,
+	summary: 'Failed to create peer',
+	invalidate: (qc) => invalidate.afterPeerChange(qc, props.server.id),
+	fields: errors,
+	onSuccess: () => {
 		visible.value = false;
-	},
-	onError: (error) => {
-		toast.add({
-			severity: 'error',
-			detail: error.message,
-			summary: 'Failed to create peer',
-			life: 5000,
-		});
 	},
 });
 
-const updatePeer = useMutation({
-	mutationFn: async (data: PeerPayload) => {
-		if (!props.peer) return;
-		const res = await eden.api.v1.wg.servers({ id: props.server.id }).peers({ peerId: props.peer.id }).patch(data);
-		return res.data;
-	},
-	onSuccess: async () => {
-		await invalidate.afterPeerChange(queryClient, props.server.id);
+const updatePeer = useWrite({
+	mutationFn: async (data: PeerPayload) => (props.peer ? (await eden.api.v1.wg.servers({ id: props.server.id }).peers({ peerId: props.peer.id }).patch(data)).data : undefined),
+	summary: 'Failed to update peer',
+	invalidate: (qc) => invalidate.afterPeerChange(qc, props.server.id),
+	fields: errors,
+	onSuccess: () => {
 		visible.value = false;
-	},
-	onError: (error) => {
-		toast.add({
-			severity: 'error',
-			detail: error.message,
-			summary: 'Failed to update peer',
-			life: 5000,
-		});
 	},
 });
 

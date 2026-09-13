@@ -1,39 +1,28 @@
 import { describe, expect, it } from 'bun:test';
-import { buildRuleset, type FirewallExitNode, type FirewallGrant, type FirewallServer, type FirewallTag } from './firewall';
+import { buildRuleset } from './firewall';
+import { graphOf, type GraphSpec, type PeerSpec } from '@server/tests/graphs';
 
-const tag = (overrides: Partial<FirewallTag> & Pick<FirewallTag, 'id'>): FirewallTag => ({
-	name: overrides.id,
-	memberIps: [],
-	...overrides,
-});
+// buildRuleset takes the fleet snapshot (db/fleet.ts), so these drive the same rows the db
+// returns - including the projection that resolves tags to member ips, decides which peers are
+// governed and drops unresolvable grants. That projection used to sit above this seam, which
+// meant the fixtures here re-enacted it by hand and nothing verified it.
+const server = (spec: GraphSpec = {}) => graphOf(spec);
 
-const grant = (overrides: Partial<FirewallGrant> & Pick<FirewallGrant, 'src' | 'dst'>): FirewallGrant => ({
-	action: 'allow',
-	protocol: 'any',
-	ports: null,
-	comment: null,
-	...overrides,
-});
+/** An exit node and one client of it, as a pair of peer rows. */
+const exitNodeWith = (spec: { id?: string; ip?: string; interfaceName?: string; routeTableId?: number; clientIps?: string[]; provisioned?: boolean } = {}): PeerSpec[] => {
+	const id = spec.id ?? 'n0';
+	const clientIps = spec.clientIps ?? ['10.20.20.3'];
 
-const server = (overrides: Partial<FirewallServer> = {}): FirewallServer => ({
-	interfaceName: 'wg0',
-	cidrRange: '10.20.20.0/24',
-	wgAddress: '10.20.20.1',
-	tags: [],
-	grants: [],
-	governedIps: [],
-	exitNodes: [],
-	advertisedRoutes: [],
-	...overrides,
-});
-
-// One exit node, as the ruleset sees it: its own interface, its own ip, its clients.
-const exitNode = (overrides: Partial<FirewallExitNode> = {}): FirewallExitNode => ({
-	interfaceName: 'wgx0',
-	ip: '10.20.20.2',
-	clientIps: ['10.20.20.3'],
-	...overrides,
-});
+	return [
+		{
+			id,
+			ip: spec.ip ?? '10.20.20.2',
+			isExitNode: true,
+			link: spec.provisioned === false ? null : { interfaceName: spec.interfaceName ?? 'wgx0', listenPort: 51900, routeTableId: spec.routeTableId ?? 52000 },
+		},
+		...clientIps.map((ip, i) => ({ id: `${id}-c${i}`, ip, exitPeerId: id })),
+	];
+};
 
 describe('buildRuleset', () => {
 	it('wraps every ruleset in the atomic create/delete/recreate idiom', () => {
@@ -54,8 +43,15 @@ describe('buildRuleset', () => {
 	});
 
 	it('emits a member set and a dispatch chain for a tag with members', () => {
-		const t = tag({ id: 't-office', name: 'office', memberIps: ['10.20.20.2', '10.20.20.5'] });
-		const ruleset = buildRuleset([server({ tags: [t], governedIps: t.memberIps })]);
+		const ruleset = buildRuleset([
+			server({
+				tags: [{ id: 't-office', name: 'office' }],
+				peers: [
+					{ id: 'p0', ip: '10.20.20.2', tags: ['t-office'] },
+					{ id: 'p1', ip: '10.20.20.5', tags: ['t-office'] },
+				],
+			}),
+		]);
 
 		expect(ruleset).toContain('set s0t0 {');
 		expect(ruleset).toContain('elements = { 10.20.20.2, 10.20.20.5 }');
@@ -66,19 +62,39 @@ describe('buildRuleset', () => {
 	});
 
 	it('does not emit an elements line for an empty tag', () => {
-		const empty = tag({ id: 't-empty', name: 'empty' });
-		const withMembers = tag({ id: 't-office', name: 'office', memberIps: ['10.20.20.2'] });
-		const ruleset = buildRuleset([server({ tags: [empty, withMembers], governedIps: ['10.20.20.2'] })]);
+		const ruleset = buildRuleset([
+			server({
+				tags: [
+					{ id: 't-empty', name: 'empty' },
+					{ id: 't-office', name: 'office' },
+				],
+				peers: [{ id: 'p0', ip: '10.20.20.2', tags: ['t-office'] }],
+			}),
+		]);
 
 		expect(ruleset).not.toContain('elements = {  }');
 		expect(ruleset).not.toContain('elements = { }');
 		expect(ruleset).toMatch(/set s0t0 \{\s*\n\s*type ipv4_addr\s*\n\s*comment "empty"\s*\n\s*\}/);
 	});
 
+	it('drops a stale assignment naming a peer that no longer exists', () => {
+		// the assignment outlives the peer (sqlite FK enforcement is off - see CLAUDE.md), and
+		// one dangling row must not take the whole tag - or the whole ruleset - with it
+		const graph = server({ tags: [{ id: 't-office', name: 'office' }], peers: [{ id: 'p0', ip: '10.20.20.2', tags: ['t-office'] }] });
+		graph.assignments.push({ id: 'stale', createdAt: new Date(0), peerId: 'deleted-peer', tagId: 't-office' });
+
+		const ruleset = buildRuleset([graph]);
+
+		expect(ruleset).toContain('elements = { 10.20.20.2 }');
+		expect(ruleset).not.toContain('deleted-peer');
+	});
+
 	it('scopes sets and chains per-server, even with overlapping CIDRs', () => {
-		const officeA = tag({ id: 'a-office', name: 'office', memberIps: ['10.0.0.2'] });
-		const officeB = tag({ id: 'b-office', name: 'office', memberIps: ['10.0.0.2'] }); // same ip, different server
-		const ruleset = buildRuleset([server({ interfaceName: 'wg0', cidrRange: '10.0.0.0/24', tags: [officeA], governedIps: ['10.0.0.2'] }), server({ interfaceName: 'wg1', cidrRange: '10.0.0.0/24', tags: [officeB], governedIps: ['10.0.0.2'] })]);
+		const ruleset = buildRuleset([
+			server({ id: 's0', interfaceName: 'wg0', cidrRange: '10.0.0.0/24', tags: [{ id: 'a-office', name: 'office' }], peers: [{ id: 'a0', ip: '10.0.0.2', tags: ['a-office'] }] }),
+			// same ip, different server
+			server({ id: 's1', interfaceName: 'wg1', cidrRange: '10.0.0.0/24', tags: [{ id: 'b-office', name: 'office' }], peers: [{ id: 'b0', ip: '10.0.0.2', tags: ['b-office'] }] }),
+		]);
 
 		expect(ruleset).toContain('iifname "wg0" jump fwd_s0');
 		expect(ruleset).toContain('iifname "wg1" jump fwd_s1');
@@ -89,10 +105,19 @@ describe('buildRuleset', () => {
 	});
 
 	it('grants a directional tag -> tag rule without granting the reverse', () => {
-		const dbTag = tag({ id: 't-db', name: 'db', memberIps: ['10.20.20.9'] });
-		const office = tag({ id: 't-office', name: 'office', memberIps: ['10.20.20.2'] });
-		const g = grant({ src: { kind: 'tag', tagId: 't-office' }, dst: { kind: 'tag', tagId: 't-db' } });
-		const ruleset = buildRuleset([server({ tags: [office, dbTag], grants: [g], governedIps: ['10.20.20.2'] })]);
+		const ruleset = buildRuleset([
+			server({
+				tags: [
+					{ id: 't-office', name: 'office' },
+					{ id: 't-db', name: 'db' },
+				],
+				peers: [
+					{ id: 'p0', ip: '10.20.20.2', tags: ['t-office'] },
+					{ id: 'p1', ip: '10.20.20.9', tags: ['t-db'] },
+				],
+				grants: [{ srcTag: 't-office', dstTag: 't-db' }],
+			}),
+		]);
 
 		expect(ruleset).toContain('ip saddr @s0t0 ip daddr @s0t1 accept');
 		// only office (s0t0) was granted db (s0t1) as a destination - the reverse
@@ -101,19 +126,25 @@ describe('buildRuleset', () => {
 	});
 
 	it('denies intra-tag traffic unless a self-referencing grant is explicitly added', () => {
-		const office = tag({ id: 't-office', name: 'office', memberIps: ['10.20.20.2', '10.20.20.3'] });
-		const withoutSelfGrant = buildRuleset([server({ tags: [office], governedIps: office.memberIps })]);
+		const peers: PeerSpec[] = [
+			{ id: 'p0', ip: '10.20.20.2', tags: ['t-office'] },
+			{ id: 'p1', ip: '10.20.20.3', tags: ['t-office'] },
+		];
+		const withoutSelfGrant = buildRuleset([server({ tags: [{ id: 't-office', name: 'office' }], peers })]);
 		expect(withoutSelfGrant).not.toContain('ip saddr @s0t0 ip daddr @s0t0 accept');
 
-		const selfGrant = grant({ src: { kind: 'tag', tagId: 't-office' }, dst: { kind: 'tag', tagId: 't-office' } });
-		const withSelfGrant = buildRuleset([server({ tags: [office], grants: [selfGrant], governedIps: office.memberIps })]);
+		const withSelfGrant = buildRuleset([server({ tags: [{ id: 't-office', name: 'office' }], peers, grants: [{ srcTag: 't-office', dstTag: 't-office' }] })]);
 		expect(withSelfGrant).toContain('ip saddr @s0t0 ip daddr @s0t0 accept');
 	});
 
 	it('allows a dstCidr target', () => {
-		const office = tag({ id: 't-office', name: 'office', memberIps: ['10.20.20.2'] });
-		const g = grant({ src: { kind: 'tag', tagId: 't-office' }, dst: { kind: 'cidr', cidr: '192.168.50.0/24' } });
-		const ruleset = buildRuleset([server({ tags: [office], grants: [g], governedIps: office.memberIps })]);
+		const ruleset = buildRuleset([
+			server({
+				tags: [{ id: 't-office', name: 'office' }],
+				peers: [{ id: 'p0', ip: '10.20.20.2', tags: ['t-office'] }],
+				grants: [{ srcTag: 't-office', dstCidr: '192.168.50.0/24' }],
+			}),
+		]);
 
 		expect(ruleset).toContain('ip daddr 192.168.50.0/24 accept');
 	});
@@ -122,28 +153,72 @@ describe('buildRuleset', () => {
 		// regression: `ip daddr` is the ipv4-specific match - handing it an ipv6
 		// literal is an nft type error (`nft -f` exits 1), not something nft
 		// tolerates. A stray ipv6 rule must not be able to break every future sync.
-		const office = tag({ id: 't-office', name: 'office', memberIps: ['10.20.20.2'] });
-		const bad = grant({ src: { kind: 'tag', tagId: 't-office' }, dst: { kind: 'cidr', cidr: 'fd00::/64' } });
-		const good = grant({ src: { kind: 'tag', tagId: 't-office' }, dst: { kind: 'cidr', cidr: '192.168.50.0/24' } });
-		const ruleset = buildRuleset([server({ tags: [office], grants: [bad, good], governedIps: office.memberIps })]);
+		const ruleset = buildRuleset([
+			server({
+				tags: [{ id: 't-office', name: 'office' }],
+				peers: [{ id: 'p0', ip: '10.20.20.2', tags: ['t-office'] }],
+				grants: [
+					{ srcTag: 't-office', dstCidr: 'fd00::/64' },
+					{ srcTag: 't-office', dstCidr: '192.168.50.0/24' },
+				],
+			}),
+		]);
 
 		expect(ruleset).not.toContain('fd00::');
 		expect(ruleset).toContain('ip daddr 192.168.50.0/24 accept');
 	});
 
 	it('ignores a grant with an unresolvable tag reference rather than breaking the ruleset', () => {
-		const office = tag({ id: 't-office', name: 'office', memberIps: ['10.20.20.2'] });
-		const stale = grant({ src: { kind: 'tag', tagId: 't-office' }, dst: { kind: 'tag', tagId: 't-deleted' } });
-		const ruleset = buildRuleset([server({ tags: [office], grants: [stale], governedIps: office.memberIps })]);
+		const ruleset = buildRuleset([
+			server({
+				tags: [{ id: 't-office', name: 'office' }],
+				peers: [{ id: 'p0', ip: '10.20.20.2', tags: ['t-office'] }],
+				grants: [{ srcTag: 't-office', dstTag: 't-deleted' }],
+			}),
+		]);
 
 		expect(ruleset).not.toContain('t-deleted');
 		expect(ruleset).toMatch(/chain fwd_s0 \{\s*\n\s*meta nfproto ipv6 drop\s*\n\s*ip saddr @s0_governed drop\s*\n\s*return\s*\n\s*\}/);
 	});
 
+	it('ignores a grant whose source peer no longer exists, without governing anything else', () => {
+		const ruleset = buildRuleset([
+			server({
+				peers: [{ id: 'p0', ip: '10.20.20.2' }],
+				grants: [{ srcPeer: 'deleted-peer', dst: 'any' }],
+			}),
+		]);
+
+		// the only grant was dropped, so nothing is governed and no chain is emitted at all
+		expect(ruleset).not.toContain('chain fwd_s0');
+		expect(ruleset).not.toContain('deleted-peer');
+	});
+
+	it('governs a peer named directly as a grant source, even with no tags at all', () => {
+		const ruleset = buildRuleset([
+			server({
+				peers: [
+					{ id: 'p0', ip: '10.20.20.2' },
+					{ id: 'p1', ip: '10.20.20.3' },
+				],
+				grants: [{ srcPeer: 'p0', dst: 'any' }],
+			}),
+		]);
+
+		// p0 is governed by being named; p1 is untouched and stays unrestricted
+		expect(ruleset).toContain('set s0_governed {');
+		expect(ruleset).toContain('elements = { 10.20.20.2 }');
+		expect(ruleset).not.toContain('10.20.20.3');
+	});
+
 	it('routes governed traffic to the input chain only via dstKind server/any grants', () => {
-		const office = tag({ id: 't-office', name: 'office', memberIps: ['10.20.20.2'] });
-		const g = grant({ src: { kind: 'tag', tagId: 't-office' }, dst: { kind: 'server' } });
-		const ruleset = buildRuleset([server({ tags: [office], grants: [g], governedIps: office.memberIps })]);
+		const ruleset = buildRuleset([
+			server({
+				tags: [{ id: 't-office', name: 'office' }],
+				peers: [{ id: 'p0', ip: '10.20.20.2', tags: ['t-office'] }],
+				grants: [{ srcTag: 't-office', dst: 'server' }],
+			}),
+		]);
 
 		expect(ruleset).toContain('chain input {');
 		expect(ruleset).toContain('iifname "wg0" ip saddr @s0_governed jump in_s0');
@@ -154,27 +229,55 @@ describe('buildRuleset', () => {
 	});
 
 	it('drops governed traffic to the gateway by default when no server-dst grant exists', () => {
-		const office = tag({ id: 't-office', name: 'office', memberIps: ['10.20.20.2'] });
-		const ruleset = buildRuleset([server({ tags: [office], governedIps: office.memberIps })]);
+		const ruleset = buildRuleset([server({ tags: [{ id: 't-office', name: 'office' }], peers: [{ id: 'p0', ip: '10.20.20.2', tags: ['t-office'] }] })]);
 
 		expect(ruleset).toMatch(/chain in_s0 \{\s*\n\s*meta nfproto ipv6 drop\n\s*drop\s*\n\s*\}/);
 	});
 
 	it('a dstKind any grant applies to both the forward and input chains', () => {
-		const office = tag({ id: 't-office', name: 'office', memberIps: ['10.20.20.2'] });
-		const g = grant({ src: { kind: 'tag', tagId: 't-office' }, dst: { kind: 'any' } });
-		const ruleset = buildRuleset([server({ tags: [office], grants: [g], governedIps: office.memberIps })]);
+		const ruleset = buildRuleset([
+			server({
+				tags: [{ id: 't-office', name: 'office' }],
+				peers: [{ id: 'p0', ip: '10.20.20.2', tags: ['t-office'] }],
+				grants: [{ srcTag: 't-office', dst: 'any' }],
+			}),
+		]);
 
 		expect(ruleset).toMatch(/chain fwd_s0 \{[\s\S]*ip saddr @s0t0 accept/);
 		expect(ruleset).toMatch(/chain in_s0 \{[\s\S]*ip saddr @s0t0 accept/);
 	});
 
+	it('skips a disabled grant but keeps its source governed', () => {
+		const ruleset = buildRuleset([
+			server({
+				tags: [{ id: 't-office', name: 'office' }],
+				peers: [{ id: 'p0', ip: '10.20.20.2', tags: ['t-office'] }],
+				grants: [{ srcTag: 't-office', dst: 'any', enabled: false }],
+			}),
+		]);
+
+		expect(ruleset).not.toContain('ip saddr @s0t0 accept');
+		// tagged, so still default-denied rather than silently unrestricted
+		expect(ruleset).toContain('ip saddr @s0_governed drop');
+	});
+
 	it('evaluates grants in order, first match wins', () => {
-		const office = tag({ id: 't-office', name: 'office', memberIps: ['10.20.20.2'] });
-		const db = tag({ id: 't-db', name: 'db', memberIps: ['10.20.20.9'] });
-		const deny = grant({ action: 'deny', src: { kind: 'tag', tagId: 't-office' }, dst: { kind: 'tag', tagId: 't-db' } });
-		const allow = grant({ action: 'allow', src: { kind: 'tag', tagId: 't-office' }, dst: { kind: 'tag', tagId: 't-db' } });
-		const ruleset = buildRuleset([server({ tags: [office, db], grants: [deny, allow], governedIps: office.memberIps })]);
+		const ruleset = buildRuleset([
+			server({
+				tags: [
+					{ id: 't-office', name: 'office' },
+					{ id: 't-db', name: 'db' },
+				],
+				peers: [
+					{ id: 'p0', ip: '10.20.20.2', tags: ['t-office'] },
+					{ id: 'p1', ip: '10.20.20.9', tags: ['t-db'] },
+				],
+				grants: [
+					{ action: 'deny', srcTag: 't-office', dstTag: 't-db' },
+					{ action: 'allow', srcTag: 't-office', dstTag: 't-db' },
+				],
+			}),
+		]);
 
 		const fwd = ruleset.match(/chain fwd_s0 \{([\s\S]*?)\n\t\}/)![1];
 		const dropIdx = fwd.indexOf('drop');
@@ -184,11 +287,23 @@ describe('buildRuleset', () => {
 	});
 
 	it('lets a peer-scoped grant placed above a tag-scoped one override it (per-client precedence)', () => {
-		const db = tag({ id: 't-db', name: 'db', memberIps: ['10.20.20.9'] });
-		const dev = tag({ id: 't-dev', name: 'dev', memberIps: ['10.20.20.2', '10.20.20.3'] });
-		const peerDeny = grant({ action: 'deny', src: { kind: 'peer', ip: '10.20.20.2' }, dst: { kind: 'tag', tagId: 't-db' } });
-		const tagAllow = grant({ action: 'allow', src: { kind: 'tag', tagId: 't-dev' }, dst: { kind: 'tag', tagId: 't-db' } });
-		const ruleset = buildRuleset([server({ tags: [dev, db], grants: [peerDeny, tagAllow], governedIps: ['10.20.20.2', '10.20.20.3'] })]);
+		const ruleset = buildRuleset([
+			server({
+				tags: [
+					{ id: 't-dev', name: 'dev' },
+					{ id: 't-db', name: 'db' },
+				],
+				peers: [
+					{ id: 'p0', ip: '10.20.20.2', tags: ['t-dev'] },
+					{ id: 'p1', ip: '10.20.20.3', tags: ['t-dev'] },
+					{ id: 'p2', ip: '10.20.20.9', tags: ['t-db'] },
+				],
+				grants: [
+					{ action: 'deny', srcPeer: 'p0', dstTag: 't-db' },
+					{ action: 'allow', srcTag: 't-dev', dstTag: 't-db' },
+				],
+			}),
+		]);
 
 		expect(ruleset).toContain('ip saddr 10.20.20.2 ip daddr @s0t1 drop');
 		const fwd = ruleset.match(/chain fwd_s0 \{([\s\S]*?)\n\t\}/)![1];
@@ -196,12 +311,23 @@ describe('buildRuleset', () => {
 	});
 
 	it('renders tcp/udp port lists and ranges, and a bare protocol match with no ports', () => {
-		const dev = tag({ id: 't-dev', name: 'dev', memberIps: ['10.20.20.2'] });
-		const db = tag({ id: 't-db', name: 'db', memberIps: ['10.20.20.9'] });
-		const withPorts = grant({ src: { kind: 'tag', tagId: 't-dev' }, dst: { kind: 'tag', tagId: 't-db' }, protocol: 'tcp', ports: '22, 8000-8100' });
-		const noPorts = grant({ src: { kind: 'tag', tagId: 't-dev' }, dst: { kind: 'tag', tagId: 't-db' }, protocol: 'udp' });
-		const icmp = grant({ src: { kind: 'tag', tagId: 't-dev' }, dst: { kind: 'tag', tagId: 't-db' }, protocol: 'icmp' });
-		const ruleset = buildRuleset([server({ tags: [dev, db], grants: [withPorts, noPorts, icmp], governedIps: dev.memberIps })]);
+		const ruleset = buildRuleset([
+			server({
+				tags: [
+					{ id: 't-dev', name: 'dev' },
+					{ id: 't-db', name: 'db' },
+				],
+				peers: [
+					{ id: 'p0', ip: '10.20.20.2', tags: ['t-dev'] },
+					{ id: 'p1', ip: '10.20.20.9', tags: ['t-db'] },
+				],
+				grants: [
+					{ srcTag: 't-dev', dstTag: 't-db', protocol: 'tcp', ports: '22, 8000-8100' },
+					{ srcTag: 't-dev', dstTag: 't-db', protocol: 'udp' },
+					{ srcTag: 't-dev', dstTag: 't-db', protocol: 'icmp' },
+				],
+			}),
+		]);
 
 		expect(ruleset).toContain('tcp dport { 22, 8000-8100 } accept');
 		expect(ruleset).toContain('meta l4proto udp accept');
@@ -209,12 +335,32 @@ describe('buildRuleset', () => {
 	});
 
 	it('attaches a sanitized nft comment to a grant', () => {
-		const dev = tag({ id: 't-dev', name: 'dev', memberIps: ['10.20.20.2'] });
-		const db = tag({ id: 't-db', name: 'db', memberIps: ['10.20.20.9'] });
-		const g = grant({ src: { kind: 'tag', tagId: 't-dev' }, dst: { kind: 'tag', tagId: 't-db' }, comment: 'db access for "dev"' });
-		const ruleset = buildRuleset([server({ tags: [dev, db], grants: [g], governedIps: dev.memberIps })]);
+		const ruleset = buildRuleset([
+			server({
+				tags: [
+					{ id: 't-dev', name: 'dev' },
+					{ id: 't-db', name: 'db' },
+				],
+				peers: [
+					{ id: 'p0', ip: '10.20.20.2', tags: ['t-dev'] },
+					{ id: 'p1', ip: '10.20.20.9', tags: ['t-db'] },
+				],
+				grants: [{ srcTag: 't-dev', dstTag: 't-db', comment: 'db access for "dev"' }],
+			}),
+		]);
 
 		expect(ruleset).toContain('comment "db access for dev"');
+	});
+
+	it("uses a tag's friendlyName for the nft comment when it has one", () => {
+		const ruleset = buildRuleset([
+			server({
+				tags: [{ id: 't-office', name: 'office', friendlyName: 'Head Office' }],
+				peers: [{ id: 'p0', ip: '10.20.20.2', tags: ['t-office'] }],
+			}),
+		]);
+
+		expect(ruleset).toContain('comment "Head Office"');
 	});
 
 	it('never masquerades and never guards egress - the hub is not a gateway', () => {
@@ -222,9 +368,14 @@ describe('buildRuleset', () => {
 		// is no egress path to permit, deny or guard, so the ruleset carries no nat hook and no
 		// oifname-based rule at all. A client reaches the internet through an exit node peer,
 		// whose traffic never leaves the wg interface here.
-		const office = tag({ id: 't-office', name: 'office', memberIps: ['10.20.20.2'] });
-		const g = grant({ src: { kind: 'tag', tagId: 't-office' }, dst: { kind: 'any' } });
-		const ruleset = buildRuleset([server({ tags: [office], grants: [g], governedIps: office.memberIps }), server({ interfaceName: 'wg1' })]);
+		const ruleset = buildRuleset([
+			server({
+				tags: [{ id: 't-office', name: 'office' }],
+				peers: [{ id: 'p0', ip: '10.20.20.2', tags: ['t-office'] }],
+				grants: [{ srcTag: 't-office', dst: 'any' }],
+			}),
+			server({ id: 's1', interfaceName: 'wg1' }),
+		]);
 
 		expect(ruleset).not.toContain('chain postrouting');
 		expect(ruleset).not.toContain('masquerade');
@@ -236,7 +387,7 @@ describe('buildRuleset', () => {
 			// No destination a grant can name matches exit traffic: it leaves *via* the exit
 			// link towards the exit node. Without this rule a governed exit client would be
 			// dropped by the default-deny and its exit node would silently do nothing.
-			const ruleset = buildRuleset([server({ cidrRange: '10.20.20.0/24', exitNodes: [exitNode()] })]);
+			const ruleset = buildRuleset([server({ cidrRange: '10.20.20.0/24', peers: exitNodeWith() })]);
 
 			expect(ruleset).toContain('elements = { 10.20.20.3 }');
 			expect(ruleset).toContain('ip saddr @s0e0 oifname "wgx0" ip daddr != 10.20.20.0/24 accept');
@@ -248,7 +399,7 @@ describe('buildRuleset', () => {
 			const ruleset = buildRuleset([
 				server({
 					cidrRange: '10.20.20.0/24',
-					exitNodes: [exitNode({ interfaceName: 'wgx0', ip: '10.20.20.2', clientIps: ['10.20.20.3'] }), exitNode({ interfaceName: 'wgx1', ip: '10.20.20.4', clientIps: ['10.20.20.5'] })],
+					peers: [...exitNodeWith({ id: 'n0', ip: '10.20.20.2', interfaceName: 'wgx0', clientIps: ['10.20.20.3'] }), ...exitNodeWith({ id: 'n1', ip: '10.20.20.4', interfaceName: 'wgx1', routeTableId: 52001, clientIps: ['10.20.20.5'] })],
 				}),
 			]);
 
@@ -262,8 +413,10 @@ describe('buildRuleset', () => {
 		it("sends every one of a server's interfaces into the same chain, so an exit node stays governed", () => {
 			// An exit node is a peer of this server that happens to live on its own interface -
 			// without a jump for that interface its own traffic would bypass policy entirely.
-			const office = tag({ id: 't-office', name: 'office', memberIps: ['10.20.20.2'] });
-			const ruleset = buildRuleset([server({ tags: [office], governedIps: office.memberIps, exitNodes: [exitNode()] })]);
+			const peers = exitNodeWith();
+			peers[0].tags = ['t-office'];
+
+			const ruleset = buildRuleset([server({ tags: [{ id: 't-office', name: 'office' }], peers })]);
 
 			expect(ruleset).toContain('iifname "wg0" jump fwd_s0');
 			expect(ruleset).toContain('iifname "wgx0" jump fwd_s0');
@@ -271,16 +424,24 @@ describe('buildRuleset', () => {
 		});
 
 		it('scopes the accept to internet-bound traffic, leaving peer-to-peer entirely to grants', () => {
-			const ruleset = buildRuleset([server({ cidrRange: '10.20.20.0/24', exitNodes: [exitNode()] })]);
+			const ruleset = buildRuleset([server({ cidrRange: '10.20.20.0/24', peers: exitNodeWith() })]);
 
 			// `ip daddr != cidrRange` is what keeps it from being a blanket allow within the vpn
 			expect(ruleset).toContain('ip daddr != 10.20.20.0/24');
 		});
 
 		it('places the exit accept after every explicit grant, so a deny above it still wins', () => {
-			const office = tag({ id: 't-office', name: 'office', memberIps: ['10.20.20.3'] });
-			const denyAll = grant({ action: 'deny', src: { kind: 'tag', tagId: 't-office' }, dst: { kind: 'any' } });
-			const ruleset = buildRuleset([server({ cidrRange: '10.20.20.0/24', tags: [office], grants: [denyAll], governedIps: office.memberIps, exitNodes: [exitNode()] })]);
+			const peers = exitNodeWith();
+			peers[1].tags = ['t-office'];
+
+			const ruleset = buildRuleset([
+				server({
+					cidrRange: '10.20.20.0/24',
+					tags: [{ id: 't-office', name: 'office' }],
+					peers,
+					grants: [{ action: 'deny', srcTag: 't-office', dst: 'any' }],
+				}),
+			]);
 
 			const denyAt = ruleset.indexOf('ip saddr @s0t0 drop');
 			const exitAt = ruleset.indexOf('@s0e0');
@@ -292,20 +453,20 @@ describe('buildRuleset', () => {
 		it('emits the exit chain even for a server with no tags and no grants', () => {
 			// the exit-client accept is the only policy such a server has - skipping the
 			// chain (as an entirely policy-free server does) would drop it with the chain
-			const ruleset = buildRuleset([server({ exitNodes: [exitNode()] })]);
+			const ruleset = buildRuleset([server({ peers: exitNodeWith() })]);
 
 			expect(ruleset).toContain('chain fwd_s0 {');
 		});
 
 		it('emits nothing for an exit node with no clients assigned', () => {
-			const ruleset = buildRuleset([server({ exitNodes: [exitNode({ clientIps: [] })] })]);
+			const ruleset = buildRuleset([server({ peers: exitNodeWith({ clientIps: [] }) })]);
 
 			expect(ruleset).not.toContain('s0e0');
 			expect(ruleset).not.toContain('chain fwd_s0 {');
 		});
 
 		it('keeps exit clients out of the governed set, so assigning an exit node does not lock a peer down', () => {
-			const ruleset = buildRuleset([server({ exitNodes: [exitNode()] })]);
+			const ruleset = buildRuleset([server({ peers: exitNodeWith() })]);
 
 			// s0_governed is emitted but empty - an exit client with no tags stays ungoverned
 			expect(ruleset).toContain('set s0_governed {');
@@ -313,11 +474,15 @@ describe('buildRuleset', () => {
 		});
 
 		it('omits the exit accept for an exit node whose link is not provisioned yet', () => {
-			// toFirewallServer drops a link-less exit node, so it reaches buildRuleset as no exit
-			// node at all - the same state the config and routing layers see it in.
-			const office = tag({ id: 't-office', name: 'office', memberIps: ['10.20.20.3'] });
-			const ruleset = buildRuleset([server({ tags: [office], governedIps: office.memberIps, exitNodes: [] })]);
+			// An exit node reaches converge before its link exists (reconcileExitLinks allocates
+			// it), and an accept naming an interface that isn't there yet would be a dangling
+			// rule. The projection drops it - the same state the config and routing layers see.
+			const peers = exitNodeWith({ provisioned: false });
+			peers[1].tags = ['t-office'];
 
+			const ruleset = buildRuleset([server({ tags: [{ id: 't-office', name: 'office' }], peers })]);
+
+			expect(ruleset).not.toContain('s0e0');
 			const fwdBody = ruleset.match(/chain fwd_s0 \{([\s\S]*?)\n\t\}/)![1];
 			expect(fwdBody).not.toContain('accept');
 		});
@@ -325,17 +490,24 @@ describe('buildRuleset', () => {
 
 	describe('advertised subnet routes', () => {
 		it('needs no rule of its own - a cidr-dst grant already compiles to the accept', () => {
-			const office = tag({ id: 't-office', name: 'office', memberIps: ['10.20.20.3'] });
-			const toLan = grant({ src: { kind: 'tag', tagId: 't-office' }, dst: { kind: 'cidr', cidr: '192.168.1.0/24' } });
-			const ruleset = buildRuleset([server({ tags: [office], grants: [toLan], governedIps: office.memberIps, advertisedRoutes: ['192.168.1.0/24'] })]);
+			const ruleset = buildRuleset([
+				server({
+					tags: [{ id: 't-office', name: 'office' }],
+					peers: [
+						{ id: 'p0', ip: '10.20.20.3', tags: ['t-office'] },
+						{ id: 'adv', ip: '10.20.20.7', advertisedRoutes: '192.168.1.0/24' },
+					],
+					grants: [{ srcTag: 't-office', dstCidr: '192.168.1.0/24' }],
+				}),
+			]);
 
 			expect(ruleset).toContain('ip saddr @s0t0 ip daddr 192.168.1.0/24 accept');
 		});
 
 		it('changes nothing at all on an interface with no exit clients', () => {
 			// the column is invisible to the firewall except through the exit accept below
-			const withRoutes = buildRuleset([server({ tags: [tag({ id: 't-office', memberIps: ['10.20.20.3'] })], advertisedRoutes: ['192.168.1.0/24'] })]);
-			const without = buildRuleset([server({ tags: [tag({ id: 't-office', memberIps: ['10.20.20.3'] })] })]);
+			const withRoutes = buildRuleset([server({ tags: [{ id: 't-office' }], peers: [{ id: 'p0', ip: '10.20.20.3', tags: ['t-office'], advertisedRoutes: '192.168.1.0/24' }] })]);
+			const without = buildRuleset([server({ tags: [{ id: 't-office' }], peers: [{ id: 'p0', ip: '10.20.20.3', tags: ['t-office'] }] })]);
 
 			expect(withRoutes).toBe(without);
 		});
@@ -345,21 +517,38 @@ describe('buildRuleset', () => {
 			// interface for free: that traffic leaves via the same wg interface and is neither
 			// inside cidrRange nor matched by an `internet`-dst grant. Advertising deliberately
 			// adds no permission mechanism, so the grants list has to stay the only way in.
-			const ruleset = buildRuleset([server({ cidrRange: '10.20.20.0/24', exitNodes: [exitNode()], advertisedRoutes: ['192.168.1.0/24'] })]);
+			const ruleset = buildRuleset([server({ cidrRange: '10.20.20.0/24', peers: [...exitNodeWith(), { id: 'adv', ip: '10.20.20.7', advertisedRoutes: '192.168.1.0/24' }] })]);
 
 			expect(ruleset).toContain('ip saddr @s0e0 oifname "wgx0" ip daddr != { 10.20.20.0/24, 192.168.1.0/24 } accept');
 		});
 
+		it('excludes a LAN advertised by the exit node itself, not just by an ordinary peer', () => {
+			const peers = exitNodeWith();
+			peers[0].advertisedRoutes = '192.168.9.0/24';
+
+			const ruleset = buildRuleset([server({ cidrRange: '10.20.20.0/24', peers })]);
+
+			expect(ruleset).toContain('ip daddr != { 10.20.20.0/24, 192.168.9.0/24 } accept');
+		});
+
 		it('keeps the single-prefix form when nothing is advertised', () => {
-			const ruleset = buildRuleset([server({ cidrRange: '10.20.20.0/24', exitNodes: [exitNode()] })]);
+			const ruleset = buildRuleset([server({ cidrRange: '10.20.20.0/24', peers: exitNodeWith() })]);
 
 			expect(ruleset).toContain('ip daddr != 10.20.20.0/24 accept');
 		});
 
 		it('a grant above the exit accept still lets an exit client reach an advertised LAN', () => {
-			const office = tag({ id: 't-office', name: 'office', memberIps: ['10.20.20.3'] });
-			const toLan = grant({ src: { kind: 'tag', tagId: 't-office' }, dst: { kind: 'cidr', cidr: '192.168.1.0/24' } });
-			const ruleset = buildRuleset([server({ cidrRange: '10.20.20.0/24', tags: [office], grants: [toLan], governedIps: office.memberIps, exitNodes: [exitNode()], advertisedRoutes: ['192.168.1.0/24'] })]);
+			const peers = exitNodeWith();
+			peers[1].tags = ['t-office'];
+
+			const ruleset = buildRuleset([
+				server({
+					cidrRange: '10.20.20.0/24',
+					tags: [{ id: 't-office', name: 'office' }],
+					peers: [...peers, { id: 'adv', ip: '10.20.20.7', advertisedRoutes: '192.168.1.0/24' }],
+					grants: [{ srcTag: 't-office', dstCidr: '192.168.1.0/24' }],
+				}),
+			]);
 
 			const grantAt = ruleset.indexOf('ip daddr 192.168.1.0/24 accept');
 			const exitAt = ruleset.indexOf('@s0e0');
@@ -369,7 +558,7 @@ describe('buildRuleset', () => {
 		});
 
 		it('ignores a non-ipv4 advertised prefix rather than emitting an nft type error', () => {
-			const ruleset = buildRuleset([server({ cidrRange: '10.20.20.0/24', exitNodes: [exitNode()], advertisedRoutes: ['fd00::/64'] })]);
+			const ruleset = buildRuleset([server({ cidrRange: '10.20.20.0/24', peers: [...exitNodeWith(), { id: 'adv', ip: '10.20.20.7', advertisedRoutes: 'fd00::/64' }] })]);
 
 			expect(ruleset).toContain('ip daddr != 10.20.20.0/24 accept');
 			expect(ruleset).not.toContain('fd00');

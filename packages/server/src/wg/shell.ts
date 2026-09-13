@@ -2,17 +2,24 @@ import { $ } from 'bun';
 import { createLog } from '@server/lib/log';
 import * as real from './shell.real';
 import * as shim from './shell.shim';
+import { ALL_CAPABILITIES, capabilityRefusal, capabilityWarning, chooseHost, NO_CAPABILITIES, readShimOverride, type Capabilities, type WgHost } from './host';
 
 const log = createLog('wg');
 
-const override = (process.env.WG_DEV_SHIM ?? '').toLowerCase();
-const forceShim = override === 'true' || override === '1';
-const forceReal = override === 'false' || override === '0';
+// Both adapters are checked against the seam's interface here rather than in their own files:
+// `import * as` yields a module namespace, so a missing export or a mistyped signature in
+// either one is a compile error at this line. This is the whole of the four-files-in-sync rule
+// that used to live in CLAUDE.md.
+const realHost: WgHost = real;
+const shimHost: WgHost = shim;
 
-const detectCapabilities = async () => {
-	if (forceShim) return { crypto: false, network: false, firewall: false };
-	if (forceReal) return { crypto: true, network: true, firewall: true };
+const override = readShimOverride(process.env.WG_DEV_SHIM);
 
+/**
+ * The io half: actually looks at the host. The decisions taken from its answer are pure and
+ * live in ./host.ts.
+ */
+const probeCapabilities = async (): Promise<Capabilities> => {
 	const hasCrypto = !!Bun.which('wg');
 	let hasNetwork = hasCrypto && !!Bun.which('wg-quick') && !!Bun.which('ip');
 
@@ -37,33 +44,14 @@ const detectCapabilities = async () => {
 	return { crypto: hasCrypto, network: hasNetwork, firewall: hasFirewall };
 };
 
-const capabilities = await detectCapabilities();
+const capabilities = override === 'shim' ? NO_CAPABILITIES : override === 'real' ? ALL_CAPABILITIES : await probeCapabilities();
 
-if (!capabilities.crypto || !capabilities.network || !capabilities.firewall) {
-	if (process.env.NODE_ENV === 'production' && !forceShim) {
-		throw new Error('wg/wg-quick/ip/nft are missing or lack permission to manage network interfaces (NET_ADMIN capability required). ' + 'Refusing to silently fall back to the development shim in production. Set WG_DEV_SHIM=true to override.');
-	}
-	log.warn(
-		`⚠️  WireGuard/network tooling unavailable (crypto: ${capabilities.crypto ? 'real' : 'shimmed'}, interfaces: ${capabilities.network ? 'real' : 'shimmed'}, firewall: ${capabilities.firewall ? 'real' : 'shimmed'}). ` +
-			'Running with the development shim — no real tunnels or network changes will be made.',
-	);
-}
+const refusal = capabilityRefusal(capabilities, { nodeEnv: process.env.NODE_ENV, override });
+if (refusal) throw new Error(refusal);
 
-export const wgGenKey = capabilities.crypto ? real.wgGenKey : shim.wgGenKey;
-export const wgGenPsk = capabilities.crypto ? real.wgGenPsk : shim.wgGenPsk;
-export const wgDerivePublicKey = capabilities.crypto ? real.wgDerivePublicKey : shim.wgDerivePublicKey;
+const warning = capabilityWarning(capabilities);
+if (warning) log.warn(warning);
 
-export const wgShow = capabilities.network ? real.wgShow : shim.wgShow;
-export const isInterfaceUp = capabilities.network ? real.isInterfaceUp : shim.isInterfaceUp;
-export const listInterfaces = capabilities.network ? real.listInterfaces : shim.listInterfaces;
-export const startInterface = capabilities.network ? real.startInterface : shim.startInterface;
-export const reloadInterface = capabilities.network ? real.reloadInterface : shim.reloadInterface;
-export const stopInterface = capabilities.network ? real.stopInterface : shim.stopInterface;
-// `network`, not `firewall`: exit routing is pure `ip rule`/`ip route` and must not depend on
-// nft being available - see the rejected-alternative note in wg/exitRouting.ts.
-export const applyExitRouting = capabilities.network ? real.applyExitRouting : shim.applyExitRouting;
+const host = chooseHost(capabilities, realHost, shimHost);
 
-export const applyFirewall = capabilities.firewall ? real.applyFirewall : shim.applyFirewall;
-export const resetFirewall = capabilities.firewall ? real.resetFirewall : shim.resetFirewall;
-
-export const cmd = real.cmd;
+export const { wgGenKey, wgGenPsk, wgDerivePublicKey, wgShow, isInterfaceUp, listInterfaces, startInterface, reloadInterface, stopInterface, applyExitRouting, applyFirewall, resetFirewall } = host;

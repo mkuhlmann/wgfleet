@@ -30,24 +30,8 @@
 					<td class="px-3 py-2.5 text-muted">{{ grant.comment || '-' }}</td>
 					<td class="px-3 py-2.5">
 						<div class="flex justify-end items-center gap-1.5 flex-nowrap">
-							<button
-								type="button"
-								class="text-accent-dim hover:text-accent transition-colors disabled:opacity-20"
-								:disabled="index === 0 || isMutating"
-								title="move up"
-								@click="move(index, -1)"
-							>
-								[ ^ ]
-							</button>
-							<button
-								type="button"
-								class="text-accent-dim hover:text-accent transition-colors disabled:opacity-20"
-								:disabled="index === grants.length - 1 || isMutating"
-								title="move down"
-								@click="move(index, 1)"
-							>
-								[ v ]
-							</button>
+							<button type="button" class="text-accent-dim hover:text-accent transition-colors disabled:opacity-20" :disabled="index === 0 || isMutating" title="move up" @click="move(index, -1)">[ ^ ]</button>
+							<button type="button" class="text-accent-dim hover:text-accent transition-colors disabled:opacity-20" :disabled="index === grants.length - 1 || isMutating" title="move down" @click="move(index, 1)">[ v ]</button>
 							<BaseButton @click="edit(grant, index)" variant="secondary" size="sm">edit</BaseButton>
 							<BaseButton @click="remove(index)" variant="danger" size="sm">del</BaseButton>
 						</div>
@@ -66,11 +50,11 @@
 
 <script setup lang="ts">
 import { computed, ref } from 'vue';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query';
+import { useQuery } from '@tanstack/vue-query';
+import { useWrite } from '@app/queries/useWrite';
 import { queryServerGrants } from '@app/queries/queryPolicy';
 import { eden } from '@app/queries/edenClient';
 import { invalidate } from '@app/queries/keys';
-import { useToast } from '@app/composables/useToast';
 import type { PeerTag, Peer, PolicyGrant } from '@server/db/schema';
 import BaseButton from './BaseButton.vue';
 import GrantModal, { type GrantDraft } from './GrantModal.vue';
@@ -80,9 +64,6 @@ const props = defineProps<{
 	tags: PeerTag[];
 	peers: Pick<Peer, 'id' | 'friendlyName'>[];
 }>();
-
-const toast = useToast();
-const queryClient = useQueryClient();
 
 const { data: grants } = useQuery(queryServerGrants(props.serverId));
 
@@ -117,13 +98,10 @@ const describeL4 = (protocol: string, ports: string | null) => {
 	return protocol;
 };
 
-const replaceAll = useMutation({
-	mutationFn: async (body: GrantDraft[]) => {
-		const res = await eden.api.v1.wg.servers({ id: props.serverId }).grants.put({ grants: body });
-		return res.data;
-	},
-	onSuccess: () => invalidate.afterGrantsChange(queryClient, props.serverId),
-	onError: (error: Error) => toast.add({ severity: 'error', detail: error.message, summary: 'Failed to update grants', life: 5000 }),
+const replaceAll = useWrite({
+	mutationFn: async (body: GrantDraft[]) => (await eden.api.v1.wg.servers({ id: props.serverId }).grants.put({ grants: body })).data,
+	summary: 'Failed to update grants',
+	invalidate: (qc) => invalidate.afterGrantsChange(qc, props.serverId),
 });
 
 const isMutating = computed(() => replaceAll.isPending.value);

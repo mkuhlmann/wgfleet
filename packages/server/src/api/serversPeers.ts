@@ -1,4 +1,5 @@
-import { Elysia, status, t } from 'elysia';
+import { Elysia, t } from 'elysia';
+import { fail } from './failure';
 import { db } from '../db';
 import { peerTagAssignmentsTable, peerTagsTable, peersTable, policyGrantsTable, type Peer, type ServerPeer } from '../db/schema';
 import { eq, and, inArray } from 'drizzle-orm';
@@ -85,7 +86,7 @@ export const serversPeersRoute = new Elysia()
 		'/wg/servers/:id/peers',
 		async ({ wgServer: server, body }) => {
 			const resolved = await resolvePeerWrite(server, null, body);
-			if (!resolved.ok) return status(400, resolved.message);
+			if (!resolved.ok) return fail(400, resolved.failure);
 			const values = resolved.values;
 
 			const privateKey = await wgGenKey();
@@ -138,7 +139,7 @@ export const serversPeersRoute = new Elysia()
 		'/wg/servers/:id/peers/:peerId',
 		async ({ wgServer: server, peer, params, body }) => {
 			const resolved = await resolvePeerWrite(server, peer, body);
-			if (!resolved.ok) return status(400, resolved.message);
+			if (!resolved.ok) return fail(400, resolved.failure);
 			const values = resolved.values;
 
 			const updatedPeer = await db

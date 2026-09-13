@@ -8,6 +8,8 @@ const log = createLog('wg');
 
 const execAsync = promisify(exec);
 
+// Internal to this adapter: not part of the WgHost seam (wg/host.ts), so nothing outside this
+// file can shell out. The shim used to carry a copy that shell.ts never selected.
 export const cmd = async (command: string) => {
 	try {
 		log.info(`⚙️  ${command}`);
@@ -84,10 +86,13 @@ export const listInterfaces = async (): Promise<string[]> => {
 	}
 };
 
-export const isInterfaceUp = async (interfaceName: string) => {
-	const output = (await $`ip a`.text()) ?? '';
-	return output.includes(interfaceName);
-};
+// Exact, and over `wg show interfaces` rather than `ip a`: this answer decides start-vs-reload
+// in wg/converge.ts, and the old substring match over every address and label on the host
+// reported `wg0` as up whenever `wg0x` existed - or whenever the string appeared anywhere in
+// `ip a` at all. A reload is a `wg syncconf`, which never applies the `[Interface]` half, so a
+// false positive leaves an interface running a stale key and port. The shim answers exactly;
+// this now does too.
+export const isInterfaceUp = async (interfaceName: string) => (await listInterfaces()).includes(interfaceName);
 
 // Takes the rendered config rather than a db row: this layer brings up *an interface*, and
 // since exit nodes got interfaces of their own (wg/exitLinks.ts) there are two kinds of config

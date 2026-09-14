@@ -113,8 +113,7 @@
 						</div>
 
 						<template #footer>
-							<div class="grid grid-cols-2 gap-2">
-								<BaseButton @click="showQrCode(peer.id)" variant="secondary" size="sm">qr</BaseButton>
+							<div class="grid grid-cols-3 gap-2">
 								<BaseButton @click="showConfig(peer.id)" variant="secondary" size="sm">cfg</BaseButton>
 								<BaseButton v-if="peer.exitPeerId || peer.exitViaServer" @click="showConfig(peer.id, { exit: true })" variant="secondary" size="sm">cfg via exit</BaseButton>
 								<BaseButton v-if="peer.isExitNode || advertisedRoutes(peer).length" @click="showConfig(peer.id, { nat: true })" variant="secondary" size="sm">cfg + nat</BaseButton>
@@ -163,7 +162,6 @@
 					</td>
 					<td class="px-4 py-3 text-right">
 						<div class="flex justify-end gap-2">
-							<BaseButton @click="showQrCode(peer.id)" variant="ghost" size="sm">qr</BaseButton>
 							<BaseButton @click="showConfig(peer.id)" variant="ghost" size="sm">cfg</BaseButton>
 							<BaseButton v-if="peer.exitPeerId || peer.exitViaServer" @click="showConfig(peer.id, { exit: true })" variant="ghost" size="sm">cfg via exit</BaseButton>
 							<BaseButton v-if="peer.isExitNode || advertisedRoutes(peer).length" @click="showConfig(peer.id, { nat: true })" variant="ghost" size="sm">cfg + nat</BaseButton>
@@ -177,15 +175,20 @@
 		</div>
 	</div>
 
-	<BaseModal v-model:visible="modalQrCode" header="qr code">
-		<div class="bg-white p-3 rounded-sm flex justify-center">
-			<QrcodeVue v-if="modalQrCode" :size="280" :value="wgConfig" />
-		</div>
-	</BaseModal>
-
 	<BaseModal v-model:visible="modalConfig" :header="configHeader">
-		<div class="bg-bg p-4 rounded-sm border border-border">
-			<pre class="font-mono text-xs text-muted overflow-auto max-h-[60vh] whitespace-pre-wrap break-all">{{ wgConfig }}</pre>
+		<div class="flex flex-col gap-3">
+			<div class="flex justify-end">
+				<BaseButton @click="configView = configView === 'text' ? 'qr' : 'text'" variant="secondary" size="sm">
+					{{ configView === 'text' ? 'show as qr' : 'show as text' }}
+				</BaseButton>
+			</div>
+
+			<div v-if="configView === 'qr'" class="bg-white p-3 rounded-sm flex justify-center">
+				<QrcodeVue :size="280" :value="wgConfig" />
+			</div>
+			<div v-else class="bg-bg p-4 rounded-sm border border-border">
+				<pre class="font-mono text-xs text-muted overflow-auto max-h-[60vh] whitespace-pre-wrap break-all">{{ wgConfig }}</pre>
+			</div>
 		</div>
 		<template #footer>
 			<div class="flex items-center gap-4 w-full justify-end">
@@ -259,14 +262,9 @@ const isReachable = (peer: { peerInfo?: { connected: boolean } | null }) => peer
 
 const queryClient = useQueryClient();
 
-const modalQrCode = ref(false);
 const modalConfig = ref(false);
 const wgConfig = ref('');
-
-const showQrCode = async (peerId: string) => {
-	await getPeerConfig(peerId);
-	modalQrCode.value = wgConfig.value !== '';
-};
+const configView = ref<'text' | 'qr'>('text');
 
 type ConfigVariant = { exit?: boolean; nat?: boolean };
 
@@ -289,6 +287,7 @@ const getPeerConfig = async (peerId: string, variant: ConfigVariant = {}) => {
 const configHeader = ref('configuration');
 
 const showConfig = async (peerId: string, variant: ConfigVariant = {}) => {
+	configView.value = 'text';
 	await getPeerConfig(peerId, variant);
 	configHeader.value = variant.exit ? 'configuration (via exit node)' : variant.nat ? 'configuration (+ gateway nat)' : 'configuration';
 	modalConfig.value = wgConfig.value !== '';

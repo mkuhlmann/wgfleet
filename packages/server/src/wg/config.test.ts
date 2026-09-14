@@ -195,6 +195,26 @@ describe('wg config generation', () => {
 			expect(withNat).toContain('PostDown = iptables -t nat -D POSTROUTING');
 		});
 
+		it('opens filter/FORWARD as well, since masquerading alone forwards nothing', async () => {
+			// nat/POSTROUTING rewrites; it never decides whether the packet is forwarded. On a
+			// host whose FORWARD chain ends in a REJECT (RHEL, firewalld) the client gets
+			// "Destination Host Prohibited" while every other part of the setup looks healthy.
+			const withNat = await generatePeerConfig(await peer('configTest-exit'), { nat: true });
+
+			expect(withNat).toContain('PostUp = iptables -I FORWARD 1 -i %i -s 10.44.0.0/16 -j ACCEPT');
+			expect(withNat).toContain('PostUp = iptables -I FORWARD 1 -o %i -d 10.44.0.0/16 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT');
+			expect(withNat).toContain('PostDown = iptables -D FORWARD -i %i -s 10.44.0.0/16 -j ACCEPT');
+			expect(withNat).toContain('PostDown = iptables -D FORWARD -o %i -d 10.44.0.0/16 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT');
+		});
+
+		it('inserts the FORWARD accepts at the head of the chain rather than appending them', async () => {
+			// An appended rule lands *after* the distro's trailing reject and never matches,
+			// which is the whole failure this block exists to prevent.
+			const withNat = await generatePeerConfig(await peer('configTest-exit'), { nat: true });
+
+			expect(withNat).not.toContain('iptables -A FORWARD');
+		});
+
 		it('tolerates a read-only /proc on the gateway rather than aborting its bring-up', async () => {
 			// wg-quick runs PostUp under `set -e` and rolls the interface back on a non-zero
 			// exit, so a bare `sysctl -w` means a container/LXC gateway - where the value is
@@ -319,6 +339,15 @@ describe('wg config generation', () => {
 			expect(withNat).toContain('PostDown = iptables -t nat -D POSTROUTING -s 10.46.46.0/24 -o $(r=$(ip -4 route show 10.10.0.0/16); [[ $r =~ dev[[:space:]]+([^[:space:]]+) ]] && echo ${BASH_REMATCH[1]}) -j MASQUERADE');
 			// not the exit node's blanket rule
 			expect(withNat).not.toContain('-o $(r=$(ip -4 route show default');
+		});
+
+		it('emits one pair of FORWARD accepts for an advertiser, not one per advertised route', async () => {
+			// The pair is symmetric - out of the tunnel, replies back in - so it covers any
+			// number of advertised LANs, and both roles, without repeating itself.
+			const withNat = await generatePeerConfig(await peer('configTest-advertiser'), { nat: true });
+
+			expect(withNat.match(/iptables -I FORWARD 1/g)).toHaveLength(2);
+			expect(withNat).toContain('PostUp = iptables -I FORWARD 1 -i %i -s 10.46.46.0/24 -j ACCEPT');
 		});
 
 		it('gives a peer that is both roles both masquerade rules', async () => {

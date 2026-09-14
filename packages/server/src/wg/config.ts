@@ -167,10 +167,38 @@ const ENABLE_FORWARDING = `sysctl -q -w net.ipv4.ip_forward=1 || test "$(cat /pr
  *     needs. This one is strictly optional: it is only required when the LAN has no route
  *     back to the vpn subnet, which is the common case for a LAN whose router this isn't.
  *
- * A peer that is both gets both rules.
+ * A peer that is both gets both rules, and either way one pair of filter/FORWARD accepts.
  */
 const natLines = (options: { uplinkMasquerade: boolean; advertisedRoutes: string[]; vpnCidr: string }) => {
 	const lines = [`PostUp = ${ENABLE_FORWARDING}`];
+
+	// Unconditional, because masquerading is only half a gateway: the rules above live in
+	// nat/POSTROUTING, which rewrites a packet but never decides whether it is forwarded at
+	// all - filter/FORWARD does. A host whose FORWARD chain ends in a REJECT (the RHEL and
+	// firewalld default) answers the client "Destination Host Prohibited"; one running docker,
+	// which sets that chain's policy to DROP, answers nothing. Either way the gateway looks
+	// configured, hands out handshakes, and forwards none of it. Distributions that leave the
+	// chain empty and ACCEPT - Debian, Ubuntu - are the ones this is a no-op on, so emitting
+	// it always costs nothing and is the fix precisely where the failure is hardest to read.
+	//
+	// `-I FORWARD 1` rather than `-A`: appended lands *after* that trailing reject and never
+	// matches. Scoped to the vpn subnet rather than a blanket `-i %i -j ACCEPT`, since jumping
+	// to the head of the chain would otherwise pre-empt the deliberate rules of a machine that
+	// is also someone's router. The pair covers both roles symmetrically - exit node (vpn ->
+	// uplink) and advertiser (vpn -> LAN) both forward out of the tunnel and need the replies
+	// back in - so it is emitted once rather than per advertised route. PostDown deletes by
+	// rule spec, not index, so unrelated rules shifting underneath it cannot remove the wrong
+	// one. `%i` is expanded by wg-quick to the interface name.
+	//
+	// Necessary but not sufficient on a firewalld host: iptables-nft writes into the filter
+	// table while firewalld keeps its own, both base chains run at the forward hook, and a
+	// reject in either still wins. Those hosts need the interface put in a trusted zone - see
+	// docs/exit-nodes-and-subnet-routes.md.
+	const forward = [`-i %i -s ${options.vpnCidr} -j ACCEPT`, `-o %i -d ${options.vpnCidr} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT`];
+
+	for (const rule of forward) {
+		lines.push(`PostUp = iptables -I FORWARD 1 ${rule}`, `PostDown = iptables -D FORWARD ${rule}`);
+	}
 
 	if (options.uplinkMasquerade) {
 		lines.push(`PostUp = iptables -t nat -A POSTROUTING -o ${UPLINK} -j MASQUERADE`, `PostDown = iptables -t nat -D POSTROUTING -o ${UPLINK} -j MASQUERADE`);

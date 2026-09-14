@@ -1,6 +1,6 @@
 <template>
 	<BaseModal v-model:visible="visible" :header="isEditMode ? 'edit tag' : 'add tag'">
-		<form @submit.prevent="handleSubmit" class="flex flex-col gap-5">
+		<form :id="formId" @submit.prevent="handleSubmit" class="flex flex-col gap-5">
 			<div class="field">
 				<label for="name" class="mb-1.5 text-sm text-muted block"><span class="text-accent-dim">&gt;</span> name</label>
 				<BaseInput id="name" v-model="form.name" class="w-full" placeholder="e.g. dev" />
@@ -11,18 +11,19 @@
 				<label for="friendlyName" class="mb-1.5 text-sm text-muted block"><span class="text-accent-dim">&gt;</span> friendly name</label>
 				<BaseInput id="friendlyName" v-model="form.friendlyName" class="w-full" placeholder="e.g. Developers" />
 			</div>
-			<div class="flex justify-end gap-2 mt-2">
-				<BaseButton @click="visible = false" variant="ghost" type="button">cancel</BaseButton>
-				<BaseButton type="submit" variant="primary">
-					{{ isEditMode ? 'save changes' : 'add tag' }}
-				</BaseButton>
-			</div>
 		</form>
+
+		<template #footer>
+			<BaseButton @click="visible = false" variant="ghost" type="button">cancel</BaseButton>
+			<BaseButton :form="formId" type="submit" variant="primary">
+				{{ isEditMode ? 'save changes' : 'add tag' }}
+			</BaseButton>
+		</template>
 	</BaseModal>
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, watch } from 'vue';
+import { ref, reactive, watch, useId } from 'vue';
 import { useWrite } from '@app/queries/useWrite';
 import type { PeerTag, ServerPeer } from '@server/db/schema';
 import { checkTagInvariants } from '@server/lib/tagInvariants';
@@ -38,6 +39,9 @@ const props = defineProps<{
 	/** every tag on this server - the uniqueness half of lib/tagInvariants.ts needs them */
 	tags?: PeerTag[];
 }>();
+
+// The submit button lives in the modal footer, outside the <form> - see PeerModal.vue.
+const formId = useId();
 
 const isEditMode = ref(props.tag ? true : false);
 

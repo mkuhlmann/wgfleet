@@ -1,120 +1,129 @@
 <template>
-	<BaseModal v-model:visible="visible" :header="isEditMode ? 'edit peer' : 'add peer'">
-		<form @submit.prevent="handleSubmit" class="flex flex-col gap-5">
-			<div class="field">
-				<label for="friendlyName" class="mb-1.5 text-sm text-muted block"><span class="text-accent-dim">&gt;</span> friendly name</label>
-				<BaseInput id="friendlyName" v-model="form.friendlyName" class="w-full" placeholder="e.g. sales-ipad-07" />
-				<small class="text-muted text-xs">a memorable name for this client device</small>
-			</div>
-			<div class="field">
-				<label for="wgAddress" class="mb-1.5 text-sm text-muted block"><span class="text-accent-dim">&gt;</span> wireguard address</label>
-				<BaseInput id="wgAddress" v-model="form.wgAddress" class="w-full" placeholder="leave empty to auto-assign" />
-				<small class="text-muted text-xs">static ip address (optional). next free address is used if left blank</small>
-				<span v-if="errors.wgAddress" class="text-down text-xs block mt-1">{{ errors.wgAddress }}</span>
-			</div>
-			<div class="field">
-				<label class="mb-1.5 text-sm text-muted block"><span class="text-accent-dim">&gt;</span> tags</label>
-				<div v-if="!tags || tags.length === 0" class="text-xs text-muted">no tags defined yet - add one from the server's policy page first</div>
-				<div v-else class="flex flex-wrap gap-x-4 gap-y-2">
-					<button v-for="tag in tags" :key="tag.id" type="button" class="flex items-center gap-2 text-sm text-text" @click="toggleTag(tag.id)">
-						<span class="text-accent-dim">{{ form.tagIds.includes(tag.id) ? '[x]' : '[ ]' }}</span>
-						<span>{{ tag.friendlyName ?? tag.name }}</span>
-					</button>
-				</div>
-				<small class="text-muted text-xs">restricts reachability to what the policy's grants allow. leave all unset for unrestricted access</small>
-			</div>
-
-			<div class="rule-line"></div>
-
-			<div class="field">
-				<button type="button" class="flex items-center gap-2 text-sm text-text" @click="toggleExitNode">
-					<span class="text-accent-dim">{{ form.isExitNode ? '[x]' : '[ ]' }}</span>
-					<span><span class="text-accent-dim">&gt;</span> exit node</span>
-				</button>
-				<small class="text-muted text-xs block mt-1">
-					route other clients' internet traffic through this peer's own uplink. it stays an ordinary reachable peer. a server can have
-					<span class="text-text">as many exit nodes as you like</span> - each gets a wg interface of its own here, so they never compete for <span class="text-text">0.0.0.0/0</span>.
-				</small>
-				<span v-if="errors.isExitNode" class="text-down text-xs block mt-1">{{ errors.isExitNode }}</span>
-			</div>
-
-			<template v-if="form.isExitNode">
+	<BaseModal v-model:visible="visible" :header="isEditMode ? 'edit peer' : 'add peer'" width="lg">
+		<!--
+			Two panes: what this peer *is* and what it exposes, against how it reaches the internet.
+			They stack below md, so the same markup is one readable column on a phone. The form lives
+			in the content slot while its actions sit in the modal footer, hence the `form` attribute
+			on the submit button.
+		-->
+		<form :id="formId" @submit.prevent="handleSubmit" class="grid grid-cols-1 gap-x-6 gap-y-5 md:grid-cols-2">
+			<div class="flex flex-col gap-5">
 				<div class="field">
-					<label for="exitListenPort" class="mb-1.5 text-sm text-muted block"><span class="text-accent-dim">&gt;</span> exit link udp port</label>
-					<BaseInput id="exitListenPort" v-model="exitListenPortInput" type="number" class="w-full" :placeholder="currentLink ? String(currentLink.listenPort) : 'auto (51900-51999)'" />
-					<small class="text-muted text-xs block mt-1"> this exit node connects to a <span class="text-text">separate wg interface</span> on this host, on its own port. leave empty to allocate one automatically. </small>
-					<small class="text-down text-xs block mt-1">
-						open this port <span class="text-text">here, on the wgfleet host</span> - publish it on the container (<span class="text-text">-p {{ currentLink?.listenPort ?? '&lt;port&gt;' }}:{{ currentLink?.listenPort ?? '&lt;port&gt;' }}/udp</span>)
-						and allow it inbound. <span class="text-text">nothing is opened on the exit node's own machine</span>: it dials in, so it works from behind nat exactly like any other peer. nothing about your clients changes.
-					</small>
-					<div v-if="currentLink" class="text-xs text-muted mt-1">
-						currently <span class="text-text">{{ currentLink.interfaceName }}</span> on udp <span class="text-text">{{ currentLink.listenPort }}</span>
+					<label for="friendlyName" class="mb-1.5 text-sm text-muted block"><span class="text-accent-dim">&gt;</span> friendly name</label>
+					<BaseInput id="friendlyName" v-model="form.friendlyName" class="w-full" placeholder="e.g. sales-ipad-07" />
+					<small class="text-muted text-xs">a memorable name for this client device</small>
+				</div>
+				<div class="field">
+					<label for="wgAddress" class="mb-1.5 text-sm text-muted block"><span class="text-accent-dim">&gt;</span> wireguard address</label>
+					<BaseInput id="wgAddress" v-model="form.wgAddress" class="w-full" placeholder="leave empty to auto-assign" />
+					<small class="text-muted text-xs">static ip address (optional). next free address is used if left blank</small>
+					<span v-if="errors.wgAddress" class="text-down text-xs block mt-1">{{ errors.wgAddress }}</span>
+				</div>
+				<div class="field">
+					<label class="mb-1.5 text-sm text-muted block"><span class="text-accent-dim">&gt;</span> tags</label>
+					<div v-if="!tags || tags.length === 0" class="text-xs text-muted">no tags defined yet - add one from the server's policy page first</div>
+					<div v-else class="flex flex-wrap gap-x-4 gap-y-2">
+						<button v-for="tag in tags" :key="tag.id" type="button" class="flex items-center gap-2 text-sm text-text" @click="toggleTag(tag.id)">
+							<span class="text-accent-dim">{{ form.tagIds.includes(tag.id) ? '[x]' : '[ ]' }}</span>
+							<span>{{ tag.friendlyName ?? tag.name }}</span>
+						</button>
 					</div>
-					<span v-if="errors.exitListenPort" class="text-down text-xs block mt-1">{{ errors.exitListenPort }}</span>
+					<small class="text-muted text-xs">restricts reachability to what the policy's grants allow. leave all unset for unrestricted access</small>
 				</div>
 
 				<div class="field">
-					<label for="exitDns" class="mb-1.5 text-sm text-muted block"><span class="text-accent-dim">&gt;</span> exit dns</label>
-					<BaseInput id="exitDns" v-model="form.exitDns" class="w-full" placeholder="leave empty to use the server's dns" />
-					<small class="text-muted text-xs">resolver handed to clients using this exit node. without one, their lookups go to whatever their local network provides</small>
+					<label for="advertisedRoutes" class="mb-1.5 text-sm text-muted block"><span class="text-accent-dim">&gt;</span> advertised subnet routes</label>
+					<BaseInput id="advertisedRoutes" v-model="form.advertisedRoutes" class="w-full" placeholder="e.g. 192.168.1.0/24, 10.10.0.0/16" />
+					<small class="text-muted text-xs">
+						networks behind this peer, reachable through it. unlike an exit node this grants nothing on its own - clients reach an advertised network only through an
+						<span class="text-text">allow &rarr; cidr</span> grant. one owner per prefix, across every interface on this host
+					</small>
+					<span v-if="errors.advertisedRoutes" class="text-down text-xs block mt-1">{{ errors.advertisedRoutes }}</span>
 				</div>
+			</div>
+
+			<div class="flex flex-col gap-5 md:border-l md:border-border md:pl-6">
+				<!-- the pane divider is a vertical hairline on md+, so stacked it needs the horizontal one -->
+				<div class="rule-line md:hidden"></div>
 
 				<div class="field">
-					<small class="text-down text-xs block">
-						this machine has to forward and masquerade for others, and ticking the box above does not change its config by itself - reinstall its own config from the peer list (<span class="text-text">cfg + nat</span>) and restart its tunnel, or this
-						exit node's clients will simply time out. its endpoint port changes too.
+					<button type="button" class="flex items-center gap-2 text-sm text-text" @click="toggleExitNode">
+						<span class="text-accent-dim">{{ form.isExitNode ? '[x]' : '[ ]' }}</span>
+						<span><span class="text-accent-dim">&gt;</span> exit node</span>
+					</button>
+					<small class="text-muted text-xs block mt-1">
+						route other clients' internet traffic through this peer's own uplink. it stays an ordinary reachable peer. a server can have
+						<span class="text-text">as many exit nodes as you like</span> - each gets a wg interface of its own here, so they never compete for <span class="text-text">0.0.0.0/0</span>.
+					</small>
+					<span v-if="errors.isExitNode" class="text-down text-xs block mt-1">{{ errors.isExitNode }}</span>
+				</div>
+
+				<template v-if="form.isExitNode">
+					<div class="field">
+						<label for="exitListenPort" class="mb-1.5 text-sm text-muted block"><span class="text-accent-dim">&gt;</span> exit link udp port</label>
+						<BaseInput id="exitListenPort" v-model="exitListenPortInput" type="number" class="w-full" :placeholder="currentLink ? String(currentLink.listenPort) : 'auto (51900-51999)'" />
+						<small class="text-muted text-xs block mt-1"> this exit node connects to a <span class="text-text">separate wg interface</span> on this host, on its own port. leave empty to allocate one automatically. </small>
+						<small class="text-down text-xs block mt-1">
+							open this port <span class="text-text">here, on the wgfleet host</span> - publish it on the container (<span class="text-text">-p {{ currentLink?.listenPort ?? '&lt;port&gt;' }}:{{ currentLink?.listenPort ?? '&lt;port&gt;' }}/udp</span
+							>) and allow it inbound. <span class="text-text">nothing is opened on the exit node's own machine</span>: it dials in, so it works from behind nat exactly like any other peer. nothing about your clients changes.
+						</small>
+						<div v-if="currentLink" class="text-xs text-muted mt-1">
+							currently <span class="text-text">{{ currentLink.interfaceName }}</span> on udp <span class="text-text">{{ currentLink.listenPort }}</span>
+						</div>
+						<span v-if="errors.exitListenPort" class="text-down text-xs block mt-1">{{ errors.exitListenPort }}</span>
+					</div>
+
+					<div class="field">
+						<label for="exitDns" class="mb-1.5 text-sm text-muted block"><span class="text-accent-dim">&gt;</span> exit dns</label>
+						<BaseInput id="exitDns" v-model="form.exitDns" class="w-full" placeholder="leave empty to use the server's dns" />
+						<small class="text-muted text-xs">resolver handed to clients using this exit node. without one, their lookups go to whatever their local network provides</small>
+					</div>
+
+					<div class="field">
+						<small class="text-down text-xs block">
+							this machine has to forward and masquerade for others, and ticking the box above does not change its config by itself - reinstall its own config from the peer list (<span class="text-text">cfg + nat</span>) and restart its tunnel, or
+							this exit node's clients will simply time out. its endpoint port changes too.
+						</small>
+					</div>
+				</template>
+
+				<div class="field" v-else>
+					<label class="mb-1.5 text-sm text-muted block"><span class="text-accent-dim">&gt;</span> internet access</label>
+					<div class="flex flex-col gap-2">
+						<button type="button" class="flex items-center gap-2 text-sm text-text text-left" @click="selectExit(null, false)">
+							<span class="text-accent-dim">{{ form.exitPeerId === null && !form.exitViaServer ? '(x)' : '( )' }}</span>
+							<span>none</span>
+						</button>
+						<button v-if="props.server.isExitNode" type="button" class="flex items-center gap-2 text-sm text-text text-left" @click="selectExit(null, true)">
+							<span class="text-accent-dim">{{ form.exitViaServer ? '(x)' : '( )' }}</span>
+							<span>via this server ({{ props.server.interfaceName }}, udp {{ props.server.wgListenPort }})</span>
+						</button>
+						<button v-for="node in exitNodes" :key="node.peer.id" type="button" class="flex items-center gap-2 text-sm text-text text-left" @click="selectExit(node.peer.id, false)">
+							<span class="text-accent-dim">{{ form.exitPeerId === node.peer.id ? '(x)' : '( )' }}</span>
+							<span>via exit node {{ node.peer.friendlyName ?? node.peer.wgAddress }}</span>
+							<span v-if="!node.link" class="text-down text-xs">(no interface yet)</span>
+						</button>
+					</div>
+					<span v-if="errors.exitViaServer" class="text-down text-xs block mt-1">{{ errors.exitViaServer }}</span>
+					<small class="text-muted text-xs block mt-1">
+						<span v-if="exitNodes.length === 0 && !props.server.isExitNode">no exit available yet - enable the server's own exit in its settings, or mark a peer as an exit node</span>
+						<span v-else>picking an exit node gives this peer a second config file to switch to. any exit node on this server will do, and switching later changes nothing else. without one it has no route to any exit node at all</span>
 					</small>
 				</div>
-			</template>
-
-			<div class="field" v-else>
-				<label class="mb-1.5 text-sm text-muted block"><span class="text-accent-dim">&gt;</span> internet access</label>
-				<div class="flex flex-col gap-2">
-					<button type="button" class="flex items-center gap-2 text-sm text-text text-left" @click="selectExit(null, false)">
-						<span class="text-accent-dim">{{ form.exitPeerId === null && !form.exitViaServer ? '(x)' : '( )' }}</span>
-						<span>none</span>
-					</button>
-					<button v-if="props.server.isExitNode" type="button" class="flex items-center gap-2 text-sm text-text text-left" @click="selectExit(null, true)">
-						<span class="text-accent-dim">{{ form.exitViaServer ? '(x)' : '( )' }}</span>
-						<span>via this server ({{ props.server.interfaceName }}, udp {{ props.server.wgListenPort }})</span>
-					</button>
-					<button v-for="node in exitNodes" :key="node.peer.id" type="button" class="flex items-center gap-2 text-sm text-text text-left" @click="selectExit(node.peer.id, false)">
-						<span class="text-accent-dim">{{ form.exitPeerId === node.peer.id ? '(x)' : '( )' }}</span>
-						<span>via exit node {{ node.peer.friendlyName ?? node.peer.wgAddress }}</span>
-						<span v-if="!node.link" class="text-down text-xs">(no interface yet)</span>
-					</button>
-				</div>
-				<span v-if="errors.exitViaServer" class="text-down text-xs block mt-1">{{ errors.exitViaServer }}</span>
-				<small class="text-muted text-xs block mt-1">
-					<span v-if="exitNodes.length === 0 && !props.server.isExitNode">no exit available yet - enable the server's own exit in its settings, or mark a peer as an exit node</span>
-					<span v-else>picking an exit node gives this peer a second config file to switch to. any exit node on this server will do, and switching later changes nothing else. without one it has no route to any exit node at all</span>
-				</small>
-			</div>
-
-			<div class="rule-line"></div>
-
-			<div class="field">
-				<label for="advertisedRoutes" class="mb-1.5 text-sm text-muted block"><span class="text-accent-dim">&gt;</span> advertised subnet routes</label>
-				<BaseInput id="advertisedRoutes" v-model="form.advertisedRoutes" class="w-full" placeholder="e.g. 192.168.1.0/24, 10.10.0.0/16" />
-				<small class="text-muted text-xs">
-					networks behind this peer, reachable through it. unlike an exit node this grants nothing on its own - clients reach an advertised network only through an
-					<span class="text-text">allow &rarr; cidr</span> grant. one owner per prefix, across every interface on this host
-				</small>
-				<span v-if="errors.advertisedRoutes" class="text-down text-xs block mt-1">{{ errors.advertisedRoutes }}</span>
-			</div>
-
-			<div class="flex justify-end gap-2 mt-2">
-				<BaseButton @click="visible = false" variant="ghost" type="button">cancel</BaseButton>
-				<BaseButton type="submit" variant="primary">
-					{{ isEditMode ? 'save changes' : 'add peer' }}
-				</BaseButton>
 			</div>
 		</form>
+
+		<template #footer>
+			<BaseButton @click="visible = false" variant="ghost" type="button">cancel</BaseButton>
+			<BaseButton :form="formId" type="submit" variant="primary">
+				{{ isEditMode ? 'save changes' : 'add peer' }}
+			</BaseButton>
+		</template>
 	</BaseModal>
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, watch, computed } from 'vue';
+import { ref, reactive, watch, computed, useId } from 'vue';
 import { useQuery } from '@tanstack/vue-query';
 import { useWrite } from '@app/queries/useWrite';
 import type { Peer, ServerPeer } from '@server/db/schema';
@@ -134,6 +143,10 @@ const props = defineProps<{
 	peer?: Omit<Peer, 'wgLastRxBytes' | 'wgLastTxBytes' | 'wgLastSampledAt'> & { tagIds?: string[] };
 	server: ServerPeer;
 }>();
+
+// The submit button lives in the modal footer, outside the <form> - `form=` associates them,
+// and the id has to be unique in case two of these are mounted at once.
+const formId = useId();
 
 const isEditMode = ref(props.peer ? true : false);
 

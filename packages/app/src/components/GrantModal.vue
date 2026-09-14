@@ -1,12 +1,12 @@
 <template>
-	<BaseModal v-model:visible="visible" :header="isEditMode ? 'edit grant' : 'add grant'">
-		<form @submit.prevent="handleSubmit" class="flex flex-col gap-5">
+	<BaseModal v-model:visible="visible" :header="isEditMode ? 'edit grant' : 'add grant'" width="md">
+		<form :id="formId" @submit.prevent="handleSubmit" class="flex flex-col gap-5">
 			<div class="field">
 				<label class="mb-1.5 text-sm text-muted block"><span class="text-accent-dim">&gt;</span> action</label>
 				<div class="flex gap-2">
 					<button
 						type="button"
-						class="flex-1 rounded-sm border px-3 py-2 text-sm transition-colors"
+						class="min-w-0 flex-1 rounded-sm border px-3 py-2 text-sm transition-colors"
 						:class="form.action === 'allow' ? 'border-up text-up bg-surface2' : 'border-border text-muted hover:border-accent-dim'"
 						@click="form.action = 'allow'"
 					>
@@ -14,7 +14,7 @@
 					</button>
 					<button
 						type="button"
-						class="flex-1 rounded-sm border px-3 py-2 text-sm transition-colors"
+						class="min-w-0 flex-1 rounded-sm border px-3 py-2 text-sm transition-colors"
 						:class="form.action === 'deny' ? 'border-down text-down bg-surface2' : 'border-border text-muted hover:border-accent-dim'"
 						@click="form.action = 'deny'"
 					>
@@ -25,16 +25,16 @@
 
 			<div class="field">
 				<label class="mb-1.5 text-sm text-muted block"><span class="text-accent-dim">&gt;</span> source</label>
-				<div class="flex gap-2">
-					<select v-model="form.srcKind" class="w-32 shrink-0 rounded-sm border border-border bg-bg text-text px-3 py-2 text-sm focus:outline-none focus:border-accent">
+				<div class="flex flex-col gap-2 sm:flex-row">
+					<select v-model="form.srcKind" class="w-full sm:w-32 sm:shrink-0 rounded-sm border border-border bg-bg text-text px-3 py-2 text-sm focus:outline-none focus:border-accent">
 						<option value="tag">tag</option>
 						<option value="peer">peer</option>
 					</select>
-					<select v-if="form.srcKind === 'tag'" v-model="form.srcTagId" class="flex-1 rounded-sm border border-border bg-bg text-text px-3 py-2 text-sm focus:outline-none focus:border-accent">
+					<select v-if="form.srcKind === 'tag'" v-model="form.srcTagId" class="min-w-0 flex-1 rounded-sm border border-border bg-bg text-text px-3 py-2 text-sm focus:outline-none focus:border-accent">
 						<option value="" disabled>select a tag</option>
 						<option v-for="tag in tags" :key="tag.id" :value="tag.id">{{ tag.friendlyName ?? tag.name }}</option>
 					</select>
-					<select v-else v-model="form.srcPeerId" class="flex-1 rounded-sm border border-border bg-bg text-text px-3 py-2 text-sm focus:outline-none focus:border-accent">
+					<select v-else v-model="form.srcPeerId" class="min-w-0 flex-1 rounded-sm border border-border bg-bg text-text px-3 py-2 text-sm focus:outline-none focus:border-accent">
 						<option value="" disabled>select a peer</option>
 						<option v-for="peer in peers" :key="peer.id" :value="peer.id">{{ peer.friendlyName ?? peer.id }}</option>
 					</select>
@@ -44,24 +44,24 @@
 
 			<div class="field">
 				<label class="mb-1.5 text-sm text-muted block"><span class="text-accent-dim">&gt;</span> destination</label>
-				<div class="flex gap-2">
-					<select v-model="form.dstKind" class="w-32 shrink-0 rounded-sm border border-border bg-bg text-text px-3 py-2 text-sm focus:outline-none focus:border-accent">
+				<div class="flex flex-col gap-2 sm:flex-row">
+					<select v-model="form.dstKind" class="w-full sm:w-32 sm:shrink-0 rounded-sm border border-border bg-bg text-text px-3 py-2 text-sm focus:outline-none focus:border-accent">
 						<option value="tag">tag</option>
 						<option value="peer">peer</option>
 						<option value="cidr">cidr</option>
 						<option value="server">server</option>
 						<option value="any">any</option>
 					</select>
-					<select v-if="form.dstKind === 'tag'" v-model="form.dstTagId" class="flex-1 rounded-sm border border-border bg-bg text-text px-3 py-2 text-sm focus:outline-none focus:border-accent">
+					<select v-if="form.dstKind === 'tag'" v-model="form.dstTagId" class="min-w-0 flex-1 rounded-sm border border-border bg-bg text-text px-3 py-2 text-sm focus:outline-none focus:border-accent">
 						<option value="" disabled>select a tag</option>
 						<option v-for="tag in tags" :key="tag.id" :value="tag.id">{{ tag.friendlyName ?? tag.name }}</option>
 					</select>
-					<select v-else-if="form.dstKind === 'peer'" v-model="form.dstPeerId" class="flex-1 rounded-sm border border-border bg-bg text-text px-3 py-2 text-sm focus:outline-none focus:border-accent">
+					<select v-else-if="form.dstKind === 'peer'" v-model="form.dstPeerId" class="min-w-0 flex-1 rounded-sm border border-border bg-bg text-text px-3 py-2 text-sm focus:outline-none focus:border-accent">
 						<option value="" disabled>select a peer</option>
 						<option v-for="peer in peers" :key="peer.id" :value="peer.id">{{ peer.friendlyName ?? peer.id }}</option>
 					</select>
-					<BaseInput v-else-if="form.dstKind === 'cidr'" v-model="form.dstCidr" class="flex-1" placeholder="e.g. 192.168.50.0/24" />
-					<div v-else class="flex-1 flex items-center text-sm text-muted">
+					<BaseInput v-else-if="form.dstKind === 'cidr'" v-model="form.dstCidr" class="min-w-0 flex-1" placeholder="e.g. 192.168.50.0/24" />
+					<div v-else class="min-w-0 flex-1 flex items-center text-sm text-muted">
 						{{ dstKindHintText }}
 					</div>
 				</div>
@@ -70,14 +70,14 @@
 
 			<div class="field">
 				<label class="mb-1.5 text-sm text-muted block"><span class="text-accent-dim">&gt;</span> protocol / ports</label>
-				<div class="flex gap-2">
-					<select v-model="form.protocol" class="w-32 shrink-0 rounded-sm border border-border bg-bg text-text px-3 py-2 text-sm focus:outline-none focus:border-accent">
+				<div class="flex flex-col gap-2 sm:flex-row">
+					<select v-model="form.protocol" class="w-full sm:w-32 sm:shrink-0 rounded-sm border border-border bg-bg text-text px-3 py-2 text-sm focus:outline-none focus:border-accent">
 						<option value="any">any</option>
 						<option value="tcp">tcp</option>
 						<option value="udp">udp</option>
 						<option value="icmp">icmp</option>
 					</select>
-					<BaseInput v-if="form.protocol === 'tcp' || form.protocol === 'udp'" v-model="form.ports" class="flex-1" placeholder="e.g. 22, 8000-8100 (leave empty for all ports)" />
+					<BaseInput v-if="form.protocol === 'tcp' || form.protocol === 'udp'" v-model="form.ports" class="min-w-0 flex-1" placeholder="e.g. 22, 8000-8100 (leave empty for all ports)" />
 				</div>
 				<span v-if="errors.ports" class="text-down text-xs block mt-1">{{ errors.ports }}</span>
 			</div>
@@ -86,19 +86,19 @@
 				<label for="comment" class="mb-1.5 text-sm text-muted block"><span class="text-accent-dim">&gt;</span> comment</label>
 				<BaseInput id="comment" v-model="form.comment" class="w-full" placeholder="optional, shown in the firewall ruleset" />
 			</div>
-
-			<div class="flex justify-end gap-2 mt-2">
-				<BaseButton @click="visible = false" variant="ghost" type="button">cancel</BaseButton>
-				<BaseButton type="submit" variant="primary">
-					{{ isEditMode ? 'save changes' : 'add grant' }}
-				</BaseButton>
-			</div>
 		</form>
+
+		<template #footer>
+			<BaseButton @click="visible = false" variant="ghost" type="button">cancel</BaseButton>
+			<BaseButton :form="formId" type="submit" variant="primary">
+				{{ isEditMode ? 'save changes' : 'add grant' }}
+			</BaseButton>
+		</template>
 	</BaseModal>
 </template>
 
 <script setup lang="ts">
-import { computed, reactive, ref, watch } from 'vue';
+import { computed, reactive, ref, useId, watch } from 'vue';
 import type { PeerTag, Peer, PolicyGrant } from '@server/db/schema';
 import { checkGrantInvariants } from '@server/lib/grantInvariants';
 import BaseButton from './BaseButton.vue';
@@ -129,6 +129,9 @@ const props = defineProps<{
 const emit = defineEmits<{
 	(e: 'save', grant: GrantDraft): void;
 }>();
+
+// The submit button lives in the modal footer, outside the <form> - see PeerModal.vue.
+const formId = useId();
 
 const isEditMode = ref(props.grant ? true : false);
 const visible = defineModel<boolean>('visible', { required: true });

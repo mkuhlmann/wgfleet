@@ -72,9 +72,32 @@ as one console instead of a set of unrelated screens:
 | `BaseButton.vue` | bracketed button, variants: `primary` (filled accent), `secondary` (outlined accent-dim), `danger` (outlined down), `ghost` (borderless, for row actions) |
 | `BaseCard.vue` | bordered panel with `>`-prefixed title, optional header/footer slots |
 | `BaseInput.vue` | terminal-style text input; `clearable` renders a `[x]` |
-| `BaseModal.vue` | teleported dialog with `///`-prefixed header and `[x]` close |
+| `BaseModal.vue` | teleported dialog with `///`-prefixed header and `[x]` close; `width` is `sm`/`md`/`lg` and only the content row scrolls (see "Dialog layout") |
 | `DataView.vue` | shared search + `[grid]`/`[table]` toggle used by both server and peer lists |
 | `ToastStack.vue` + `composables/useToast.ts` | in-house replacement for PrimeVue's `ToastService` — same `add({ severity, summary, detail, life })` call shape, so call sites didn't need to change beyond the import |
+
+## Dialog layout
+
+`BaseModal` bounds itself to the viewport and lays its header, content and
+footer out as three rows, so a dialog taller than the screen scrolls its
+*content* while the title and the actions stay put. Two rules follow from
+that:
+
+- **Put a form's actions in the `#footer` slot**, not at the bottom of the
+  form, so they never scroll out of reach. The submit button is then outside
+  the `<form>`, so give the form an id (`useId()`) and the button a matching
+  `form` attribute — see `PeerModal.vue`.
+- **Reach for `width` before you let a dialog get tall.** A long form reads
+  better as two panes (`grid grid-cols-1 gap-x-6 gap-y-5 md:grid-cols-2`)
+  at `width="lg"` than as one column that has to scroll. Split the panes on
+  a real distinction — `PeerModal` is "what this peer is and what it
+  exposes" against "how it reaches the internet" — and divide them with
+  `md:border-l md:border-border md:pl-6`, plus a `rule-line md:hidden` at
+  the top of the second pane for when they stack.
+
+Below `md` every dialog is one column, so check new markup at a phone width:
+`grid-cols-1` and `min-w-0` are what keep a wide `<select>` or a long option
+label from setting the row's width and overflowing the dialog sideways.
 
 ## What NOT to reach for
 

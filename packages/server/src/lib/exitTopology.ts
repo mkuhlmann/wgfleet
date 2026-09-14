@@ -10,6 +10,7 @@ export type ExitTopologyPeer = {
 	id: string;
 	wgAddress: string;
 	isExitNode: boolean;
+	exitViaServer: boolean;
 	exitPeerId: string | null;
 	advertisedRoutes: string | null;
 	exitInterfaceName: string | null;
@@ -68,6 +69,13 @@ export type ExitTopology<P> = {
 	exitNodes: ExitNode<P>[];
 	/** the peers that stay on the server's own wg interface - everything that is not an exit node */
 	plainPeers: P[];
+	/**
+	 * ips of the peers that exit through the *server's* own uplink (`peers.exitViaServer`).
+	 * Unlike an exit node's clients these need no routing at all - the host's own default route
+	 * already goes where they want - so they appear only in the firewall, which is what
+	 * masquerades them and what stops everyone else doing the same.
+	 */
+	serverExitClientIps: string[];
 	/** subnet routes advertised by peers on the server's own interface */
 	interfaceAdvertisedRoutes: string[];
 	/** every subnet route on this server, wherever its advertiser lives */
@@ -106,6 +114,7 @@ export function exitTopologyOf<P extends ExitTopologyPeer>(peers: P[]): ExitTopo
 	return {
 		exitNodes,
 		plainPeers,
+		serverExitClientIps: peers.filter((p) => p.exitViaServer).map((p) => p.wgAddress),
 		interfaceAdvertisedRoutes: plainPeers.flatMap(advertisedRoutesOf),
 		allAdvertisedRoutes: peers.flatMap(advertisedRoutesOf),
 	};

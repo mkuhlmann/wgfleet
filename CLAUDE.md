@@ -97,7 +97,8 @@ route parameterized by that server's id, including all of its peers, tags and gr
 clients" below). `peersTable` also carries the exit-node columns (`isExitNode`, `exitPeerId`, `exitDns`,
 `advertisedRoutes`) and, for a peer that *is* an exit node, the five columns describing the wg interface it gets
 to itself (`exitInterfaceName`, `exitPrivateKey`, `exitPublicKey`, `exitListenPort`, `exitRouteTableId`);
-`serverPeersTable` carries the interface's `dns` - see "Exit nodes" below. **SQLite foreign-key enforcement is never turned on** (no `PRAGMA foreign_keys = ON` anywhere) -
+`serverPeersTable` carries the interface's `dns` and `isExitNode` (whether this server offers its own uplink
+as an exit) - see "Exit nodes" below. **SQLite foreign-key enforcement is never turned on** (no `PRAGMA foreign_keys = ON` anywhere) -
 `onDelete` clauses in the schema are declarative intent only; cascade/cleanup on delete is done by hand in the
 API handler (see `DELETE /wg/servers/:id/tags/:tagId` in `src/api/policy.ts` for the pattern: an explicit
 `db.transaction(...)` that unassigns members and deletes referencing grants before deleting the row itself).
@@ -198,14 +199,20 @@ notable non-obvious invariants: nft object names are ordinal (`s{serverIdx}t{tag
 nanoid ids or `interfaceName`, because those don't satisfy nft's identifier charset; and a tag can't reach its own
 members unless a grant explicitly names that tag as both `src` and `dst`.
 
-**The hub is not an internet gateway.** `drizzle/0008_drop_hub_egress.sql` removed `serverPeers.enableNat` and
-the `internet` grant destination: the ruleset has no nat hook, no masquerade and no `oifname`-based rule at all,
-so a wg packet routed out a non-wg interface leaves with its vpn source address and nothing routes the reply
-back. There is consequently no hub-side egress to permit, deny or guard - the only path to the internet is an
-exit node peer (routing, `peers.exitPeerId`), whose traffic never leaves the wg interface on this host. The same
-reason is why `allowedIpsForPeer` (`db/policyGraph.ts`) never widens to `0.0.0.0/0`: it used to for an
-`internet`/`any` grant, and that hint would now route a client's internet traffic into a tunnel that drops it.
-`?exit=true` is the one rendering that legitimately carries `/0`.
+**Internet access is not a grant.** `drizzle/0008_drop_hub_egress.sql` removed `serverPeers.enableNat` and the
+`internet` grant destination, and `drizzle/0010_server_as_exit_node.sql` brought the *capability* back in a
+different shape: a client reaches the internet by **selecting an exit**, and that selection is the whole
+permission. Two arms, mutually exclusive (`lib/peerInvariants.ts`): `peers.exitPeerId` (a peer's uplink) or
+`peers.exitViaServer` (its server's own, gated on `serverPeers.isExitNode`). No grant agrees or disagrees with
+either - the old model needed `enableNat` *and* an `internet` grant to line up, and picking one without the
+other failed silently.
+
+The masquerade is therefore scoped to exactly `serverExitClientIps`, never to `cidrRange`. That scoping *is* the
+guard: a peer that selected nothing still leaves with its vpn source address, which nothing can route a reply
+back to - which is why there is no egress-guard rule taking back what a broad masquerade would have granted.
+The same reason is why `allowedIpsForPeer` (`db/policyGraph.ts`) never widens to `0.0.0.0/0`: that hint would
+route a client's internet traffic into a tunnel that drops it. `?exit=true` is the one rendering that
+legitimately carries `/0`.
 
 `src/wg/firewall.ts` exposes one function: `buildRuleset(fleet: PolicyGraph[])`, pure (no db, no io), taking the
 fleet snapshot itself. It folds in the projection that resolves tags to member ips, decides which peers are
@@ -257,9 +264,13 @@ steered into one). The things most likely to surprise:
   installed explicitly by `wg/exitRouting.ts` instead - its server's connected route no longer
   covers it - and an address here could only duplicate the server's (which the kernel refuses)
   or invent a link subnet.
-- **Each exit link needs its own published UDP port**, since the exit node dials in. Allocated
-  from 51900-51999 or pinned per peer (`exitListenPort`). This is the one operational cost of
-  the design and the ui says so at every point where an exit node is configured.
+- **A *peer* exit link needs its own published UDP port**, since the exit node dials in.
+  Allocated from 51900-51999 or pinned per peer (`exitListenPort`). This is the one operational
+  cost of the design and the ui says so at every point where an exit node is configured. The
+  **server's own** exit (`serverPeers.isExitNode`, selected per client with
+  `peers.exitViaServer`) costs nothing: the server is not a peer of its own interface, so it
+  never competes for `0.0.0.0/0` and needs no interface, key, port or `ip rule` at all - just
+  the nft masquerade, scoped to the clients that selected it.
 - **Everything server-side can be correct and the client still times out**, because the two
   halves that are not in this codebase's control are the exit node's own machine
   (`ip_forward` + a masquerade rule, emitted only by the `?nat=true` rendering - and marking a

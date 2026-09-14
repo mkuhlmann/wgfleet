@@ -37,6 +37,19 @@ export const serverPeersTable = sqliteTable('serverPeers', {
 	// per-peer because it describes the network the tunnel leads into, not one client.
 	dns: text('dns'),
 
+	// This server offers *its own* uplink as an exit: a client that selects it
+	// (`peers.exitViaServer`) has its internet traffic masqueraded out of this host's default
+	// route. The cheapest exit there is - no extra interface, no extra udp port, and the client
+	// keeps dialing this server's own endpoint - which is why it is the one exit that lives on
+	// the server rather than on a peer.
+	//
+	// Off by default, and turning it on grants nobody anything: a client reaches the internet
+	// only once it selects this server as its exit, and the masquerade is scoped to exactly the
+	// clients that did (see wg/firewall.ts). That is the same rule peer exit nodes follow -
+	// routing is the permission - rather than the grant-gated `enableNat` this replaced
+	// (drizzle/0008_drop_hub_egress.sql), where two independent switches had to agree.
+	isExitNode: integer('isExitNode', { mode: 'boolean' }).notNull().default(false),
+
 	// Lifetime traffic totals since statsSince, manually resettable (see api/traffic.ts). Kept
 	// as running counters rather than derived from trafficBucketsTable because that table is
 	// pruned (see wg/traffic.ts) and because a server's total must keep counting traffic from
@@ -280,6 +293,13 @@ export const peersTable = sqliteTable(
 		// per server: the table's default route names the exit link, which is what makes
 		// "client A exits here, client B exits there" expressible at all.
 		exitRouteTableId: integer('exitRouteTableId').unique(),
+
+		// This peer's internet goes out its *server's* own uplink (`serverPeers.isExitNode`).
+		// Mutually exclusive with exitPeerId - they are the two arms of one choice, "which exit
+		// does this client use", and the ui presents them as one radio group. Kept as its own
+		// column rather than a sentinel in exitPeerId because the server is not a peer: it has no
+		// row in this table to point at.
+		exitViaServer: integer('exitViaServer', { mode: 'boolean' }).notNull().default(false),
 
 		// The exit node this peer reaches the internet through, or null for "no exit node".
 		// Any exit node on the same server - that is the whole point of the per-exit-node

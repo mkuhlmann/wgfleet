@@ -565,3 +565,70 @@ describe('buildRuleset', () => {
 		});
 	});
 });
+
+describe('buildRuleset - the server as an exit node', () => {
+	it('masquerades exactly the clients that selected it, and nobody else', () => {
+		// Scoping the masquerade to the selected set is what replaces the egress guard the old
+		// `enableNat` needed: a peer that did not select this exit still leaves with its vpn
+		// source address, which nothing can route a reply back to.
+		const ruleset = buildRuleset([
+			graphOf({
+				isExitNode: true,
+				peers: [
+					{ id: 'p1', ip: '10.20.20.2', exitViaServer: true },
+					{ id: 'p2', ip: '10.20.20.3' },
+				],
+			}),
+		]);
+
+		expect(ruleset).toContain('set s0_serverexit {');
+		expect(ruleset).toContain('elements = { 10.20.20.2 }');
+		expect(ruleset).toContain('chain postrouting {');
+		expect(ruleset).toContain('ip saddr @s0_serverexit oifname != { "wg0" } masquerade');
+		// no blanket cidrRange masquerade, and so no guard rule needed to claw it back
+		expect(ruleset).not.toContain('ip saddr 10.20.20.0/24');
+		expect(ruleset).not.toContain('iifname { "wg0" } oifname != { "wg0" } drop');
+	});
+
+	it('accepts a governed client leaving the vpn entirely, after every grant', () => {
+		const ruleset = buildRuleset([
+			graphOf({
+				isExitNode: true,
+				tags: ['office'],
+				peers: [{ id: 'p1', ip: '10.20.20.2', tags: ['office'], exitViaServer: true }],
+				grants: [{ action: 'deny', srcTag: 'office', dst: 'any' }],
+			}),
+		]);
+
+		const fwd = ruleset.match(/chain fwd_s0 \{([\s\S]*?)\n\t\}/)![1];
+		// an admin deny placed above still wins - the accept only exists so a *governed* client
+		// isn't caught by the default-deny
+		expect(fwd.indexOf('ip saddr @s0t0 drop')).toBeLessThan(fwd.indexOf('@s0_serverexit'));
+		expect(ruleset).toContain('ip saddr @s0_serverexit oifname != { "wg0" } accept comment "exit via this server"');
+	});
+
+	it('emits nothing at all while the server does not offer its uplink', () => {
+		// A stale exitViaServer on a peer whose server has since turned the exit off must not
+		// keep masquerading that peer.
+		const ruleset = buildRuleset([graphOf({ isExitNode: false, peers: [{ id: 'p1', ip: '10.20.20.2', exitViaServer: true }] })]);
+
+		expect(ruleset).not.toContain('serverexit');
+		expect(ruleset).not.toContain('masquerade');
+		expect(ruleset).not.toContain('chain postrouting');
+	});
+
+	it('counts every managed interface as "still inside the vpn", exit links included', () => {
+		// oifname != <managed> is what "leaving the vpn" means; an exit link is not leaving it.
+		const ruleset = buildRuleset([
+			graphOf({
+				isExitNode: true,
+				peers: [
+					{ id: 'gw', ip: '10.20.20.9', isExitNode: true, link: { interfaceName: 'wgx0', listenPort: 51900, routeTableId: 52000 } },
+					{ id: 'p1', ip: '10.20.20.2', exitViaServer: true },
+				],
+			}),
+		]);
+
+		expect(ruleset).toContain('ip saddr @s0_serverexit oifname != { "wg0", "wgx0" } masquerade');
+	});
+});

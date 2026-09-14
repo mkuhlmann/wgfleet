@@ -44,6 +44,9 @@
 						<span class="whitespace-nowrap">dns</span>
 						<span class="text-text text-right break-all">{{ server.dns ?? '-' }}</span>
 
+						<span class="whitespace-nowrap">server is exit</span>
+						<span class="text-text text-right">{{ server.isExitNode ? 'yes - clients may exit via this host' : 'no' }}</span>
+
 						<span class="whitespace-nowrap">exit nodes</span>
 						<span class="text-text text-right break-all">{{ exitNodes.length ? exitNodes.map((n) => n.peer.friendlyName ?? n.peer.wgAddress).join(', ') : '-' }}</span>
 					</div>
@@ -76,6 +79,7 @@
 								<span v-for="name in tagNames(peer.tagIds)" :key="name" class="text-accent-dim border border-accent-dim/40 rounded-sm px-1.5 py-0.5">[{{ name }}]</span>
 								<span v-if="peer.isExitNode" class="text-accent border border-accent/40 rounded-sm px-1.5 py-0.5">exit</span>
 								<span v-if="peer.exitPeerId" class="text-muted border border-border rounded-sm px-1.5 py-0.5">via {{ exitNodeLabel(peer.exitPeerId) }}</span>
+								<span v-else-if="peer.exitViaServer" class="text-muted border border-border rounded-sm px-1.5 py-0.5">via server</span>
 								<span v-if="advertisedRoutes(peer).length" class="text-muted border border-border rounded-sm px-1.5 py-0.5">subnets</span>
 							</div>
 
@@ -112,7 +116,7 @@
 							<div class="grid grid-cols-2 gap-2">
 								<BaseButton @click="showQrCode(peer.id)" variant="secondary" size="sm">qr</BaseButton>
 								<BaseButton @click="showConfig(peer.id)" variant="secondary" size="sm">cfg</BaseButton>
-								<BaseButton v-if="peer.exitPeerId" @click="showConfig(peer.id, { exit: true })" variant="secondary" size="sm">cfg via exit</BaseButton>
+								<BaseButton v-if="peer.exitPeerId || peer.exitViaServer" @click="showConfig(peer.id, { exit: true })" variant="secondary" size="sm">cfg via exit</BaseButton>
 								<BaseButton v-if="peer.isExitNode || advertisedRoutes(peer).length" @click="showConfig(peer.id, { nat: true })" variant="secondary" size="sm">cfg + nat</BaseButton>
 								<BaseButton @click="editPeer(peer)" variant="secondary" size="sm">edit</BaseButton>
 								<BaseButton @click="deletePeer(peer.id)" variant="danger" size="sm">del</BaseButton>
@@ -144,9 +148,10 @@
 					</td>
 					<td class="px-4 py-3 text-muted text-xs">
 						<span v-if="tagNames(peer.tagIds).length" class="text-accent-dim">[{{ tagNames(peer.tagIds).join('] [') }}]</span>
-						<span v-else-if="!peer.isExitNode && !peer.exitPeerId && !advertisedRoutes(peer).length">-</span>
+						<span v-else-if="!peer.isExitNode && !peer.exitPeerId && !peer.exitViaServer && !advertisedRoutes(peer).length">-</span>
 						<span v-if="peer.isExitNode" class="text-accent ml-1">[exit]</span>
 						<span v-if="peer.exitPeerId" class="ml-1">via {{ exitNodeLabel(peer.exitPeerId) }}</span>
+						<span v-else-if="peer.exitViaServer" class="ml-1">via server</span>
 						<span v-if="advertisedRoutes(peer).length" class="ml-1">{{ advertisedRoutes(peer).join(' ') }}</span>
 					</td>
 					<td class="px-4 py-3 text-muted text-xs">
@@ -160,7 +165,7 @@
 						<div class="flex justify-end gap-2">
 							<BaseButton @click="showQrCode(peer.id)" variant="ghost" size="sm">qr</BaseButton>
 							<BaseButton @click="showConfig(peer.id)" variant="ghost" size="sm">cfg</BaseButton>
-							<BaseButton v-if="peer.exitPeerId" @click="showConfig(peer.id, { exit: true })" variant="ghost" size="sm">cfg via exit</BaseButton>
+							<BaseButton v-if="peer.exitPeerId || peer.exitViaServer" @click="showConfig(peer.id, { exit: true })" variant="ghost" size="sm">cfg via exit</BaseButton>
 							<BaseButton v-if="peer.isExitNode || advertisedRoutes(peer).length" @click="showConfig(peer.id, { nat: true })" variant="ghost" size="sm">cfg + nat</BaseButton>
 							<BaseButton @click="showTraffic(peer)" variant="ghost" size="sm">t</BaseButton>
 							<BaseButton @click="editPeer(peer)" variant="ghost" size="sm">edit</BaseButton>

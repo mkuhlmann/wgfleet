@@ -22,6 +22,8 @@ export type PeerSpec = {
 	isExitNode?: boolean;
 	/** the exit node this peer routes through */
 	exitPeerId?: string;
+	/** this peer exits through its server's own uplink (`peers.exitViaServer`) */
+	exitViaServer?: boolean;
 	exitDns?: string | null;
 	advertisedRoutes?: string | null;
 	/** the provisioned exit link, when this peer is an exit node; omit for "not reconciled yet" */
@@ -44,6 +46,8 @@ export type GraphSpec = {
 	cidrRange?: string;
 	wgAddress?: string;
 	dns?: string | null;
+	/** this server offers its own uplink as an exit (`serverPeers.isExitNode`) */
+	isExitNode?: boolean;
 	wgEndpoint?: string;
 	wgListenPort?: number;
 	tags?: ({ id: string; name?: string; friendlyName?: string | null } | string)[];
@@ -67,6 +71,7 @@ const serverRow = (spec: GraphSpec): ServerPeer => ({
 	wgPrivateKey: 'serverPrivateKey',
 	wgPublicKey: 'serverPublicKey',
 	dns: spec.dns ?? null,
+	isExitNode: spec.isExitNode ?? false,
 	lifetimeRxBytes: 0,
 	lifetimeTxBytes: 0,
 	statsSince: EPOCH,
@@ -90,6 +95,7 @@ const peerRow = (serverPeerId: string, spec: PeerSpec): Peer => ({
 	exitListenPort: spec.link?.listenPort ?? null,
 	exitRouteTableId: spec.link?.routeTableId ?? null,
 	exitPeerId: spec.exitPeerId ?? null,
+	exitViaServer: spec.exitViaServer ?? false,
 	exitDns: spec.exitDns ?? null,
 	advertisedRoutes: spec.advertisedRoutes ?? null,
 	wgLastRxBytes: 0,

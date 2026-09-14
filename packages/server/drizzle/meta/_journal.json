@@ -71,6 +71,13 @@
       "when": 1789176131360,
       "tag": "0009_exit_links",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "6",
+      "when": 1789335222830,
+      "tag": "0010_server_as_exit_node",
+      "breakpoints": true
     }
   ]
 }

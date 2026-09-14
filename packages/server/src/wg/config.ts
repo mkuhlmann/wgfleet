@@ -108,10 +108,11 @@ Table = off
 
 export type PeerConfigOptions = {
 	/**
-	 * Render the "via exit node" variant: AllowedIPs becomes 0.0.0.0/0 so the client sends
-	 * its internet traffic into the tunnel. Requires the peer to have an exitPeerId - that
-	 * column is the permission, and without it the hub installs no policy route, so a config
-	 * generated here anyway would simply have no path to the exit node's uplink.
+	 * Render the "via its exit" variant: AllowedIPs becomes 0.0.0.0/0 so the client sends its
+	 * internet traffic into the tunnel. Which exit that reaches is decided entirely server-side
+	 * by the peer's selection - `exitPeerId` (a peer's uplink) or `exitViaServer` (its server's).
+	 * Both are the permission as well as the routing, so a config generated for a peer that
+	 * selected neither has no path to any uplink and simply blackholes.
 	 */
 	exit?: boolean;
 	/**

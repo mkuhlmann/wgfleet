@@ -293,3 +293,51 @@ describe('exit nodes', () => {
 		});
 	});
 });
+
+describe('the server as an exit node', () => {
+	const app = serversPeersRoute;
+	const auth = { authorization: 'Bearer adminToken', 'content-type': 'application/json' };
+	const patch = (server: string, peerId: string, body: unknown) => app.handle(new Request(`http://localhost/wg/servers/${server}/peers/${peerId}`, { method: 'PATCH', headers: auth, body: JSON.stringify(body) }));
+
+	it('refuses a client selecting an exit its server does not offer', async () => {
+		// Selecting it is the whole permission - there is no grant for internet access - so the
+		// server has to actually be offering the uplink.
+		const response = await patch(SERVER, 'exitNodes-client', { exitViaServer: true });
+
+		expect(response.status).toBe(400);
+		expect((await response.json()).field).toBe('exitViaServer');
+	});
+
+	it('accepts it once the server offers its uplink', async () => {
+		await db.update(serverPeersTable).set({ isExitNode: true }).where(eq(serverPeersTable.id, SERVER));
+
+		expect((await patch(SERVER, 'exitNodes-client', { exitViaServer: true })).status).toBe(200);
+		expect((await db.query.peersTable.findFirst({ where: eq(peersTable.id, 'exitNodes-client') }))!.exitViaServer).toBe(true);
+
+		await db.update(serverPeersTable).set({ isExitNode: false }).where(eq(serverPeersTable.id, SERVER));
+	});
+
+	it('refuses holding both arms of the same choice', async () => {
+		await db.update(serverPeersTable).set({ isExitNode: true }).where(eq(serverPeersTable.id, SERVER));
+
+		const response = await patch(SERVER, 'exitNodes-client', { exitViaServer: true, exitPeerId: 'exitNodes-exit' });
+		expect(response.status).toBe(400);
+		expect((await response.json()).field).toBe('exitViaServer');
+
+		await db.update(serverPeersTable).set({ isExitNode: false }).where(eq(serverPeersTable.id, SERVER));
+	});
+
+	it('needs no ip rule - the host default route already goes where the client wants', async () => {
+		await db.update(serverPeersTable).set({ isExitNode: true }).where(eq(serverPeersTable.id, SERVER));
+		shellCallLog.reset();
+
+		await patch(SERVER, 'exitNodes-client', { exitViaServer: true });
+
+		// unlike an exit node peer, which needs `ip rule from <client> table <its table>`
+		expect(shellCallLog.lastAppliedExitRouting()?.some((c) => c.includes('rule add from 10.66.0.3/32'))).toBe(false);
+		expect(shellCallLog.lastAppliedRuleset()).toContain('masquerade');
+
+		await db.update(serverPeersTable).set({ isExitNode: false }).where(eq(serverPeersTable.id, SERVER));
+		await patch(SERVER, 'exitNodes-client', { exitViaServer: false });
+	});
+});

@@ -65,10 +65,9 @@
 					address alone, so only one peer per interface can own <span class="text-text">0.0.0.0/0</span>, and an interface each is what removes the collision instead of rationing it.
 				</p>
 				<p class="text-xs text-down">
-					each exit node's udp port below must be reachable from that machine - publish it on the container and open it in the host firewall. and marking a peer here does not change that machine's own config: install it from the peer list (<span
-						class="text-text"
-						>cfg + nat</span
-					>) and restart its tunnel, or that exit node's clients time out while everything on this page still looks correct.
+					each exit node's udp port below is opened <span class="text-text">here, on the wgfleet host</span> - publish it on the container and allow it inbound; nothing is opened on the exit node itself, which dials in and so works from behind nat.
+					and marking a peer here does not change that machine's own config: install it from the peer list (<span class="text-text">cfg + nat</span>) and restart its tunnel, or that exit node's clients time out while everything on this page still
+					looks correct.
 				</p>
 
 				<div v-if="exitNodes.length === 0" class="text-center py-8 text-muted text-sm">no exit node on this server - mark a peer as one from the peers list. until then no client here can reach the internet through the tunnel</div>

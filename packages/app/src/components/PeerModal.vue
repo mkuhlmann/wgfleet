@@ -44,8 +44,8 @@
 					<BaseInput id="exitListenPort" v-model="exitListenPortInput" type="number" class="w-full" :placeholder="currentLink ? String(currentLink.listenPort) : 'auto (51900-51999)'" />
 					<small class="text-muted text-xs block mt-1"> this exit node connects to a <span class="text-text">separate wg interface</span> on this host, on its own port. leave empty to allocate one automatically. </small>
 					<small class="text-down text-xs block mt-1">
-						you must make this port reachable from the exit node's machine - publish it on the wgfleet container (<span class="text-text">-p {{ currentLink?.listenPort ?? '&lt;port&gt;' }}:{{ currentLink?.listenPort ?? '&lt;port&gt;' }}/udp</span>)
-						and open it in the host firewall. nothing else about your clients changes.
+						open this port <span class="text-text">here, on the wgfleet host</span> - publish it on the container (<span class="text-text">-p {{ currentLink?.listenPort ?? '&lt;port&gt;' }}:{{ currentLink?.listenPort ?? '&lt;port&gt;' }}/udp</span>)
+						and allow it inbound. <span class="text-text">nothing is opened on the exit node's own machine</span>: it dials in, so it works from behind nat exactly like any other peer. nothing about your clients changes.
 					</small>
 					<div v-if="currentLink" class="text-xs text-muted mt-1">
 						currently <span class="text-text">{{ currentLink.interfaceName }}</span> on udp <span class="text-text">{{ currentLink.listenPort }}</span>
@@ -70,18 +70,23 @@
 			<div class="field" v-else>
 				<label class="mb-1.5 text-sm text-muted block"><span class="text-accent-dim">&gt;</span> internet access</label>
 				<div class="flex flex-col gap-2">
-					<button type="button" class="flex items-center gap-2 text-sm text-text text-left" @click="form.exitPeerId = null">
-						<span class="text-accent-dim">{{ form.exitPeerId === null ? '(x)' : '( )' }}</span>
+					<button type="button" class="flex items-center gap-2 text-sm text-text text-left" @click="selectExit(null, false)">
+						<span class="text-accent-dim">{{ form.exitPeerId === null && !form.exitViaServer ? '(x)' : '( )' }}</span>
 						<span>none</span>
 					</button>
-					<button v-for="node in exitNodes" :key="node.peer.id" type="button" class="flex items-center gap-2 text-sm text-text text-left" @click="form.exitPeerId = node.peer.id">
+					<button v-if="props.server.isExitNode" type="button" class="flex items-center gap-2 text-sm text-text text-left" @click="selectExit(null, true)">
+						<span class="text-accent-dim">{{ form.exitViaServer ? '(x)' : '( )' }}</span>
+						<span>via this server ({{ props.server.interfaceName }}, udp {{ props.server.wgListenPort }})</span>
+					</button>
+					<button v-for="node in exitNodes" :key="node.peer.id" type="button" class="flex items-center gap-2 text-sm text-text text-left" @click="selectExit(node.peer.id, false)">
 						<span class="text-accent-dim">{{ form.exitPeerId === node.peer.id ? '(x)' : '( )' }}</span>
 						<span>via exit node {{ node.peer.friendlyName ?? node.peer.wgAddress }}</span>
 						<span v-if="!node.link" class="text-down text-xs">(no interface yet)</span>
 					</button>
 				</div>
+				<span v-if="errors.exitViaServer" class="text-down text-xs block mt-1">{{ errors.exitViaServer }}</span>
 				<small class="text-muted text-xs block mt-1">
-					<span v-if="exitNodes.length === 0">no exit node on this server yet - mark a peer as one first. the hub itself does not route clients to the internet</span>
+					<span v-if="exitNodes.length === 0 && !props.server.isExitNode">no exit available yet - enable the server's own exit in its settings, or mark a peer as an exit node</span>
 					<span v-else>picking an exit node gives this peer a second config file to switch to. any exit node on this server will do, and switching later changes nothing else. without one it has no route to any exit node at all</span>
 				</small>
 			</div>
@@ -143,6 +148,7 @@ const form = reactive<{
 	tagIds: string[];
 	isExitNode: boolean;
 	exitPeerId: string | null;
+	exitViaServer: boolean;
 	exitDns: string;
 	advertisedRoutes: string;
 }>({
@@ -151,6 +157,7 @@ const form = reactive<{
 	tagIds: [],
 	isExitNode: false,
 	exitPeerId: null,
+	exitViaServer: false,
 	exitDns: '',
 	advertisedRoutes: '',
 });
@@ -169,9 +176,15 @@ const exitListenPortInput = ref('');
 
 // Being an exit node and using one are mutually exclusive (the api rejects both) - it would
 // be a routing loop, and the two roles need different AllowedIPs.
+/** The two arms are one choice, so selecting either clears the other - see lib/peerInvariants.ts. */
+const selectExit = (exitPeerId: string | null, viaServer: boolean) => {
+	form.exitPeerId = exitPeerId;
+	form.exitViaServer = viaServer;
+};
+
 const toggleExitNode = () => {
 	form.isExitNode = !form.isExitNode;
-	if (form.isExitNode) form.exitPeerId = null;
+	if (form.isExitNode) selectExit(null, false);
 	else {
 		form.exitDns = '';
 		exitListenPortInput.value = '';
@@ -191,6 +204,7 @@ const errors = reactive({
 	// Present so a field-scoped failure has somewhere to land (see queries/useWrite.ts).
 	tagIds: '',
 	exitPeerId: '',
+	exitViaServer: '',
 });
 
 // The per-server state lib/peerInvariants.ts decides against, assembled from what this form
@@ -198,6 +212,7 @@ const errors = reactive({
 const invariantSnapshot = computed(() => ({
 	peers: peers.value ?? [],
 	tagIds: (tags.value ?? []).map((t) => t.id),
+	serverIsExitNode: props.server.isExitNode,
 }));
 
 const validate = () => {
@@ -208,6 +223,7 @@ const validate = () => {
 	errors.exitListenPort = '';
 	errors.tagIds = '';
 	errors.exitPeerId = '';
+	errors.exitViaServer = '';
 
 	// Range only - whether the port is free depends on every other interface on the host, so
 	// that check stays server-side (resolveExitListenPort in wg/peerIntake.ts).
@@ -233,6 +249,7 @@ const validate = () => {
 		tagIds: form.tagIds,
 		isExitNode: form.isExitNode,
 		exitPeerId: form.exitPeerId,
+		exitViaServer: form.exitViaServer,
 	});
 	if (invariantError) {
 		// each rule names the field it is about, so "tags not found" no longer lands on the
@@ -278,6 +295,7 @@ watch(
 			form.tagIds = peer.tagIds ?? [];
 			form.isExitNode = peer.isExitNode ?? false;
 			form.exitPeerId = peer.exitPeerId ?? null;
+			form.exitViaServer = peer.exitViaServer ?? false;
 			form.exitDns = peer.exitDns ?? '';
 			form.advertisedRoutes = peer.advertisedRoutes ?? '';
 			exitListenPortInput.value = peer.exitListenPort === null ? '' : String(peer.exitListenPort);
@@ -289,6 +307,7 @@ watch(
 			form.tagIds = [];
 			form.isExitNode = false;
 			form.exitPeerId = null;
+			form.exitViaServer = false;
 			form.exitDns = '';
 			form.advertisedRoutes = '';
 			exitListenPortInput.value = '';

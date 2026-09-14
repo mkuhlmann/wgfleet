@@ -12,6 +12,10 @@ _Avoid_: IP allocation (too generic - this is always scoped to one server's peer
 A peer that lends its own internet uplink to the other clients of its server (`peers.isExitNode`). It stays an entirely ordinary peer as far as anything else is concerned - reachable, and reaching others - but it does not live on its server's wg interface: it is the single peer of an **exit link** of its own, where it owns `AllowedIPs = 0.0.0.0/0` uncontested. Any number per server.
 _Avoid_: gateway (ambiguous - it is the gateway for its own clients, but so is the hub for peer-to-peer traffic), relay (implies it forwards vpn traffic, which is the hub's job)
 
+**Server Exit**:
+The server lending *its own* uplink to clients that select it (`serverPeers.isExitNode` + `peers.exitViaServer`). Costs no interface, keypair, udp port or `ip rule` - the server is not a peer of its own wg interface, so it never competes for `0.0.0.0/0`, and the host's default route already goes where those clients want. Its whole implementation is one nft masquerade scoped to exactly the selected clients.
+_Avoid_: "enableNat" (the removed grant-gated switch this replaced - that one needed a separate `internet` grant to agree with it), "hub egress" (same)
+
 **Exit Client**:
 A peer whose `exitPeerId` names an exit node, meaning its internet-bound traffic is policy-routed into that node's tunnel. The column is both the permission and the routing instruction: without it no `ip rule` exists, so the peer has no route to any exit node and cannot reach one by editing its own config.
 _Avoid_: "peer with internet access" (there is no other kind - hub egress was removed in `drizzle/0008_drop_hub_egress.sql`, so an exit client is the only peer that reaches the internet at all)

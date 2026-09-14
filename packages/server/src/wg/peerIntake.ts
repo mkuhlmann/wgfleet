@@ -18,6 +18,7 @@ export type PeerWriteRequest = {
 	tagIds?: string[];
 	isExitNode?: boolean;
 	exitPeerId?: string | null;
+	exitViaServer?: boolean;
 	exitDns?: string | null;
 	advertisedRoutes?: string | null;
 	/** operator-pinned udp port for this exit node's link; null/undefined = allocate one */
@@ -30,6 +31,7 @@ export type ResolvedPeerWrite = {
 	wgAddress: string;
 	isExitNode: boolean;
 	exitPeerId: string | null;
+	exitViaServer: boolean;
 	exitDns: string | null;
 	advertisedRoutes: string | null;
 	exitListenPort: number | null;
@@ -91,6 +93,7 @@ export async function resolvePeerWrite(server: ServerPeer, current: Peer | null,
 			wgAddress,
 			isExitNode: request.isExitNode ?? current?.isExitNode ?? false,
 			exitPeerId: request.exitPeerId === undefined ? (current?.exitPeerId ?? null) : request.exitPeerId,
+			exitViaServer: request.exitViaServer ?? current?.exitViaServer ?? false,
 			exitDns: request.exitDns === undefined ? (current?.exitDns ?? null) : request.exitDns,
 			advertisedRoutes: advertised.value,
 			exitListenPort: exitListenPort.value,
@@ -128,7 +131,7 @@ async function resolveExitListenPort(current: Peer | null, request: PeerWriteReq
 async function loadInvariantSnapshot(server: ServerPeer) {
 	const [peers, tags] = await Promise.all([db.query.peersTable.findMany({ where: eq(peersTable.serverPeerId, server.id) }), db.query.peerTagsTable.findMany({ where: eq(peerTagsTable.serverPeerId, server.id), columns: { id: true } })]);
 
-	return { peers, tagIds: tags.map((t) => t.id) };
+	return { peers, tagIds: tags.map((t) => t.id), serverIsExitNode: server.isExitNode };
 }
 
 /**

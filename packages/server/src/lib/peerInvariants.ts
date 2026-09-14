@@ -22,6 +22,7 @@ export type InvariantPeer = {
 	friendlyName: string | null;
 	wgAddress: string;
 	isExitNode: boolean;
+	exitViaServer: boolean;
 	exitPeerId: string | null;
 };
 
@@ -30,6 +31,8 @@ export type PeerInvariantSnapshot = {
 	peers: InvariantPeer[];
 	/** tag ids defined on this server */
 	tagIds: string[];
+	/** does this server offer its own uplink as an exit (`serverPeers.isExitNode`) */
+	serverIsExitNode: boolean;
 };
 
 import { failure, type Failure } from './failure';
@@ -39,6 +42,7 @@ import { CIDR_REGEX } from './validation';
 export type PeerInvariantRequest = {
 	tagIds?: string[];
 	isExitNode?: boolean;
+	exitViaServer?: boolean;
 	exitPeerId?: string | null;
 };
 
@@ -79,11 +83,29 @@ export function checkPeerInvariants(snapshot: PeerInvariantSnapshot, current: In
 
 	const isExitNode = request.isExitNode ?? current?.isExitNode ?? false;
 	const exitPeerId = request.exitPeerId === undefined ? (current?.exitPeerId ?? null) : request.exitPeerId;
+	const exitViaServer = request.exitViaServer ?? current?.exitViaServer ?? false;
 
 	// An exit node routing its own internet traffic into itself is a loop, and its config
 	// can't express both roles anyway (it needs cidrRange AllowedIPs, not 0.0.0.0/0).
 	if (isExitNode && exitPeerId) {
 		return failure('A peer cannot be an exit node and use an exit node at the same time', 'isExitNode');
+	}
+
+	// Same reason, for the other arm of the choice.
+	if (isExitNode && exitViaServer) {
+		return failure('A peer cannot be an exit node and use one at the same time', 'isExitNode');
+	}
+
+	// The two arms are one question - "which exit does this client use" - so holding both is not
+	// a state the ui's radio group can display, and nothing downstream would know which to apply.
+	if (exitViaServer && exitPeerId) {
+		return failure('A peer uses either this server or an exit node as its exit, not both', 'exitViaServer');
+	}
+
+	// Selecting it is the whole permission (there is no grant for internet access), so a client
+	// may only select an uplink its server actually offers.
+	if (exitViaServer && !snapshot.serverIsExitNode) {
+		return failure('This server does not offer its own uplink as an exit - enable it in the server settings first', 'exitViaServer');
 	}
 
 	if (current && request.isExitNode === false && current.isExitNode) {

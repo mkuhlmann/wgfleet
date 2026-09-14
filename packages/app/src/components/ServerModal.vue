@@ -45,6 +45,18 @@
 				<BaseInput id="dns" v-model="form.dns" class="w-full" placeholder="leave empty to omit" />
 				<small class="text-muted text-xs">resolver handed to clients as <span class="text-text">DNS =</span> in their config. an exit node can override it for its own clients</small>
 			</div>
+			<div class="field">
+				<button type="button" class="flex items-center gap-2 text-sm text-text" @click="form.isExitNode = !form.isExitNode">
+					<span class="text-accent-dim">{{ form.isExitNode ? '[x]' : '[ ]' }}</span>
+					<span><span class="text-accent-dim">&gt;</span> offer this server as an exit node</span>
+				</button>
+				<small class="text-muted text-xs block mt-1">
+					lets clients send their internet traffic out <span class="text-text">this host's</span> own uplink, masqueraded. the cheapest exit there is - no extra interface, no extra udp port, and the client keeps dialing this server's endpoint. a peer
+					exit node needs its own port; this one does not.
+				</small>
+				<small class="text-muted text-xs block mt-1">this grants nobody anything on its own - each client still has to select it under <span class="text-text">internet access</span> in its own dialog.</small>
+			</div>
+
 			<div class="flex justify-end gap-2 mt-2">
 				<BaseButton @click="visible = false" variant="ghost" type="button">cancel</BaseButton>
 				<BaseButton type="submit" variant="primary">
@@ -85,6 +97,7 @@ const form = reactive({
 	cidrRange: '10.0.0.0/24',
 	reservedIps: 50,
 	dns: '',
+	isExitNode: false,
 });
 
 const errors = reactive({
@@ -133,6 +146,7 @@ watch(
 			form.cidrRange = server.cidrRange ?? '10.0.0.0/24';
 			form.reservedIps = server.reservedIps ?? 50;
 			form.dns = server.dns ?? '';
+			form.isExitNode = server.isExitNode ?? false;
 			isEditMode.value = true;
 		} else {
 			isEditMode.value = false;
@@ -145,6 +159,7 @@ watch(
 			form.cidrRange = '10.0.0.0/24';
 			form.reservedIps = 50;
 			form.dns = '';
+			form.isExitNode = false;
 		}
 		// Clear errors when opening/changing server
 		errors.interfaceName = '';

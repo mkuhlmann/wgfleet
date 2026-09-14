@@ -8,7 +8,11 @@ services:
       - ./wg-data:/app/data
     ports:
       - 3000:3000
+      # one per wireguard server you run
       - 51820:51820/udp
+      # one per *peer* exit node - each gets its own wg interface on its own udp port
+      # from 51900 upwards. Not needed if you only use the server's own exit.
+      - 51900-51909:51900-51909/udp
     cap_add:
       - SYS_MODULE
       - NET_ADMIN

@@ -60,6 +60,7 @@ export const serversRoutes = new Elysia()
 					wgPublicKey: publicKey,
 
 					dns: body.dns,
+					isExitNode: body.isExitNode,
 
 					// the column default is a literal 0 - see schema.ts's statsSince comment
 					statsSince: new Date(),
@@ -84,6 +85,8 @@ export const serversRoutes = new Elysia()
 				wgListenPort: t.Integer({ minimum: WG_LISTEN_PORT_MIN, maximum: WG_LISTEN_PORT_MAX }),
 				wgAddress: t.String(),
 				dns: t.Optional(t.String()),
+				// offer this server's own uplink as an exit - see serverPeers.isExitNode
+				isExitNode: t.Optional(t.Boolean({ default: false })),
 			}),
 			verifyAuth: { scope: 'admin' },
 		},

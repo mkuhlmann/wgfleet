@@ -42,6 +42,8 @@ const PEER_WRITE_BODY = t.Object({
 	tagIds: t.Optional(t.Array(t.String())),
 	isExitNode: t.Optional(t.Boolean()),
 	exitPeerId: t.Optional(t.Nullable(t.String())),
+	// the other arm of "which exit does this client use" - see peers.exitViaServer
+	exitViaServer: t.Optional(t.Boolean()),
 	exitDns: t.Optional(t.Nullable(t.String())),
 	// comma-separated ipv4 CIDR list of LANs behind this peer, e.g.
 	// "192.168.1.0/24,10.10.0.0/16". A plain string rather than an array so the wire shape
@@ -106,6 +108,7 @@ export const serversPeersRoute = new Elysia()
 
 					isExitNode: values.isExitNode,
 					exitPeerId: values.exitPeerId,
+					exitViaServer: values.exitViaServer,
 					exitDns: values.exitDns,
 					advertisedRoutes: values.advertisedRoutes,
 					exitListenPort: values.exitListenPort,
@@ -149,6 +152,7 @@ export const serversPeersRoute = new Elysia()
 					wgAddress: values.wgAddress,
 					isExitNode: values.isExitNode,
 					exitPeerId: values.exitPeerId,
+					exitViaServer: values.exitViaServer,
 					exitDns: values.exitDns,
 					advertisedRoutes: values.advertisedRoutes,
 					exitListenPort: values.exitListenPort,
